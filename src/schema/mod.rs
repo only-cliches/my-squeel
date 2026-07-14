@@ -9,11 +9,17 @@ pub struct ColumnHint {
     pub default: Option<String>,
     pub primary_key: bool,
     pub auto_increment: bool,
+    #[serde(default)]
+    pub generated: Option<String>,
+    #[serde(default)]
+    pub generated_stored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TableSchemaHint {
     pub table: String,
+    #[serde(default)]
+    pub temporary: bool,
     pub columns: BTreeMap<String, ColumnHint>,
     #[serde(default)]
     pub column_order: Vec<String>,
@@ -31,6 +37,8 @@ pub struct IndexHint {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[serde(default)]
+    pub prefix_lengths: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

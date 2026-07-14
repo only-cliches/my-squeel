@@ -10,6 +10,20 @@ use datetime::*;
 use json::*;
 use scalar::*;
 
+const HIDDEN_HISTORICAL_COLUMN_PREFIX: &str = "\0my_sqweel_historical:";
+
+pub(super) fn is_bare_datetime_keyword(name: &str) -> bool {
+    eval_bare_datetime_keyword(name).is_some()
+}
+
+pub(super) fn historical_column_marker(column: &str) -> String {
+    format!("{HIDDEN_HISTORICAL_COLUMN_PREFIX}{column}")
+}
+
+fn is_historical_column_marker(column: &str) -> bool {
+    column.starts_with(HIDDEN_HISTORICAL_COLUMN_PREFIX)
+}
+
 pub(super) fn table_factor_name(factor: &TableFactor) -> Result<String> {
     table_factor_name_and_alias(factor).map(|(name, _)| name)
 }
@@ -66,18 +80,34 @@ pub(super) fn project_row_with<F>(
 where
     F: FnMut(&Expr) -> Result<Value>,
 {
-    if projection
-        .iter()
-        .any(|p| matches!(p, SelectItem::Wildcard(_)))
-    {
-        return Ok(data.clone());
-    }
-
     let mut out = Map::new();
     for item in projection {
         match item {
+            SelectItem::Wildcard(_) => {
+                for (column, value) in data {
+                    if !column.contains('.') && !is_historical_column_marker(column) {
+                        out.insert(column.clone(), value.clone());
+                    }
+                }
+            }
+            SelectItem::QualifiedWildcard(prefix, _) => {
+                let qualifier = prefix
+                    .0
+                    .iter()
+                    .map(|part| part.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let qualified_prefix = format!("{qualifier}.");
+                for (column, value) in data {
+                    if let Some(output) = strip_prefix_case_insensitive(column, &qualified_prefix)
+                        && !is_historical_column_marker(output)
+                    {
+                        out.insert(output.to_string(), value.clone());
+                    }
+                }
+            }
             SelectItem::UnnamedExpr(expr) => {
-                let key = projection_expr_column_name(expr);
+                let key = projection_output_column_name(expr);
                 let value = eval(expr)?;
                 out.insert(key, value);
             }
@@ -85,32 +115,64 @@ where
                 let value = eval(expr)?;
                 out.insert(alias.value.clone(), value);
             }
-            _ => {}
         }
     }
 
     Ok(out)
 }
 
+fn strip_prefix_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    (value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
+}
+
 pub(super) fn virtual_select_result(
     select: &Select,
     rows: Vec<Map<String, Value>>,
 ) -> Result<QueryResult> {
+    let qualifiers = select.from.first().and_then(|table| match &table.relation {
+        TableFactor::Table { name, alias, .. } => {
+            let full = name
+                .0
+                .iter()
+                .map(|part| part.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            let short = name.0.last().map(|part| part.value.clone());
+            Some((
+                full,
+                short,
+                alias.as_ref().map(|alias| alias.name.value.clone()),
+            ))
+        }
+        _ => None,
+    });
     let rows = rows
         .into_iter()
-        .filter_map(
-            |row| match matches_selection(select.selection.as_ref(), &row) {
-                Ok(true) => Some(project_row(&select.projection, &row, 0)),
+        .filter_map(|row| {
+            let mut view = row.clone();
+            if let Some((full, short, alias)) = &qualifiers {
+                add_qualified_columns(&mut view, full, &row);
+                if let Some(short) = short {
+                    add_qualified_columns(&mut view, short, &row);
+                }
+                if let Some(alias) = alias {
+                    add_qualified_columns(&mut view, alias, &row);
+                }
+            }
+            match matches_selection(select.selection.as_ref(), &view) {
+                Ok(true) => Some(project_row(&select.projection, &view, 0)),
                 Ok(false) => None,
                 Err(err) => Some(Err(err)),
-            },
-        )
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(QueryResult {
         rows_affected: 0,
         last_insert_id: 0,
         columns: infer_projection_columns(&select.projection),
+        column_metadata: vec![],
         rows,
     })
 }
@@ -149,6 +211,9 @@ pub(super) fn aggregate_select_result(
         }
     }
 
+    if select.distinct.is_some() {
+        deduplicate_rows(&mut output);
+    }
     apply_ordering(&mut output, order_by)?;
     apply_limit_offset(&mut output, limit, offset)?;
 
@@ -156,8 +221,14 @@ pub(super) fn aggregate_select_result(
         rows_affected: 0,
         last_insert_id: 0,
         columns: infer_projection_columns(&select.projection),
+        column_metadata: vec![],
         rows: output,
     }))
+}
+
+pub(super) fn deduplicate_rows(rows: &mut Vec<Map<String, Value>>) {
+    let mut seen = BTreeSet::new();
+    rows.retain(|row| seen.insert(encode_json_row(row)));
 }
 
 pub(super) fn group_by_exprs(select: &Select) -> Vec<Expr> {
@@ -170,9 +241,95 @@ pub(super) fn group_by_exprs(select: &Select) -> Vec<Expr> {
 pub(super) fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
     projection.iter().any(|item| match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            aggregate_call(expr).is_some()
+            expr_has_aggregate(expr)
         }
         _ => false,
+    })
+}
+
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    if aggregate_call(expr).is_some() {
+        return true;
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. } => expr_has_aggregate(expr),
+        Expr::Convert { expr, styles, .. } => {
+            expr_has_aggregate(expr) || styles.iter().any(expr_has_aggregate)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
+        Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
+        Expr::Like { expr, pattern, .. } => expr_has_aggregate(expr) || expr_has_aggregate(pattern),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
+        Expr::Position { expr, r#in } => expr_has_aggregate(expr) || expr_has_aggregate(r#in),
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            expr_has_aggregate(expr)
+                || substring_from.as_deref().is_some_and(expr_has_aggregate)
+                || substring_for.as_deref().is_some_and(expr_has_aggregate)
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            expr_has_aggregate(expr)
+                || trim_what.as_deref().is_some_and(expr_has_aggregate)
+                || trim_characters
+                    .as_ref()
+                    .is_some_and(|items| items.iter().any(expr_has_aggregate))
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_has_aggregate)
+                || conditions.iter().any(expr_has_aggregate)
+                || results.iter().any(expr_has_aggregate)
+                || else_result.as_deref().is_some_and(expr_has_aggregate)
+        }
+        Expr::Function(function) => function_arguments_have_aggregate(&function.args),
+        // Aggregates inside subqueries belong to the subquery's scope.
+        Expr::Subquery(_) | Expr::Exists { .. } => false,
+        _ => false,
+    }
+}
+
+fn function_arguments_have_aggregate(arguments: &FunctionArguments) -> bool {
+    let FunctionArguments::List(arguments) = arguments else {
+        return false;
+    };
+    arguments.args.iter().any(|argument| {
+        let arg = match argument {
+            FunctionArg::Named { arg, .. }
+            | FunctionArg::ExprNamed { arg, .. }
+            | FunctionArg::Unnamed(arg) => arg,
+        };
+        matches!(arg, FunctionArgExpr::Expr(expr) if expr_has_aggregate(expr))
     })
 }
 
@@ -205,10 +362,16 @@ pub(super) fn project_aggregate_item(
 ) -> Result<()> {
     match item {
         SelectItem::Wildcard(_) => {
-            out.extend(base.clone());
+            out.extend(
+                base.iter()
+                    .filter(|(column, _)| {
+                        !column.contains('.') && !is_historical_column_marker(column)
+                    })
+                    .map(|(column, value)| (column.clone(), value.clone())),
+            );
         }
         SelectItem::UnnamedExpr(expr) => {
-            let column = projection_expr_column_name(expr);
+            let column = projection_output_column_name(expr);
             let value = aggregate_or_eval_expr(expr, group, base, last_insert_id)?;
             out.insert(column, value);
         }
@@ -230,10 +393,9 @@ pub(super) fn aggregate_or_eval_expr(
     base: &Map<String, Value>,
     last_insert_id: u64,
 ) -> Result<Value> {
-    if let Some(call) = aggregate_call(expr) {
-        return eval_aggregate_call(&call, group, last_insert_id);
-    }
-    eval_expr(expr, base, last_insert_id)
+    let mut context = base.clone();
+    materialize_aggregate_exprs(expr, group, base, last_insert_id, &mut context)?;
+    eval_expr(expr, &context, last_insert_id)
 }
 
 pub(super) fn materialize_aggregate_exprs(
@@ -258,10 +420,25 @@ pub(super) fn materialize_aggregate_exprs(
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
         | Expr::Cast { expr, .. } => {
             materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+        }
+        Expr::Convert { expr, styles, .. } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            for style in styles {
+                materialize_aggregate_exprs(style, group, base, last_insert_id, out)?;
+            }
         }
         Expr::InList { expr, list, .. } => {
             materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
@@ -269,9 +446,83 @@ pub(super) fn materialize_aggregate_exprs(
                 materialize_aggregate_exprs(item, group, base, last_insert_id, out)?;
             }
         }
+        Expr::InSubquery { expr, .. } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+        }
         Expr::Like { expr, pattern, .. } => {
             materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
             materialize_aggregate_exprs(pattern, group, base, last_insert_id, out)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(low, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(high, group, base, last_insert_id, out)?;
+        }
+        Expr::Position { expr, r#in } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(r#in, group, base, last_insert_id, out)?;
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            if let Some(expr) = substring_from {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+            if let Some(expr) = substring_for {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            if let Some(expr) = trim_what {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+            if let Some(items) = trim_characters {
+                for expr in items {
+                    materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(expr) = operand {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+            for expr in conditions.iter().chain(results) {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+            if let Some(expr) = else_result {
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            }
+        }
+        Expr::Function(function) => {
+            if let FunctionArguments::List(arguments) = &function.args {
+                for argument in &arguments.args {
+                    let argument = match argument {
+                        FunctionArg::Named { arg, .. }
+                        | FunctionArg::ExprNamed { arg, .. }
+                        | FunctionArg::Unnamed(arg) => arg,
+                    };
+                    if let FunctionArgExpr::Expr(expr) = argument {
+                        materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                    }
+                }
+            }
         }
         _ => {
             let _ = base;
@@ -306,6 +557,9 @@ struct GroupConcatOrder {
 }
 
 fn aggregate_call(expr: &Expr) -> Option<AggregateCall> {
+    if matches!(expr, Expr::Function(function) if function.over.is_some()) {
+        return None;
+    }
     let (name, args) = split_function_call(&expr.to_string())?;
     let kind = match name.as_str() {
         "COUNT" => AggregateKind::Count,
@@ -476,6 +730,9 @@ fn eval_aggregate_call(
     match call.kind {
         AggregateKind::Count => Ok(Value::Number(Number::from(values.len() as u64))),
         AggregateKind::Sum => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
             let sum = values
                 .iter()
                 .map(json_to_f64_lossy)
@@ -517,12 +774,22 @@ pub(super) fn infer_projection_columns(projection: &[SelectItem]) -> Vec<String>
     let mut out = Vec::new();
     for item in projection {
         match item {
-            SelectItem::UnnamedExpr(expr) => out.push(projection_expr_column_name(expr)),
+            SelectItem::UnnamedExpr(expr) => out.push(projection_output_column_name(expr)),
             SelectItem::ExprWithAlias { alias, .. } => out.push(alias.value.clone()),
             _ => {}
         }
     }
     out
+}
+
+pub(super) fn projection_output_column_name(expr: &Expr) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|part| part.value.clone())
+            .unwrap_or_else(|| expr.to_string()),
+        _ => projection_expr_column_name(expr),
+    }
 }
 
 pub(super) fn projection_expr_column_name(expr: &Expr) -> String {
@@ -610,13 +877,7 @@ pub(super) fn compare_json_values(left: &Value, right: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
-        (Value::Number(a), Value::Number(b)) => a
-            .as_f64()
-            .partial_cmp(&b.as_f64())
-            .unwrap_or(Ordering::Equal),
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::String(a), Value::String(b)) => a.cmp(b),
-        _ => left.to_string().cmp(&right.to_string()),
+        _ => mysql_cmp_non_null(left, right),
     }
 }
 
@@ -624,40 +885,153 @@ pub(super) fn mysql_eq(left: &Value, right: &Value) -> bool {
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return false;
     }
-    if left == right {
-        return true;
-    }
+    mysql_cmp_non_null(left, right) == Ordering::Equal
+}
 
+fn mysql_cmp_non_null(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
-        (Value::Number(_), Value::Number(_)) => {
-            let Ok(l) = json_to_f64(left) else {
-                return false;
-            };
-            let Ok(r) = json_to_f64(right) else {
-                return false;
-            };
-            (l - r).abs() < f64::EPSILON
+        (Value::String(left), Value::String(right)) => {
+            left.to_lowercase().cmp(&right.to_lowercase())
         }
-        (Value::Number(_), Value::String(_)) | (Value::String(_), Value::Number(_)) => {
-            let Ok(l) = json_to_f64(left) else {
-                return false;
-            };
-            let Ok(r) = json_to_f64(right) else {
-                return false;
-            };
-            (l - r).abs() < f64::EPSILON
-        }
-        (Value::Bool(a), Value::Number(b)) => b.as_i64() == Some(i64::from(*a)),
-        (Value::Number(a), Value::Bool(b)) => a.as_i64() == Some(i64::from(*b)),
-        _ => false,
+        (Value::Number(_), Value::Number(_))
+        | (Value::Number(_), Value::String(_))
+        | (Value::String(_), Value::Number(_))
+        | (Value::Bool(_), Value::Number(_))
+        | (Value::Number(_), Value::Bool(_))
+        | (Value::Bool(_), Value::String(_))
+        | (Value::String(_), Value::Bool(_))
+        | (Value::Bool(_), Value::Bool(_)) => json_to_f64_lossy(left)
+            .unwrap_or(0.0)
+            .partial_cmp(&json_to_f64_lossy(right).unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
+        _ => left.to_string().cmp(&right.to_string()),
     }
 }
 
-pub(super) fn mysql_ne(left: &Value, right: &Value) -> bool {
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SqlTruth {
+    False,
+    True,
+    Unknown,
+}
+
+pub(super) fn sql_truth(value: &Value) -> SqlTruth {
+    match value {
+        Value::Null => SqlTruth::Unknown,
+        Value::Bool(true) => SqlTruth::True,
+        Value::Bool(false) => SqlTruth::False,
+        Value::Number(_) | Value::String(_) => {
+            if json_to_f64_lossy(value).unwrap_or(0.0) == 0.0 {
+                SqlTruth::False
+            } else {
+                SqlTruth::True
+            }
+        }
+        Value::Array(_) | Value::Object(_) => SqlTruth::False,
     }
-    !mysql_eq(left, right)
+}
+
+pub(super) fn truth_value(truth: SqlTruth) -> Value {
+    match truth {
+        SqlTruth::False => Value::Bool(false),
+        SqlTruth::True => Value::Bool(true),
+        SqlTruth::Unknown => Value::Null,
+    }
+}
+
+pub(super) fn sql_not_value(value: Value) -> Value {
+    truth_value(match sql_truth(&value) {
+        SqlTruth::False => SqlTruth::True,
+        SqlTruth::True => SqlTruth::False,
+        SqlTruth::Unknown => SqlTruth::Unknown,
+    })
+}
+
+pub(super) fn sql_and_values(left: Value, right: Value) -> Value {
+    truth_value(match (sql_truth(&left), sql_truth(&right)) {
+        (SqlTruth::False, _) | (_, SqlTruth::False) => SqlTruth::False,
+        (SqlTruth::True, SqlTruth::True) => SqlTruth::True,
+        _ => SqlTruth::Unknown,
+    })
+}
+
+pub(super) fn sql_or_values(left: Value, right: Value) -> Value {
+    truth_value(match (sql_truth(&left), sql_truth(&right)) {
+        (SqlTruth::True, _) | (_, SqlTruth::True) => SqlTruth::True,
+        (SqlTruth::False, SqlTruth::False) => SqlTruth::False,
+        _ => SqlTruth::Unknown,
+    })
+}
+
+pub(super) fn sql_xor_values(left: Value, right: Value) -> Value {
+    match (sql_truth(&left), sql_truth(&right)) {
+        (SqlTruth::Unknown, _) | (_, SqlTruth::Unknown) => Value::Null,
+        (left, right) => Value::Bool(left != right),
+    }
+}
+
+pub(super) fn mysql_eq_value(left: &Value, right: &Value) -> Value {
+    if left == &Value::Null || right == &Value::Null {
+        Value::Null
+    } else {
+        Value::Bool(mysql_eq(left, right))
+    }
+}
+
+pub(super) fn eval_in_values(value: Value, candidates: Vec<Value>, negated: bool) -> Value {
+    if value == Value::Null {
+        return Value::Null;
+    }
+    let mut saw_unknown = false;
+    for candidate in candidates {
+        match sql_truth(&mysql_eq_value(&value, &candidate)) {
+            SqlTruth::True => {
+                return if negated {
+                    Value::Bool(false)
+                } else {
+                    Value::Bool(true)
+                };
+            }
+            SqlTruth::Unknown => saw_unknown = true,
+            SqlTruth::False => {}
+        }
+    }
+    let result = if saw_unknown {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    };
+    if negated {
+        sql_not_value(result)
+    } else {
+        result
+    }
+}
+
+pub(super) fn eval_between_values(value: Value, low: Value, high: Value, negated: bool) -> Value {
+    let lower = comparison_value(&value, &low, BinaryOperator::GtEq);
+    let upper = comparison_value(&value, &high, BinaryOperator::LtEq);
+    let result = sql_and_values(lower, upper);
+    if negated {
+        sql_not_value(result)
+    } else {
+        result
+    }
+}
+
+fn comparison_value(left: &Value, right: &Value, operator: BinaryOperator) -> Value {
+    if left == &Value::Null || right == &Value::Null {
+        return Value::Null;
+    }
+    let ordering = mysql_cmp_non_null(left, right);
+    let result = match operator {
+        BinaryOperator::Gt => ordering.is_gt(),
+        BinaryOperator::GtEq => !ordering.is_lt(),
+        BinaryOperator::Lt => ordering.is_lt(),
+        BinaryOperator::LtEq => !ordering.is_gt(),
+        _ => false,
+    };
+    Value::Bool(result)
 }
 
 pub(super) fn is_defaultish(value: &Value) -> bool {
@@ -707,88 +1081,7 @@ pub(super) fn matches_expr_with<F>(expr: &Expr, eval: &mut F) -> Result<bool>
 where
     F: FnMut(&Expr) -> Result<Value>,
 {
-    match expr {
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Eq => Ok(mysql_eq(&eval(left)?, &eval(right)?)),
-            BinaryOperator::NotEq => Ok(mysql_ne(&eval(left)?, &eval(right)?)),
-            BinaryOperator::Gt => Ok(compare_predicate_values(
-                eval(left)?,
-                eval(right)?,
-                |a, b| a > b,
-            )),
-            BinaryOperator::GtEq => Ok(compare_predicate_values(
-                eval(left)?,
-                eval(right)?,
-                |a, b| a >= b,
-            )),
-            BinaryOperator::Lt => Ok(compare_predicate_values(
-                eval(left)?,
-                eval(right)?,
-                |a, b| a < b,
-            )),
-            BinaryOperator::LtEq => Ok(compare_predicate_values(
-                eval(left)?,
-                eval(right)?,
-                |a, b| a <= b,
-            )),
-            BinaryOperator::And => {
-                Ok(matches_expr_with(left, eval)? && matches_expr_with(right, eval)?)
-            }
-            BinaryOperator::Or => {
-                Ok(matches_expr_with(left, eval)? || matches_expr_with(right, eval)?)
-            }
-            _ => Ok(value_truthy(&eval(expr)?)),
-        },
-        Expr::IsNull(expr) => Ok(eval(expr)? == Value::Null),
-        Expr::IsNotNull(expr) => Ok(eval(expr)? != Value::Null),
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let value = eval(expr)?;
-            let hit = list.iter().any(|item| {
-                eval(item)
-                    .map(|candidate| mysql_eq(&value, &candidate))
-                    .unwrap_or(false)
-            });
-            Ok(if *negated { !hit } else { hit })
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            negated,
-            ..
-        } => {
-            let target = eval(expr)?;
-            let pattern = eval(pattern)?;
-            Ok(value_truthy(&eval_like_values(target, pattern, *negated)))
-        }
-        _ => Ok(value_truthy(&eval(expr)?)),
-    }
-}
-
-pub(super) fn compare_predicate_values<F: Fn(f64, f64) -> bool>(
-    left: Value,
-    right: Value,
-    f: F,
-) -> bool {
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return false;
-    }
-    if let (Ok(l), Ok(r)) = (json_to_f64(&left), json_to_f64(&right)) {
-        return f(l, r);
-    }
-    let ordering = compare_json_values(&left, &right);
-    f(ordering_to_f64(ordering), 0.0)
-}
-
-pub(super) fn ordering_to_f64(ordering: Ordering) -> f64 {
-    match ordering {
-        Ordering::Less => -1.0,
-        Ordering::Equal => 0.0,
-        Ordering::Greater => 1.0,
-    }
+    Ok(matches!(sql_truth(&eval(expr)?), SqlTruth::True))
 }
 
 pub(super) fn json_to_f64(v: &Value) -> Result<f64> {
@@ -807,9 +1100,52 @@ pub(super) fn json_to_f64_lossy(v: &Value) -> Result<f64> {
     match v {
         Value::Null => Ok(0.0),
         Value::Bool(value) => Ok(if *value { 1.0 } else { 0.0 }),
-        Value::Number(_) | Value::String(_) => json_to_f64(v).or_else(|_| Ok(0.0)),
+        Value::Number(_) => json_to_f64(v),
+        Value::String(value) => Ok(mysql_string_to_f64(value)),
         Value::Array(_) | Value::Object(_) => Ok(0.0),
     }
+}
+
+fn mysql_string_to_f64(value: &str) -> f64 {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        index += 1;
+    }
+
+    let mut digits = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        digits += 1;
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            digits += 1;
+            index += 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+
+    let exponent_start = index;
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_digits_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == exponent_digits_start {
+            index = exponent_start;
+        }
+    }
+
+    value[..index].parse::<f64>().unwrap_or(0.0)
 }
 
 pub(super) fn number_from_f64(value: f64) -> Value {
@@ -833,17 +1169,7 @@ pub(super) fn value_to_u64(value: &Value) -> Option<u64> {
 }
 
 pub(super) fn value_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => value
-            .parse::<f64>()
-            .map(|v| v != 0.0)
-            .unwrap_or(!value.is_empty()),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
+    matches!(sql_truth(value), SqlTruth::True)
 }
 
 pub(super) fn eval_like_values(target: Value, pattern: Value, negated: bool) -> Value {
@@ -912,25 +1238,41 @@ pub(super) fn like_match(target: &str, pattern: &str) -> bool {
 
 pub(super) fn expr_field_value(expr: &Expr, data: &Map<String, Value>) -> Result<Value> {
     match expr {
-        Expr::Identifier(Ident { value, .. }) => Ok(data
-            .get(value)
-            .cloned()
-            .or_else(|| eval_bare_datetime_keyword(value))
-            .unwrap_or(Value::Null)),
+        Expr::Identifier(Ident { value, .. }) => {
+            let historical = historical_column_marker(value);
+            map_value_case_insensitive(data, value)
+                .or_else(|| map_value_case_insensitive(data, &historical))
+                .cloned()
+                .or_else(|| eval_bare_datetime_keyword(value))
+                .ok_or_else(|| anyhow!("unknown column: {value}"))
+        }
         Expr::CompoundIdentifier(parts) => {
             let key = parts
                 .iter()
                 .map(|p| p.value.clone())
                 .collect::<Vec<_>>()
                 .join(".");
-            Ok(data
-                .get(&key)
+            let historical = historical_column_marker(
+                parts
+                    .last()
+                    .map(|part| part.value.as_str())
+                    .unwrap_or_default(),
+            );
+            map_value_case_insensitive(data, &key)
+                .or_else(|| map_value_case_insensitive(data, &historical))
                 .cloned()
-                .or_else(|| data.get(&parts.last().expect("parts").value).cloned())
-                .unwrap_or(Value::Null))
+                .ok_or_else(|| anyhow!("unknown column: {key}"))
         }
         _ => expr_to_json(expr),
     }
+}
+
+fn map_value_case_insensitive<'a>(data: &'a Map<String, Value>, column: &str) -> Option<&'a Value> {
+    data.get(column).or_else(|| {
+        data.iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(column))
+            .map(|(_, value)| value)
+    })
 }
 
 pub(super) fn expr_resolved_value(expr: &Expr, data: &Map<String, Value>) -> Result<Value> {
@@ -980,15 +1322,60 @@ pub(super) fn eval_expr(
         Expr::Nested(expr) => eval_expr(expr, data, last_insert_id),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
             let value = eval_expr(expr, data, last_insert_id)?;
+            if value == Value::Null {
+                return Ok(Value::Null);
+            }
             Ok(number_from_f64(-json_to_f64_lossy(&value)?))
         }
-        Expr::UnaryOp { op, expr } if op.to_string().eq_ignore_ascii_case("NOT") => Ok(
-            Value::Bool(!value_truthy(&eval_expr(expr, data, last_insert_id)?)),
-        ),
-        Expr::UnaryOp { expr, .. } => eval_expr(expr, data, last_insert_id),
+        Expr::UnaryOp { op, expr } if op.to_string() == "+" => {
+            let value = eval_expr(expr, data, last_insert_id)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(number_from_f64(json_to_f64_lossy(&value)?))
+            }
+        }
+        Expr::UnaryOp { op, expr }
+            if op.to_string().eq_ignore_ascii_case("NOT") || op.to_string() == "!" =>
+        {
+            Ok(sql_not_value(eval_expr(expr, data, last_insert_id)?))
+        }
+        Expr::UnaryOp { op, expr } if op.to_string() == "~" => {
+            let value = eval_expr(expr, data, last_insert_id)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Number(Number::from(
+                    !(json_to_f64_lossy(&value)? as i64),
+                )))
+            }
+        }
+        Expr::UnaryOp { op, .. } => Err(anyhow!("unsupported unary operator: {op}")),
         Expr::BinaryOp { left, op, right } => {
             eval_binary_expr(left, op, right, data, last_insert_id)
         }
+        Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
+            sql_truth(&eval_expr(expr, data, last_insert_id)?),
+            SqlTruth::True
+        ))),
+        Expr::IsNotTrue(expr) => Ok(Value::Bool(!matches!(
+            sql_truth(&eval_expr(expr, data, last_insert_id)?),
+            SqlTruth::True
+        ))),
+        Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
+            sql_truth(&eval_expr(expr, data, last_insert_id)?),
+            SqlTruth::False
+        ))),
+        Expr::IsNotFalse(expr) => Ok(Value::Bool(!matches!(
+            sql_truth(&eval_expr(expr, data, last_insert_id)?),
+            SqlTruth::False
+        ))),
+        Expr::IsUnknown(expr) => Ok(Value::Bool(
+            eval_expr(expr, data, last_insert_id)? == Value::Null,
+        )),
+        Expr::IsNotUnknown(expr) => Ok(Value::Bool(
+            eval_expr(expr, data, last_insert_id)? != Value::Null,
+        )),
         Expr::IsNull(expr) => Ok(Value::Bool(
             eval_expr(expr, data, last_insert_id)? == Value::Null,
         )),
@@ -1001,12 +1388,11 @@ pub(super) fn eval_expr(
             negated,
         } => {
             let value = eval_expr(expr, data, last_insert_id)?;
-            let hit = list.iter().any(|item| {
-                eval_expr(item, data, last_insert_id)
-                    .map(|item| mysql_eq(&value, &item))
-                    .unwrap_or(false)
-            });
-            Ok(Value::Bool(if *negated { !hit } else { hit }))
+            let candidates = list
+                .iter()
+                .map(|item| eval_expr(item, data, last_insert_id))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(eval_in_values(value, candidates, *negated))
         }
         Expr::Like {
             expr,
@@ -1027,9 +1413,7 @@ pub(super) fn eval_expr(
             let v = eval_expr(expr, data, last_insert_id)?;
             let lo = eval_expr(low, data, last_insert_id)?;
             let hi = eval_expr(high, data, last_insert_id)?;
-            let hit = !compare_predicate_values(v.clone(), lo, |a, b| a < b)
-                && !compare_predicate_values(v, hi, |a, b| a > b);
-            Ok(Value::Bool(if *negated { !hit } else { hit }))
+            Ok(eval_between_values(v, lo, hi, *negated))
         }
         Expr::Case {
             operand,
@@ -1057,6 +1441,22 @@ pub(super) fn eval_expr(
         Expr::Extract { field, expr, .. } => {
             eval_extract_datetime_field(field, eval_expr(expr, data, last_insert_id)?)
         }
+        Expr::Ceil { expr, .. } => {
+            let value = eval_expr(expr, data, last_insert_id)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(number_from_f64(json_to_f64_lossy(&value)?.ceil()))
+            }
+        }
+        Expr::Floor { expr, .. } => {
+            let value = eval_expr(expr, data, last_insert_id)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(number_from_f64(json_to_f64_lossy(&value)?.floor()))
+            }
+        }
         Expr::Position { expr, r#in } => eval_position_values(
             eval_expr(expr, data, last_insert_id)?,
             eval_expr(r#in, data, last_insert_id)?,
@@ -1077,6 +1477,19 @@ pub(super) fn eval_expr(
                 .map(|expr| eval_expr(expr, data, last_insert_id))
                 .transpose()?;
             eval_substring_values(value, start, len)
+        }
+        Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            ..
+        } => {
+            let value = eval_expr(expr, data, last_insert_id)?;
+            let trim_what = trim_what
+                .as_ref()
+                .map(|expr| eval_expr(expr, data, last_insert_id))
+                .transpose()?;
+            Ok(eval_trim_values(value, trim_what, *trim_where))
         }
         Expr::Function(func) => eval_function_text(&func.to_string(), data, last_insert_id),
         Expr::Cast {
@@ -1100,8 +1513,43 @@ pub(super) fn eval_expr(
                 Ok(value)
             }
         }
-        _ => expr_to_json(expr),
+        _ => Err(anyhow!("unsupported expression: {expr}")),
     }
+}
+
+fn eval_trim_values(
+    value: Value,
+    trim_what: Option<Value>,
+    trim_where: Option<sqlparser::ast::TrimWhereField>,
+) -> Value {
+    if value == Value::Null || trim_what == Some(Value::Null) {
+        return Value::Null;
+    }
+
+    let value = json_scalar_to_string(&value);
+    let trim_what = trim_what
+        .as_ref()
+        .map(json_scalar_to_string)
+        .unwrap_or_else(|| " ".to_string());
+    if trim_what.is_empty() {
+        return Value::String(value);
+    }
+
+    let trim_leading = !matches!(trim_where, Some(sqlparser::ast::TrimWhereField::Trailing));
+    let trim_trailing = !matches!(trim_where, Some(sqlparser::ast::TrimWhereField::Leading));
+    let mut start = 0;
+    let mut end = value.len();
+    if trim_leading {
+        while start + trim_what.len() <= end && value[start..end].starts_with(&trim_what) {
+            start += trim_what.len();
+        }
+    }
+    if trim_trailing {
+        while start + trim_what.len() <= end && value[start..end].ends_with(&trim_what) {
+            end -= trim_what.len();
+        }
+    }
+    Value::String(value[start..end].to_string())
 }
 
 pub(super) fn eval_binary_expr(
@@ -1126,6 +1574,9 @@ pub(super) fn eval_binary_values(
         BinaryOperator::Minus => numeric_binary(left_value, right_value, |l, r| l - r),
         BinaryOperator::Multiply => numeric_binary(left_value, right_value, |l, r| l * r),
         BinaryOperator::Divide => {
+            if left_value == Value::Null || right_value == Value::Null {
+                return Ok(Value::Null);
+            }
             let divisor = json_to_f64_lossy(&right_value)?;
             if divisor == 0.0 {
                 Ok(Value::Null)
@@ -1134,6 +1585,9 @@ pub(super) fn eval_binary_values(
             }
         }
         BinaryOperator::Modulo => {
+            if left_value == Value::Null || right_value == Value::Null {
+                return Ok(Value::Null);
+            }
             let divisor = json_to_f64_lossy(&right_value)?;
             if divisor == 0.0 {
                 Ok(Value::Null)
@@ -1141,27 +1595,47 @@ pub(super) fn eval_binary_values(
                 Ok(number_from_f64(json_to_f64_lossy(&left_value)? % divisor))
             }
         }
-        BinaryOperator::Eq => Ok(Value::Bool(mysql_eq(&left_value, &right_value))),
-        BinaryOperator::NotEq => Ok(Value::Bool(mysql_ne(&left_value, &right_value))),
-        BinaryOperator::Gt => Ok(Value::Bool(
-            compare_json_values(&left_value, &right_value).is_gt(),
-        )),
-        BinaryOperator::GtEq => Ok(Value::Bool(
-            !compare_json_values(&left_value, &right_value).is_lt(),
-        )),
-        BinaryOperator::Lt => Ok(Value::Bool(
-            compare_json_values(&left_value, &right_value).is_lt(),
-        )),
-        BinaryOperator::LtEq => Ok(Value::Bool(
-            !compare_json_values(&left_value, &right_value).is_gt(),
-        )),
-        BinaryOperator::And => Ok(Value::Bool(
-            value_truthy(&left_value) && value_truthy(&right_value),
-        )),
-        BinaryOperator::Or => Ok(Value::Bool(
-            value_truthy(&left_value) || value_truthy(&right_value),
-        )),
-        _ => Ok(Value::Null),
+        BinaryOperator::MyIntegerDivide => {
+            if left_value == Value::Null || right_value == Value::Null {
+                return Ok(Value::Null);
+            }
+            let divisor = json_to_f64_lossy(&right_value)?;
+            if divisor == 0.0 {
+                Ok(Value::Null)
+            } else {
+                Ok(number_from_f64(
+                    (json_to_f64_lossy(&left_value)? / divisor).trunc(),
+                ))
+            }
+        }
+        BinaryOperator::Eq => Ok(mysql_eq_value(&left_value, &right_value)),
+        BinaryOperator::NotEq => Ok(sql_not_value(mysql_eq_value(&left_value, &right_value))),
+        BinaryOperator::Spaceship => Ok(Value::Bool(match (&left_value, &right_value) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => mysql_eq(&left_value, &right_value),
+        })),
+        BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq => {
+            Ok(comparison_value(&left_value, &right_value, op.clone()))
+        }
+        BinaryOperator::And => Ok(sql_and_values(left_value, right_value)),
+        BinaryOperator::Or => Ok(sql_or_values(left_value, right_value)),
+        BinaryOperator::Xor => Ok(sql_xor_values(left_value, right_value)),
+        BinaryOperator::BitwiseOr | BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXor => {
+            if left_value == Value::Null || right_value == Value::Null {
+                return Ok(Value::Null);
+            }
+            let left = json_to_f64_lossy(&left_value)? as i64;
+            let right = json_to_f64_lossy(&right_value)? as i64;
+            let value = match op {
+                BinaryOperator::BitwiseOr => left | right,
+                BinaryOperator::BitwiseAnd => left & right,
+                BinaryOperator::BitwiseXor => left ^ right,
+                _ => unreachable!(),
+            };
+            Ok(Value::Number(Number::from(value)))
+        }
+        _ => Err(anyhow!("unsupported binary operator: {op}")),
     }
 }
 
@@ -1177,6 +1651,9 @@ pub(super) fn numeric_binary(
     right: Value,
     op: impl FnOnce(f64, f64) -> f64,
 ) -> Result<Value> {
+    if left == Value::Null || right == Value::Null {
+        return Ok(Value::Null);
+    }
     Ok(number_from_f64(op(
         json_to_f64_lossy(&left)?,
         json_to_f64_lossy(&right)?,
@@ -1320,7 +1797,21 @@ pub(super) fn eval_function_text(
         "TRIM" => eval_unary_string(args.first(), data, last_insert_id, |value| {
             value.trim().to_string()
         }),
-        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+        "LENGTH" | "OCTET_LENGTH" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Number(Number::from(
+                    json_scalar_to_string(&value).len() as u64,
+                )))
+            }
+        }
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
             let value = args
                 .first()
                 .map(|arg| eval_scalar_text(arg, data, last_insert_id))
@@ -1508,7 +1999,7 @@ pub(super) fn eval_function_text(
         }
         _ => {
             tracing::debug!(function = %name, "sql.unsupported_function");
-            Ok(Value::Null)
+            Err(anyhow!("unsupported SQL function: {name}"))
         }
     }
 }

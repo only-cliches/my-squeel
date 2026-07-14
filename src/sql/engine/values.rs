@@ -10,17 +10,43 @@ pub(super) fn eval_insert_update_value(
     }
 
     match expr {
+        Expr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case("DEFAULT") => {
+            Ok(Value::String("DEFAULT".to_string()))
+        }
         Expr::Nested(expr) => eval_insert_update_value(expr, existing, incoming),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
             let value = eval_insert_update_value(expr, existing, incoming)?;
+            if value == Value::Null {
+                return Ok(Value::Null);
+            }
             Ok(number_from_f64(-json_to_f64_lossy(&value)?))
         }
-        Expr::UnaryOp { op, expr } if op.to_string().eq_ignore_ascii_case("NOT") => {
-            Ok(Value::Bool(!value_truthy(&eval_insert_update_value(
-                expr, existing, incoming,
-            )?)))
+        Expr::UnaryOp { op, expr } if op.to_string() == "+" => {
+            let value = eval_insert_update_value(expr, existing, incoming)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(number_from_f64(json_to_f64_lossy(&value)?))
+            }
         }
-        Expr::UnaryOp { expr, .. } => eval_insert_update_value(expr, existing, incoming),
+        Expr::UnaryOp { op, expr }
+            if op.to_string().eq_ignore_ascii_case("NOT") || op.to_string() == "!" =>
+        {
+            Ok(sql_not_value(eval_insert_update_value(
+                expr, existing, incoming,
+            )?))
+        }
+        Expr::UnaryOp { op, expr } if op.to_string() == "~" => {
+            let value = eval_insert_update_value(expr, existing, incoming)?;
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Number(Number::from(
+                    !(json_to_f64_lossy(&value)? as i64),
+                )))
+            }
+        }
+        Expr::UnaryOp { op, .. } => Err(anyhow!("unsupported unary operator: {op}")),
         Expr::BinaryOp { left, op, right } => {
             let left = eval_insert_update_value(left, existing, incoming)?;
             let right = eval_insert_update_value(right, existing, incoming)?;
@@ -32,18 +58,33 @@ pub(super) fn eval_insert_update_value(
         Expr::IsNotNull(expr) => Ok(Value::Bool(
             eval_insert_update_value(expr, existing, incoming)? != Value::Null,
         )),
+        Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
+            sql_truth(&eval_insert_update_value(expr, existing, incoming)?),
+            SqlTruth::True
+        ))),
+        Expr::IsNotTrue(expr) => Ok(Value::Bool(!matches!(
+            sql_truth(&eval_insert_update_value(expr, existing, incoming)?),
+            SqlTruth::True
+        ))),
+        Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
+            sql_truth(&eval_insert_update_value(expr, existing, incoming)?),
+            SqlTruth::False
+        ))),
+        Expr::IsNotFalse(expr) => Ok(Value::Bool(!matches!(
+            sql_truth(&eval_insert_update_value(expr, existing, incoming)?),
+            SqlTruth::False
+        ))),
         Expr::InList {
             expr,
             list,
             negated,
         } => {
             let value = eval_insert_update_value(expr, existing, incoming)?;
-            let hit = list.iter().any(|item| {
-                eval_insert_update_value(item, existing, incoming)
-                    .map(|item| mysql_eq(&value, &item))
-                    .unwrap_or(false)
-            });
-            Ok(Value::Bool(if *negated { !hit } else { hit }))
+            let candidates = list
+                .iter()
+                .map(|item| eval_insert_update_value(item, existing, incoming))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(eval_in_values(value, candidates, *negated))
         }
         Expr::Between {
             expr,
@@ -54,9 +95,7 @@ pub(super) fn eval_insert_update_value(
             let value = eval_insert_update_value(expr, existing, incoming)?;
             let low = eval_insert_update_value(low, existing, incoming)?;
             let high = eval_insert_update_value(high, existing, incoming)?;
-            let hit = !compare_predicate_values(value.clone(), low, |a, b| a < b)
-                && !compare_predicate_values(value, high, |a, b| a > b);
-            Ok(Value::Bool(if *negated { !hit } else { hit }))
+            Ok(eval_between_values(value, low, high, *negated))
         }
         Expr::Like {
             expr,
@@ -124,16 +163,30 @@ pub(super) fn assignment_target_name(assignment: &Assignment) -> String {
 }
 
 pub(super) fn unique_key(data: &Map<String, Value>, unique_cols: &[String]) -> Option<String> {
+    unique_key_with_prefixes(data, unique_cols, &[])
+}
+
+pub(super) fn unique_key_with_prefixes(
+    data: &Map<String, Value>,
+    unique_cols: &[String],
+    prefix_lengths: &[Option<u32>],
+) -> Option<String> {
     if unique_cols.is_empty() {
         return None;
     }
     let mut parts = Vec::with_capacity(unique_cols.len());
-    for column in unique_cols {
+    for (index, column) in unique_cols.iter().enumerate() {
         let value = data.get(column)?;
         if value == &Value::Null {
             return None;
         }
-        parts.push(encode_json_value(value));
+        let value = match (value, prefix_lengths.get(index).copied().flatten()) {
+            (Value::String(value), Some(length)) => {
+                Value::String(value.chars().take(length as usize).collect())
+            }
+            _ => value.clone(),
+        };
+        parts.push(encode_json_value(&value));
     }
     Some(parts.join(&UNIQUE_SEPARATOR.to_string()))
 }
@@ -192,6 +245,13 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         return coerce_double(value.clone()).unwrap_or(value);
     }
 
+    if sql_type.starts_with("date") && !sql_type.starts_with("datetime") {
+        return match value {
+            Value::String(value) if value.len() >= 10 => Value::String(value[..10].to_string()),
+            other => other,
+        };
+    }
+
     if sql_type.contains("char")
         || sql_type.contains("text")
         || sql_type.contains("date")
@@ -212,6 +272,185 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
     }
 
     value
+}
+
+pub(super) fn validate_mysql_column_value(
+    column: &str,
+    value: &Value,
+    hint: &ColumnHint,
+) -> Result<()> {
+    if value == &Value::Null {
+        return Ok(());
+    }
+    let declared = hint
+        .sql_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+
+    if (declared.contains("CHAR") || declared.contains("BINARY"))
+        && let Some(limit) = first_type_number(&declared)
+        && let Value::String(value) = value
+    {
+        let length = if declared.contains("BINARY") {
+            value.len()
+        } else {
+            value.chars().count()
+        };
+        if length > limit {
+            return Err(anyhow!("data too long for column '{column}'"));
+        }
+    }
+
+    if declared.contains("INT") || declared == "SERIAL" {
+        let text = match value {
+            Value::Number(value) => value.to_string(),
+            Value::Bool(value) => i32::from(*value).to_string(),
+            Value::String(value) => value.clone(),
+            _ => return Err(anyhow!("incorrect integer value for column '{column}'")),
+        };
+        let number = text
+            .parse::<i128>()
+            .map_err(|_| anyhow!("incorrect integer value for column '{column}'"))?;
+        let unsigned = declared.contains("UNSIGNED") || declared == "SERIAL";
+        let (minimum, maximum) = if declared.starts_with("TINYINT") {
+            if unsigned { (0, 255) } else { (-128, 127) }
+        } else if declared.starts_with("SMALLINT") {
+            if unsigned {
+                (0, 65_535)
+            } else {
+                (-32_768, 32_767)
+            }
+        } else if declared.starts_with("MEDIUMINT") {
+            if unsigned {
+                (0, 16_777_215)
+            } else {
+                (-8_388_608, 8_388_607)
+            }
+        } else if declared.starts_with("BIGINT") || declared == "SERIAL" {
+            if unsigned {
+                (0, u64::MAX as i128)
+            } else {
+                (i64::MIN as i128, i64::MAX as i128)
+            }
+        } else if unsigned {
+            (0, u32::MAX as i128)
+        } else {
+            (i32::MIN as i128, i32::MAX as i128)
+        };
+        if number < minimum || number > maximum {
+            return Err(anyhow!("out of range value for column '{column}'"));
+        }
+    }
+
+    if declared.starts_with("DECIMAL") || declared.starts_with("NUMERIC") {
+        let text = match value {
+            Value::String(value) => value.clone(),
+            Value::Number(value) => value.to_string(),
+            _ => return Err(anyhow!("incorrect decimal value for column '{column}'")),
+        };
+        let normalized = text.trim().trim_start_matches(['+', '-']);
+        if normalized.parse::<f64>().is_err() {
+            return Err(anyhow!("incorrect decimal value for column '{column}'"));
+        }
+        if let Some((precision, scale)) = decimal_precision_scale(&declared) {
+            let integer_digits = normalized
+                .split_once('.')
+                .map(|(integer, _)| integer)
+                .unwrap_or(normalized)
+                .trim_start_matches('0')
+                .len();
+            if integer_digits > precision.saturating_sub(scale) {
+                return Err(anyhow!("out of range value for column '{column}'"));
+            }
+        }
+    }
+
+    if declared.starts_with("DATE") && !declared.starts_with("DATETIME") {
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow!("incorrect date value for column '{column}'"))?;
+        let valid = NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
+            || NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").is_ok()
+            || NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").is_ok();
+        if !valid {
+            return Err(anyhow!("incorrect date value for column '{column}'"));
+        }
+    }
+    if declared.starts_with("DATETIME") || declared.starts_with("TIMESTAMP") {
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow!("incorrect datetime value for column '{column}'"))?;
+        let valid = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
+            .is_ok();
+        if !valid {
+            return Err(anyhow!("incorrect datetime value for column '{column}'"));
+        }
+    }
+    if declared.starts_with("TIME") && !declared.starts_with("TIMESTAMP") {
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow!("incorrect time value for column '{column}'"))?;
+        if !is_valid_mysql_time(text) {
+            return Err(anyhow!("incorrect time value for column '{column}'"));
+        }
+    }
+    if declared.starts_with("JSON")
+        && let Value::String(value) = value
+        && serde_json::from_str::<Value>(value).is_err()
+    {
+        return Err(anyhow!("invalid JSON text for column '{column}'"));
+    }
+    Ok(())
+}
+
+fn is_valid_mysql_time(value: &str) -> bool {
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let mut parts = value.split(':');
+    let hours = parts.next().and_then(|part| part.parse::<u16>().ok());
+    let minutes = parts.next().and_then(|part| part.parse::<u8>().ok());
+    let seconds = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let Some((seconds, fraction)) = seconds.map(|seconds| {
+        seconds
+            .split_once('.')
+            .map(|(seconds, fraction)| (seconds, Some(fraction)))
+            .unwrap_or((seconds, None))
+    }) else {
+        return false;
+    };
+    let seconds = seconds.parse::<u8>().ok();
+    hours.is_some_and(|hours| hours <= 838)
+        && minutes.is_some_and(|minutes| minutes <= 59)
+        && seconds.is_some_and(|seconds| seconds <= 59)
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty()
+                && fraction.len() <= 6
+                && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn first_type_number(declared: &str) -> Option<usize> {
+    let (_, tail) = declared.split_once('(')?;
+    tail.split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()
+}
+
+fn decimal_precision_scale(declared: &str) -> Option<(usize, usize)> {
+    let (_, tail) = declared.split_once('(')?;
+    let body = tail.split_once(')').map(|(body, _)| body).unwrap_or(tail);
+    let mut parts = body.split(',').map(str::trim);
+    let precision = parts.next()?.parse().ok()?;
+    let scale = parts
+        .next()
+        .and_then(|scale| scale.parse().ok())
+        .unwrap_or(0);
+    Some((precision, scale))
 }
 
 pub(super) fn coerce_number(value: Value) -> Option<Value> {

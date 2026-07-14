@@ -57,6 +57,42 @@ pub(super) fn split_sql_statements(sql: &str) -> Vec<String> {
     out
 }
 
+pub(super) fn parse_alter_table_drop_index(sql: &str) -> Option<(String, String)> {
+    let tokens = normalized_sql_tokens(sql);
+    if tokens.len() < 6
+        || !tokens[0].eq_ignore_ascii_case("ALTER")
+        || !tokens[1].eq_ignore_ascii_case("TABLE")
+        || !tokens[3].eq_ignore_ascii_case("DROP")
+        || !matches!(tokens[4].to_ascii_uppercase().as_str(), "INDEX" | "KEY")
+    {
+        return None;
+    }
+
+    let index_position = if tokens
+        .get(5)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+        && tokens
+            .get(6)
+            .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+    {
+        7
+    } else {
+        5
+    };
+    let table = unqualified_sql_identifier(tokens.get(2)?);
+    let index = unqualified_sql_identifier(tokens.get(index_position)?);
+    (!table.is_empty() && !index.is_empty()).then_some((table, index))
+}
+
+fn unqualified_sql_identifier(identifier: &str) -> String {
+    identifier
+        .rsplit('.')
+        .next()
+        .unwrap_or(identifier)
+        .trim_matches(['`', '"'])
+        .to_string()
+}
+
 pub(super) fn parse_show_columns_table(sql: &str) -> Option<String> {
     let tokens = normalized_sql_tokens(sql);
     let upper = tokens
@@ -140,6 +176,7 @@ pub(super) fn show_databases_result() -> QueryResult {
         rows_affected: 0,
         last_insert_id: 0,
         columns: vec![column],
+        column_metadata: vec![],
         rows,
     }
 }
@@ -175,6 +212,7 @@ pub(super) fn select_system_variables(sql: &str) -> Option<QueryResult> {
         rows_affected: 0,
         last_insert_id: 0,
         columns,
+        column_metadata: vec![],
         rows: vec![row],
     })
 }

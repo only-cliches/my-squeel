@@ -4,63 +4,58 @@
 
 # MySqweel
 
-**The development database for when your app is still becoming itself.**
+<p align="center">
+  <strong>A disposable, MySQL-shaped development database for apps that are still becoming themselves.</strong>
+</p>
 
-MySqweel is a **schema-drift-tolerant, development-only MySQL facade** built for fast local iteration.
+<p align="center">
+  <a href="https://github.com/only-cliches/my-sqweel/actions/workflows/ci.yml"><img src="https://github.com/only-cliches/my-sqweel/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
 
-It speaks enough MySQL for real application code to connect to it, but it does not force your local workflow to behave like production. Tables can inferred from inserts, extended from seed payloads, inspected through MySQL metadata, searched through a Meilisearch-shaped HTTP API, snapshotted, restored, reset, and intentionally broken for resilience testing.
+MySqweel is a development-only database server that speaks the MySQL wire protocol. It gives an
+application a real database connection while keeping local state easy to infer, inspect, seed,
+snapshot, reset, and deliberately break.
 
-## Why this exists
+Choose the default drift-tolerant profile for rapid iteration, or enable the strict profile when
+testing migrations, ORMs, prepared statements, result metadata, and MySQL error handling. The same
+process also exposes a debug API and a Meilisearch-shaped local search surface.
 
-Local development often has two bad options:
+> **Development only.** MySqweel is not a production database and does not provide ACID guarantees,
+> transaction semantics, replication, access control, secure multi-tenant isolation, or complete
+> MySQL compatibility.
 
-1. Run the full production-shaped stack locally and pay the complexity tax every day.
-2. Mock everything and discover integration problems too late.
+## At a glance
 
-MySqweel is a third lane.
+| Surface | Default | Purpose |
+| --- | --- | --- |
+| MySQL wire protocol | `127.0.0.1:3307` | Application, ORM, migration, and MySQL-client connections |
+| Debug and search HTTP | `127.0.0.1:3407` | Drift inspection, seeding, snapshots, and local search |
+| Storage | In memory | Disposable state; optional locked Lux-backed directory persistence |
+| Compatibility profiles | Drift tolerant / MySQL strict | Choose convenience or fail-fast schema behavior |
+| MySQL verification | MySQL 8.0.43 | 2,500-query differential corpus plus exact parity suites |
 
-It lets your app speak a real protocol, run real SQL-ish flows, and exercise real data access paths while still giving you the softness you want during product development.
+## Where it fits
 
-That softness matters.
+MySqweel is useful for:
 
-When you are building early, the schema is not sacred. The seed data is not sacred. The search index is not sacred. The whole thing should be resettable, inspectable, scriptable, and forgiving.
+- early application development while the schema is changing
+- local integration tests that need a disposable MySQL endpoint
+- ORM, query-builder, migration, and seed-script development
+- realistic UI flows without a full production-shaped stack
+- schema-drift inspection and fixture management
+- retry, loading, idempotency, and error-path testing
+- local text, facet, and vector-search development
+- demos, teaching, and experiments
 
-MySqweel is built around that belief.
+Use real MySQL—or the database you deploy—when you need production durability, transactions,
+permissions, replication, optimizer fidelity, security boundaries, scale, or compliance guarantees.
 
-## When MySqweel is a great fit
+## Quick start
 
-Use MySqweel when you are:
+### 1. Install from a checkout
 
-* building a new app before the schema has settled
-* prototyping with MySQL-compatible tooling
-* working on ORMs, query builders, migrations, or seed scripts
-* building UI flows that need realistic data
-* developing search experiences locally
-* writing integration tests that need a disposable database
-* testing how your app handles slow or failing queries
-* teaching, demoing, or experimenting
-
-## When MySqweel is the wrong fit
-
-Do not use MySqweel when you need:
-
-* production durability
-* ACID correctness
-* real MySQL compatibility across the full grammar
-* replication
-* permissions
-* user management
-* query planning
-* production-grade indexing
-* production search relevance
-* secure multi-tenant isolation
-* compliance guarantees
-
-Use real MySQL, MariaDB, Postgres, or your actual production database when correctness, durability, security, scale, and operational guarantees matter.
-
-## Install
-
-From source:
+You need a recent stable Rust toolchain and Cargo. A MySQL CLI is optional but useful for the
+examples below.
 
 ```sh
 git clone https://github.com/only-cliches/my-sqweel.git
@@ -68,102 +63,93 @@ cd my-sqweel
 cargo install --path .
 ```
 
-Or run directly:
+The installed binary is `sqwl`. You can also run it from the checkout with:
 
 ```sh
 cargo run --bin sqwl -- serve
 ```
 
-The installed binary is:
-
-```sh
-sqwl
-```
-
-## Start the server
+### 2. Start the server
 
 ```sh
 sqwl serve
 ```
 
-By default, MySqweel listens on:
+The MySQL and HTTP listeners bind to loopback by default:
 
 ```text
-MySQL wire:  127.0.0.1:3307
-Debug HTTP:  127.0.0.1:3407
+MySQL wire:   127.0.0.1:3307
+Debug/search: 127.0.0.1:3407
 ```
 
-Connect with a MySQL client:
+### 3. Connect
 
 ```sh
-mysql --protocol TCP -h 127.0.0.1 -P 3307 -u root app
+mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u root app
 ```
 
-Then use normal SQL:
+No password is required for the local connection. Try a normal schema and query flow:
 
 ```sql
 CREATE TABLE users (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  email VARCHAR(255),
-  display_name TEXT,
-  UNIQUE(email)
+  email VARCHAR(255) NOT NULL UNIQUE,
+  display_name VARCHAR(100)
 );
 
 INSERT INTO users (email, display_name)
 VALUES
-  ('ada@example.com', 'Ada'),
-  ('grace@example.com', 'Grace');
+  ('ada@example.test', 'Ada'),
+  ('grace@example.test', 'Grace');
 
 SELECT id, email, display_name
 FROM users
 ORDER BY id;
 ```
 
-## Use it behind your app
-
-Point your local app at MySqweel:
+Point an application at the same endpoint:
 
 ```sh
 export DATABASE_URL="mysql://root@127.0.0.1:3307/app"
 ```
 
-Then start your app as usual.
-
-That is the core trick. Your code gets a MySQL-shaped database. Your local workflow gets a forgiving development engine.
-
-## Durable local mode
-
-By default, MySqweel uses in-memory embedded storage.
-
-For a local persistent database:
+For fail-fast compatibility work, start with the strict profile instead:
 
 ```sh
-sqwl --data-dir .my-sqweel/data serve
+sqwl --mysql-strict serve
 ```
 
-Persistent mode uses embedded Lux storage and protects the data directory with a lock file so the same directory is not opened twice.
+## Choose a compatibility profile
 
-## Serve plus REPL
+MySqweel has two intentionally different development workflows.
 
-Run the MySQL server and an interactive maintenance shell at the same time:
+| Behavior | Drift tolerant (default) | MySQL strict (`--mysql-strict`) |
+| --- | --- | --- |
+| Missing tables or columns during writes | Infer and extend schema hints | Return an error |
+| Repeated `CREATE TABLE` | Merge new hints into known metadata | Use MySQL-style exists behavior |
+| Declared types, ranges, lengths, nulls, and defaults | Best-effort coercion | Validate and reject invalid values |
+| Unique conflicts | Overwrite by default; configurable | Enforce uniqueness |
+| Foreign keys | Enforce declared relationships and actions | Enforce relationships with MySQL-style errors |
+| Best use | Prototypes, fixtures, changing DTOs | ORMs, migrations, protocol and compatibility tests |
+
+Strict mode also returns common MySQL wire error numbers for missing tables and columns, duplicate
+entries, null/default violations, invalid values, length/range errors, and foreign-key failures.
+
+Strict mode narrows accidental differences; it does not turn MySqweel into MySQL. Both profiles use
+the same supported SQL surface, and neither implements transaction semantics.
+
+### Unique conflicts without full strict mode
+
+The drift profile can enforce unique keys while retaining schema inference:
 
 ```sh
-sqwl serve --repl
+sqwl --unique-mode enforce serve
 ```
 
-Inside the REPL:
+The default is `--unique-mode overwrite`, which is convenient for repeatable seeds. The strict
+profile always enforces unique keys.
 
-```text
-sqwl> status
-sqwl> drift report
-sqwl> snapshot save before-auth-refactor
-sqwl> sql SELECT * FROM users ORDER BY id
-sqwl> reset users
-sqwl> snapshot restore before-auth-refactor
-sqwl> quit
-```
-
-## CLI
+## CLI reference
 
 ```text
 sqwl [options] serve [--repl]
@@ -172,25 +158,29 @@ sqwl explain <sql>
 sqwl help
 ```
 
-Options:
+Global options in the table below must appear before the subcommand.
 
-| Option                   | Purpose                                                   |
-| ------------------------ | --------------------------------------------------------- |
-| `--bind <addr>`          | MySQL bind address. Default: `127.0.0.1:3307`.            |
-| `--data-dir <dir>`       | Enable durable embedded storage in a local directory.     |
-| `--allow-remote`         | Permit non-loopback bind addresses. Use carefully.        |
-| `--unique-mode <mode>`   | `overwrite` or `enforce`. Default: `overwrite`.           |
-| `--debug-bind <addr>`    | Debug HTTP bind address. Default: MySQL port plus 100.    |
-| `--query-delay-ms <n>`   | Add fixed latency to every SQL statement.                 |
-| `--fail-read-every <n>`  | Fail every Nth read statement.                            |
-| `--fail-write-every <n>` | Fail every Nth write statement.                           |
-| `--snapshot-dir <path>`  | REPL snapshot directory. Default: `.my-sqweel/snapshots`. |
-| `--log-filter <filter>`  | Tracing filter. Default: `my_sqweel=info`.                |
+| Option | Purpose |
+| --- | --- |
+| `--bind <addr>` | MySQL bind address; default `127.0.0.1:3307` |
+| `--debug-bind <addr>` | Debug/search HTTP bind; default is the MySQL port plus 100 |
+| `--data-dir <dir>` | Enable locked Lux-backed directory persistence |
+| `--allow-remote` | Permit non-loopback MySQL and HTTP bindings |
+| `--mysql-strict` | Reject schema drift and use MySQL-style validation errors |
+| `--unique-mode <mode>` | Choose `overwrite` or `enforce`; default `overwrite` |
+| `--query-delay-ms <n>` | Add fixed latency to each SQL statement |
+| `--fail-read-every <n>` | Fail every Nth read statement |
+| `--fail-write-every <n>` | Fail every Nth write statement |
+| `--snapshot-dir <path>` | REPL snapshot directory; default `.my-sqweel/snapshots` |
+| `--log-filter <filter>` | Tracing filter; default `my_sqweel=info` |
 
-## Explain SQL without running it
+The debug/search API is always enabled. `--allow-remote` can expose unauthenticated, state-mutating
+development endpoints; never bind MySqweel to an untrusted network.
+
+### Explain SQL without executing it
 
 ```sh
-sqwl explain "SELECT id, email FROM users WHERE email = 'ada@example.com'"
+sqwl explain "SELECT id, email FROM users WHERE email = 'ada@example.test'"
 ```
 
 Example output:
@@ -202,43 +192,69 @@ Example output:
     {
       "kind": "query",
       "tables": ["users"],
-      "normalized": "SELECT id, email FROM users WHERE email = 'ada@example.com'"
+      "normalized": "SELECT id, email FROM users WHERE email = 'ada@example.test'"
     }
   ]
 }
 ```
 
-## Schema drift is a feature
+## Local-data workflows
 
-MySqweel keeps schema hints, but it does not panic just because your local data is messy.
+### Durable local state
 
-It can tell you where reality and declared schema disagree:
+Without `--data-dir`, state lives in memory and disappears with the process. To reuse a local
+database between runs:
+
+```sh
+sqwl --data-dir .my-sqweel/data serve
+```
+
+The embedded Lux store locks the directory so two MySqweel processes cannot open it concurrently.
+Durable local mode is still not production durability.
+
+### Maintenance REPL
+
+Run the server and maintenance shell together:
+
+```sh
+sqwl serve --repl
+```
+
+Or open only the REPL, optionally against an existing data directory:
+
+```sh
+sqwl --data-dir .my-sqweel/data repl
+```
+
+Common commands:
+
+```text
+status
+drift check
+drift report
+snapshot save <name>
+snapshot restore <name>
+snapshot list
+index rebuild [--all|<table>]
+reset [table]
+explain <sql>
+sql <sql>
+help
+quit
+```
+
+### Inspect schema drift
+
+The drift report compares declared schema hints with stored rows:
 
 ```sh
 curl http://127.0.0.1:3407/_drift/report
 ```
 
-You can also ask the REPL:
+It reports known tables, row counts, declared columns, missing row fields, extra fields, and
+duplicate values for unique constraints.
 
-```text
-sqwl> drift check
-sqwl> drift report
-```
-
-A drift report includes:
-
-* known tables
-* row counts
-* declared schema columns
-* columns missing from rows
-* extra row fields not present in schema
-* duplicate values for unique constraints
-
-This is useful when you are rapidly changing DTOs, migrations, seed data, fixtures, or product assumptions.
-
-## Seed JSON directly
-
-Seed a table through the debug HTTP API:
+### Seed JSON directly
 
 ```sh
 curl -X POST http://127.0.0.1:3407/_drift/tables/users/seed \
@@ -247,12 +263,12 @@ curl -X POST http://127.0.0.1:3407/_drift/tables/users/seed \
     "mode": "replace",
     "rows": [
       {
-        "email": "ada@example.com",
+        "email": "ada@example.test",
         "display_name": "Ada Lovelace",
         "role": "admin"
       },
       {
-        "email": "grace@example.com",
+        "email": "grace@example.test",
         "display_name": "Grace Hopper",
         "role": "engineer"
       }
@@ -260,49 +276,130 @@ curl -X POST http://127.0.0.1:3407/_drift/tables/users/seed \
   }'
 ```
 
-If the table or columns do not exist yet, MySqweel can infer the shape from the seed payload.
+In the drift profile, the seed endpoint can infer a missing table and columns from the payload.
 
-## Snapshots
+### Save and restore snapshots
 
-Take a snapshot through HTTP:
+The REPL stores named snapshots under `--snapshot-dir`:
+
+```text
+snapshot save before-auth-refactor
+reset users
+snapshot restore before-auth-refactor
+```
+
+The HTTP API can also return or restore complete engine snapshots:
 
 ```sh
 curl -X POST http://127.0.0.1:3407/_drift/snapshot
 ```
 
-Or use the REPL:
+### Inject failures
 
-```text
-sqwl> snapshot save clean-demo
-sqwl> snapshot restore clean-demo
-sqwl> snapshot list
+Add latency or deterministic read/write failures:
+
+```sh
+sqwl \
+  --query-delay-ms 100 \
+  --fail-read-every 10 \
+  --fail-write-every 7 \
+  serve
 ```
 
-Snapshots make local workflows cheap:
+This is useful for testing retries, loading states, error handling, idempotency, and unhappy-path
+user experiences.
 
-```text
-seed fixture
-run app
-break everything
-restore fixture
-try again
-```
+## MySQL compatibility
+
+MySqweel implements a practical, tested MySQL subset. Unsupported syntax returns an explicit error
+instead of being silently evaluated as `NULL`, `FALSE`, or a partial result.
+
+### Verification contract
+
+- A deterministic 2,500-query corpus compares column names and normalized values with MySQL 8.0.43.
+- The current corpus result is 2,500/2,500 exact matches; CI fails below 95%.
+- Broader parity tests require exact results for every claimed DDL, DML, metadata, and query shape.
+- Wire tests verify common MySQL error numbers and typed prepared-statement behavior.
+- ORM-shaped tests cover migration, CRUD, relation, and introspection patterns used by Diesel,
+  Drizzle/Knex, Prisma, and SeaORM.
+
+The percentage describes this versioned corpus, not the entire MySQL grammar. Every reported edge
+case should become a regression case before its implementation is changed.
+
+### Schema, DDL, and metadata
+
+- `CREATE TABLE` and `CREATE TEMPORARY TABLE`
+- primary, unique, secondary, prefix, and foreign-key metadata
+- virtual and stored generated columns
+- `ALTER TABLE` add, drop, rename, change, and modify column forms
+- column defaults, types, nullability, `FIRST`, and `AFTER`
+- `CREATE INDEX`, prefix indexes, `DROP INDEX`, and `ALTER TABLE ... DROP INDEX`
+- `DROP TABLE`, `TRUNCATE TABLE`, and `RENAME TABLE`
+- foreign-key validation and `CASCADE`, `SET NULL`, `RESTRICT`, and `NO ACTION`
+- `SHOW TABLES`, `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, and `DESCRIBE`
+- common `information_schema` views used by clients and ORMs
+
+### Writes
+
+- `INSERT ... VALUES` and `INSERT ... SELECT`
+- `INSERT IGNORE`, `REPLACE`, and `ON DUPLICATE KEY UPDATE`
+- `UPDATE`, including common joined-update forms
+- single-table deletes with ordering/limits and MySQL multi-table delete forms
+- `RETURNING` for inserts, updates, and deletes
+- auto-increment keys, defaults, generated values, type coercion, and affected-row counts
+
+### Queries
+
+- `SELECT`, `DISTINCT`, aliases, qualified wildcards, and expression projections
+- `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`
+- aggregate, scalar, date/time, JSON, string, numeric, and conversion functions
+- `INNER`, `LEFT`, `RIGHT`, `CROSS`, `NATURAL`, `ON`, and `USING` joins
+- derived tables and nonrecursive CTEs with column aliases
+- scalar and `EXISTS`/`IN` subqueries
+- `UNION`, `INTERSECT`, and `EXCEPT`, including `ALL`/`DISTINCT` variants
+- named/inline windows, common `ROWS` frames, and peer-aware `RANGE` behavior
+- `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`,
+  `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, and aggregate windows
+- MySQL-style three-valued logic, numeric-prefix coercion, and byte/character length behavior
+
+See [CHANGELOG.md](CHANGELOG.md) for the detailed function and compatibility history.
+
+### Wire and client behavior
+
+- prepared statements and positional parameters
+- declared/inferred result types and nullability
+- signed/unsigned numeric widths, decimal scale, and source-table metadata
+- typed `DATE`, `DATETIME`, `TIMESTAMP`, and signed fractional `TIME` values
+- JSON and binary result metadata
+- `LAST_INSERT_ID()`, `DATABASE()`, `SCHEMA()`, and common session variables
+- charset, collation, and MySQL system-metadata stubs
+
+### Explicit limits
+
+The following are outside the supported compatibility surface:
+
+- transaction semantics, isolation, savepoints, and row locking
+- recursive CTEs
+- `FULL JOIN`
+- stored procedures, stored functions, triggers, and events
+- replication, users, grants, and production authentication
+- exact optimizer, index-planning, collation, and locking behavior
+- the remainder of the MySQL grammar not listed above
+
+Use real MySQL for tests that depend on any of these behaviors.
 
 ## Meilisearch-shaped local search
 
-MySqweel also exposes a local search API shaped like Meilisearch.
+The debug HTTP listener also provides a local API shaped like Meilisearch. SQL tables remain the
+source of truth; document mutations update table rows and rebuild the derived Tantivy search index.
 
-Create an index:
+Create an index and add documents:
 
 ```sh
 curl -X POST http://127.0.0.1:3407/indexes \
   -H 'content-type: application/json' \
   -d '{ "uid": "books", "primaryKey": "id" }'
-```
 
-Add documents:
-
-```sh
 curl -X POST http://127.0.0.1:3407/indexes/books/documents \
   -H 'content-type: application/json' \
   -d '{
@@ -339,26 +436,15 @@ curl -X POST http://127.0.0.1:3407/indexes/books/search \
   }'
 ```
 
-Supported development workflows include:
+The development compatibility surface includes document CRUD, filters, sorting, facets, facet
+search, multi-search, settings, task-shaped responses, stats, dumps, webhooks, and API-key stubs.
+Official Meilisearch JavaScript-client flows are covered by tests; Python client coverage is
+available when its optional dependency is installed.
 
-* index creation
-* document add, patch, replace, delete
-* search
-* filters
-* sorting
-* facets
-* facet search
-* multi-search
-* task responses
-* settings
-* stats
-* dumps
-* webhooks
-* API key stubs
+This is not a complete Meilisearch implementation. Authentication is permissive/stubbed, task
+execution is local, and relevance is not guaranteed to match a production Meilisearch server.
 
-This is not a full Meilisearch replacement. It is a local compatibility surface for building and testing app behavior without running another service.
-
-## Vector search
+### Vector search
 
 Declare a vector column:
 
@@ -370,20 +456,7 @@ CREATE TABLE books (
 );
 ```
 
-Insert vector data:
-
-```sh
-curl -X POST http://127.0.0.1:3407/indexes/books/documents \
-  -H 'content-type: application/json' \
-  -d '{
-    "documents": [
-      { "id": "1", "title": "Dune", "embedding": [0.9, 0.1, 0.2] },
-      { "id": "2", "title": "Foundation", "embedding": [0.1, 0.9, 0.3] }
-    ]
-  }'
-```
-
-Search by vector:
+Add vectors through the document endpoint, then search with a query vector:
 
 ```sh
 curl -X POST http://127.0.0.1:3407/indexes/books/search \
@@ -395,207 +468,83 @@ curl -X POST http://127.0.0.1:3407/indexes/books/search \
   }'
 ```
 
-MySqweel uses cosine similarity for local vector ranking.
+Local vector ranking uses cosine similarity.
 
-## SQL support
+## HTTP endpoint map
 
-MySqweel is not a complete MySQL implementation, but it supports a practical subset for development.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Basic process health |
+| `GET /version` | Version payload |
+| `GET /_drift/health` | Drift API health |
+| `GET /_drift/report` | Schema-drift report |
+| `GET /_drift/tables` | Known tables |
+| `GET /_drift/tables/{table}/rows` | Inspect table rows |
+| `POST /_drift/tables/{table}/seed` | Seed JSON rows |
+| `POST /_drift/snapshot` | Export an engine snapshot |
+| `POST /_drift/restore` | Restore an engine snapshot |
+| `GET/POST /indexes` | List or create search indexes |
+| `POST /indexes/{uid}/documents` | Add or update documents |
+| `POST /indexes/{uid}/search` | Search an index |
+| `POST /indexes/{uid}/facet-search` | Search facet values |
+| `POST /multi-search` | Run multiple searches |
+| `GET /tasks` | List task-shaped responses |
+| `GET /stats` | Instance statistics |
 
-### DDL and metadata
-
-* `CREATE TABLE`
-* `ALTER TABLE ADD COLUMN`
-* metadata capture for primary keys, unique keys, indexes, and foreign keys
-* `CREATE INDEX`
-* `DROP TABLE`
-* `DROP INDEX`
-* `TRUNCATE TABLE`
-* `RENAME TABLE`
-* `SHOW TABLES`
-* `SHOW COLUMNS`
-* `SHOW INDEX`
-* `SHOW CREATE TABLE`
-* `DESCRIBE`
-* common `information_schema` views
-
-### Writes
-
-* `INSERT ... VALUES`
-* `INSERT ... SELECT`
-* `INSERT IGNORE`
-* `REPLACE`
-* `ON DUPLICATE KEY UPDATE`
-* `UPDATE`
-* `DELETE`
-* `RETURNING`
-* auto-increment primary keys
-* defaults
-* basic type coercion
-* unique constraint handling
-
-### Reads
-
-* `SELECT`
-* `WHERE`
-* `ORDER BY`
-* `LIMIT`
-* `OFFSET`
-* `GROUP BY`
-* aggregate functions
-* scalar functions
-* `INNER JOIN`
-* `LEFT JOIN`
-* implicit cross joins
-* derived tables
-* scalar subqueries
-* `EXISTS`
-* `IN`
-* `UNION`
-
-### Compatibility helpers
-
-* prepared statements
-* `LAST_INSERT_ID()`
-* `DATABASE()`
-* `SCHEMA()`
-* common session variables
-* MySQL-ish system metadata
-* charset and collation metadata stubs
-
-## Unique constraint modes
-
-By default, MySqweel uses `overwrite` mode:
-
-```sh
-sqwl --unique-mode overwrite serve
-```
-
-That means incoming rows can replace conflicting rows. This is convenient for local iteration and seed workflows.
-
-For stricter behavior:
-
-```sh
-sqwl --unique-mode enforce serve
-```
-
-In `enforce` mode, unique constraint violations return errors.
-
-## Failure injection
-
-Test your app against database pain without setting up chaos infrastructure:
-
-```sh
-sqwl --query-delay-ms 250 serve
-```
-
-Fail every third read:
-
-```sh
-sqwl --fail-read-every 3 serve
-```
-
-Fail every fifth write:
-
-```sh
-sqwl --fail-write-every 5 serve
-```
-
-Combine them:
-
-```sh
-sqwl \
-  --query-delay-ms 100 \
-  --fail-read-every 10 \
-  --fail-write-every 7 \
-  serve
-```
-
-This is useful for checking retry behavior, loading states, error handling, idempotency, and unhappy-path UX.
-
-## Debug HTTP endpoints
-
-| Endpoint                           | Purpose                        |
-| ---------------------------------- | ------------------------------ |
-| `GET /health`                      | Basic health check.            |
-| `GET /version`                     | Local version payload.         |
-| `GET /_drift/health`               | Drift API health check.        |
-| `GET /_drift/report`               | Schema drift report.           |
-| `GET /_drift/tables`               | List known tables.             |
-| `GET /_drift/tables/{table}/rows`  | Inspect table rows.            |
-| `POST /_drift/tables/{table}/seed` | Seed JSON rows into a table.   |
-| `POST /_drift/snapshot`            | Return a full engine snapshot. |
-| `POST /_drift/restore`             | Restore a snapshot.            |
-| `GET /indexes`                     | List search indexes.           |
-| `POST /indexes`                    | Create a search index.         |
-| `POST /indexes/{uid}/search`       | Search documents.              |
-| `POST /multi-search`               | Run multiple searches.         |
-| `GET /tasks`                       | List task-style responses.     |
-| `GET /stats`                       | Instance stats.                |
-
-There are additional Meilisearch-shaped routes for settings, documents, dumps, webhooks, keys, and per-index stats.
+Additional Meilisearch-shaped routes cover per-index settings and stats, document fetch/delete,
+index swaps, dumps, webhooks, and keys.
 
 ## Development
 
-Run tests:
+Run the complete local suite:
 
 ```sh
-cargo test
+cargo test --all-targets --locked
 ```
 
-Format:
+When Docker and a local `mysql:8.0.43` image are available, compatibility tests provision and
+remove their own comparison server. To require comparison or use an existing MySQL instance:
 
 ```sh
-cargo fmt
+MYSQL_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test \
+MYSQL_PARITY_REQUIRED=1 \
+cargo test --all-targets --locked
 ```
 
-Lint:
+Formatting and linting:
 
 ```sh
+cargo fmt --all --check
 cargo clippy --all-targets --all-features
 ```
 
-Run locally with logs:
+Run from the checkout with debug logs:
 
 ```sh
-RUST_LOG=my_sqweel=debug cargo run --bin sqwl -- serve --repl
+cargo run --bin sqwl -- --log-filter my_sqweel=debug serve --repl
 ```
+
+When fixing a compatibility mismatch, add the smallest reproducing query to the differential
+corpus or parity suite first. A useful report includes the schema, fixture rows, query, MySQL
+version, expected result, and MySqweel result.
 
 ## Project layout
 
 ```text
-src/bin/sqwl.rs              CLI entrypoint
-src/lib.rs                   CLI parsing, REPL, help, explain
-src/server/mysql_wire.rs     MySQL wire protocol server
-src/server/debug_http.rs     Drift API and Meilisearch-shaped HTTP API
-src/sql/mod.rs               MySQL dialect parsing
-src/sql/engine/              SQL execution engine
-src/schema/mod.rs            Schema hint model
-src/model.rs                 Stored row model
-src/storage/mod.rs           Embedded Lux-backed Redis-like storage layer
+src/bin/sqwl.rs                    CLI entrypoint
+src/lib.rs                         CLI, REPL, snapshots, and SQL explain
+src/server/mysql_wire.rs           MySQL wire protocol and typed results
+src/server/debug_http.rs           Drift and Meilisearch-shaped HTTP APIs
+src/sql/mod.rs                     MySQL-dialect parsing
+src/sql/engine/                    SQL execution and compatibility validation
+src/schema/mod.rs                  Schema-hint model
+src/model.rs                       Stored-row model
+src/storage/mod.rs                 Embedded Lux-backed storage adapter
+tests/mysql_compatibility_corpus.rs Differential MySQL query corpus
+tests/mysql_parity.rs              Exact real-MySQL parity suite
+tests/orm_compatibility.rs         ORM-shaped wire and migration coverage
 ```
-
-## Design principles
-
-### 1. Speak the protocol apps already use
-
-The app should not need a fake adapter just because the database is local.
-
-### 2. Make drift observable, not fatal
-
-Early product development is messy. Local tooling should show the mess clearly without blocking every experiment.
-
-### 3. Prefer resettable over precious
-
-Local state should be easy to seed, snapshot, restore, and delete.
-
-### 4. Be useful before being complete
-
-MySqweel does not need to be all of MySQL to unlock real local workflows.
-
-### 5. Stay honest
-
-The production warning is not legal decoration. It is the contract.
 
 ## License
 
-MIT
+[MIT](LICENSE)

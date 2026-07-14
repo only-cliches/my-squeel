@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 
-use crate::sql::engine::{Engine, QueryResult, UniqueMode};
+use crate::sql::engine::{CompatibilityProfile, Engine, QueryResult, UniqueMode};
 
 pub mod model;
 pub mod schema;
@@ -132,6 +132,12 @@ fn parse_cli(args: &[String]) -> Result<(AppConfig, Command)> {
         }
         if let Some(value) = option_value(args, &mut idx, "--unique-mode")? {
             app.server.engine.unique_mode = parse_unique_mode(&value)?;
+            idx += 1;
+            continue;
+        }
+        if arg == "--mysql-strict" {
+            app.server.engine.compatibility_profile = CompatibilityProfile::MysqlStrict;
+            app.server.engine.unique_mode = UniqueMode::Enforce;
             idx += 1;
             continue;
         }
@@ -662,6 +668,7 @@ fn print_help() {
         "  --data-dir <dir>              locked Lux-backed data directory\n",
         "  --allow-remote                allow non-loopback bind addresses\n",
         "  --unique-mode <mode>          overwrite or enforce (default overwrite)\n",
+        "  --mysql-strict                reject drift and enforce MySQL-style errors\n",
         "  --debug-bind <addr>           debug HTTP bind address (default: bind port + 100)\n",
         "  --query-delay-ms <n>          add fixed latency per SQL statement\n",
         "  --fail-read-every <n>         fail every Nth read statement\n",
@@ -733,6 +740,18 @@ mod tests {
     fn parse_cli_allows_only_two_unique_modes() {
         let err = parse_cli(&["--unique-mode".to_string(), "warn".to_string()]).unwrap_err();
         assert!(err.to_string().contains("expected overwrite or enforce"));
+    }
+
+    #[test]
+    fn parse_cli_enables_mysql_strict_profile_and_uniqueness() {
+        let (app, command) =
+            parse_cli(&["--mysql-strict".to_string(), "serve".to_string()]).unwrap();
+        assert!(matches!(command, Command::Serve { repl: false }));
+        assert_eq!(
+            app.server.engine.compatibility_profile,
+            CompatibilityProfile::MysqlStrict
+        );
+        assert_eq!(app.server.engine.unique_mode, UniqueMode::Enforce);
     }
 
     #[test]

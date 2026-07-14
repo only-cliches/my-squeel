@@ -539,9 +539,10 @@ fn supports_mysql_insert_modes() {
         "Alice"
     );
 
-    engine
+    let updated = engine
         .execute_sql("INSERT INTO users (email, name) VALUES ('a@example.com', 'Updated') ON DUPLICATE KEY UPDATE name = VALUES(name);")
         .unwrap();
+    assert_eq!(updated[0].rows_affected, 2);
     let after_upsert = engine
         .execute_sql("SELECT name FROM users WHERE email = 'a@example.com'")
         .unwrap();
@@ -554,9 +555,10 @@ fn supports_mysql_insert_modes() {
         "Updated"
     );
 
-    engine
+    let replaced = engine
         .execute_sql("REPLACE INTO users (email, name) VALUES ('a@example.com', 'Replaced');")
         .unwrap();
+    assert_eq!(replaced[0].rows_affected, 2);
     let after_replace = engine
         .execute_sql("SELECT name FROM users WHERE email = 'a@example.com'")
         .unwrap();
@@ -579,7 +581,7 @@ fn exposes_richer_information_schema_columns() {
         .unwrap();
 
     let info = engine
-        .execute_sql("SELECT column_name, ordinal_position, is_nullable, column_default, column_type, column_key, extra FROM information_schema.columns WHERE table_name = 'users'")
+        .execute_sql("SELECT column_name, ordinal_position, is_nullable, column_default, column_type, data_type, column_key, extra FROM information_schema.columns WHERE table_name = 'users'")
         .unwrap();
 
     let id = info[0]
@@ -589,6 +591,9 @@ fn exposes_richer_information_schema_columns() {
         .expect("id column");
     assert_eq!(id.get("column_key").unwrap().as_str().unwrap(), "PRI");
     assert_eq!(id.get("extra").unwrap().as_str().unwrap(), "auto_increment");
+    assert_eq!(id.get("is_nullable").unwrap().as_str().unwrap(), "NO");
+    assert_eq!(id.get("column_type").unwrap().as_str().unwrap(), "bigint");
+    assert_eq!(id.get("data_type").unwrap().as_str().unwrap(), "bigint");
 
     let email = info[0]
         .rows
@@ -606,9 +611,15 @@ fn supports_alter_table_metadata_expansion_and_more_introspection() {
     engine
         .execute_sql("CREATE TABLE users (id BIGINT PRIMARY KEY AUTO_INCREMENT, email VARCHAR(255) UNIQUE, legacy TEXT);")
         .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (email, legacy) VALUES ('a@example.com', 'old')")
+        .unwrap();
 
     engine
         .execute_sql("ALTER TABLE users ADD COLUMN display_name TEXT")
+        .unwrap();
+    engine
+        .execute_sql("UPDATE users SET display_name = 'Alice!'")
         .unwrap();
     engine
         .execute_sql("ALTER TABLE users RENAME COLUMN display_name TO handle")
@@ -625,7 +636,7 @@ fn supports_alter_table_metadata_expansion_and_more_introspection() {
         .unwrap();
     assert!(cols[0].rows.iter().any(|row| {
         row.get("column_name").and_then(|v| v.as_str()) == Some("handle")
-            && row.get("column_type").and_then(|v| v.as_str()) == Some("VARCHAR(128)")
+            && row.get("column_type").and_then(|v| v.as_str()) == Some("varchar(128)")
             && row.get("is_nullable").and_then(|v| v.as_str()) == Some("NO")
     }));
     assert!(
@@ -633,6 +644,11 @@ fn supports_alter_table_metadata_expansion_and_more_introspection() {
             .rows
             .iter()
             .any(|row| row.get("column_name").and_then(|v| v.as_str()) == Some("legacy"))
+    );
+    let renamed = engine.execute_sql("SELECT handle FROM users").unwrap();
+    assert_eq!(
+        renamed[0].rows[0].get("handle").and_then(|v| v.as_str()),
+        Some("Alice!")
     );
 
     let schemata = engine
@@ -804,7 +820,7 @@ fn information_schema_columns_reports_all_documented_columns() {
         .iter()
         .find(|row| row.get("column_name").and_then(|v| v.as_str()) == Some("note"))
         .expect("note row");
-    assert_eq!(note.get("column_key").and_then(|v| v.as_str()), Some(""));
+    assert_eq!(note.get("column_key").and_then(|v| v.as_str()), Some("MUL"));
     assert_eq!(
         note.get("table_schema").and_then(|v| v.as_str()),
         Some("app")
@@ -969,7 +985,7 @@ fn information_schema_key_column_usage_emits_pk_unique_and_fk_rows() {
         .filter(|row| {
             row.get("constraint_name")
                 .and_then(|v| v.as_str())
-                .map(|name| name.contains("email") && name.ends_with("_uniq"))
+                .map(|name| name == "email")
                 .unwrap_or(false)
         })
         .collect();

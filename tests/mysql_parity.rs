@@ -1,163 +1,15 @@
+mod common;
+
 use std::net::TcpListener;
-use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use my_sqweel::server::WireServer;
-use my_sqweel::sql::engine::Engine;
+use my_sqweel::sql::engine::{Engine, EngineConfig};
 use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, Row, Value as MyValue};
 
-const MYSQL_DOCKER_IMAGE: &str = "mysql:8";
-const MYSQL_DOCKER_PASSWORD: &str = "my-sqweel";
-const MYSQL_DOCKER_DATABASE: &str = "test";
-
-enum MysqlTarget {
-    External(String),
-    Docker(DockerMysql),
-}
-
-impl MysqlTarget {
-    fn url(&self) -> &str {
-        match self {
-            MysqlTarget::External(url) => url,
-            MysqlTarget::Docker(container) => &container.url,
-        }
-    }
-}
-
-struct DockerMysql {
-    name: String,
-    url: String,
-}
-
-impl Drop for DockerMysql {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .output();
-    }
-}
-
-fn mysql_compare_target() -> Option<MysqlTarget> {
-    if let Ok(url) = std::env::var("MYSQL_COMPARE_URL") {
-        return Some(MysqlTarget::External(url));
-    }
-
-    match start_docker_mysql() {
-        Ok(container) => Some(MysqlTarget::Docker(container)),
-        Err(err) => {
-            eprintln!("skipping parity test: {err}");
-            None
-        }
-    }
-}
-
-fn start_docker_mysql() -> Result<DockerMysql, String> {
-    if !docker_available() {
-        return Err(
-            "MYSQL_COMPARE_URL is not set and Docker is not available from this test process"
-                .to_string(),
-        );
-    }
-    if !docker_image_available(MYSQL_DOCKER_IMAGE) {
-        return Err(format!(
-            "MYSQL_COMPARE_URL is not set and Docker image {MYSQL_DOCKER_IMAGE:?} is not local; run `docker pull {MYSQL_DOCKER_IMAGE}` first"
-        ));
-    }
-
-    let name = format!(
-        "my-sqweel-mysql-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default()
-    );
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--rm",
-            "--name",
-            &name,
-            "-e",
-            &format!("MYSQL_ROOT_PASSWORD={MYSQL_DOCKER_PASSWORD}"),
-            "-e",
-            &format!("MYSQL_DATABASE={MYSQL_DOCKER_DATABASE}"),
-            "-p",
-            "127.0.0.1::3306",
-            MYSQL_DOCKER_IMAGE,
-        ])
-        .output()
-        .map_err(|err| format!("failed to start Docker MySQL: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to start Docker MySQL: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let port = docker_container_port(&name)?;
-    let url =
-        format!("mysql://root:{MYSQL_DOCKER_PASSWORD}@127.0.0.1:{port}/{MYSQL_DOCKER_DATABASE}");
-    wait_for_mysql(&url).map_err(|err| {
-        let _ = Command::new("docker").args(["logs", &name]).status();
-        let _ = Command::new("docker").args(["rm", "-f", &name]).status();
-        err
-    })?;
-
-    Ok(DockerMysql { name, url })
-}
-
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn docker_image_available(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn docker_container_port(name: &str) -> Result<u16, String> {
-    let output = Command::new("docker")
-        .args(["port", name, "3306/tcp"])
-        .output()
-        .map_err(|err| format!("failed to inspect Docker MySQL port: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to inspect Docker MySQL port: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let endpoint = stdout
-        .lines()
-        .next()
-        .ok_or_else(|| "Docker did not publish MySQL port 3306".to_string())?;
-    endpoint
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.trim().parse::<u16>().ok())
-        .ok_or_else(|| format!("could not parse Docker MySQL port from {endpoint:?}"))
-}
-
-fn wait_for_mysql(url: &str) -> Result<(), String> {
-    let opts = Opts::from_url(url).map_err(|err| format!("invalid Docker MySQL URL: {err}"))?;
-    for _ in 0..90 {
-        if let Ok(pool) = Pool::new(opts.clone()) {
-            if pool.get_conn().is_ok() {
-                return Ok(());
-            }
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    Err("Docker MySQL did not become ready within 90 seconds".to_string())
-}
+use common::{MYSQL_DOCKER_DATABASE, mysql_compare_target};
 
 fn start_whatever_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local port");
@@ -166,7 +18,7 @@ fn start_whatever_server() -> String {
 
     let bind_addr = addr;
     thread::spawn(move || {
-        let engine = std::sync::Arc::new(Engine::default());
+        let engine = std::sync::Arc::new(Engine::new(EngineConfig::mysql_strict()));
         let wire = WireServer::new(engine);
         wire.serve(bind_addr).expect("wire server should run");
     });
@@ -250,6 +102,25 @@ fn assert_query_parity_unordered(
     assert_eq!(whatever_rows, mysql_rows, "query mismatch: {sql}");
 }
 
+fn assert_show_index_parity(
+    mysql: &mut mysql::PooledConn,
+    whatever: &mut mysql::PooledConn,
+    sql: &str,
+) {
+    let mut mysql_rows = fetch_rows(mysql, sql).expect("mysql show index");
+    let mut whatever_rows = fetch_rows(whatever, sql).expect("whatever show index");
+    // InnoDB Cardinality is an optimizer estimate and can vary between two
+    // identical databases, so compare every stable SHOW INDEX field instead.
+    for row in mysql_rows.iter_mut().chain(&mut whatever_rows) {
+        if let Some(cardinality) = row.get_mut(6) {
+            *cardinality = "<estimate>".to_string();
+        }
+    }
+    mysql_rows.sort();
+    whatever_rows.sort();
+    assert_eq!(whatever_rows, mysql_rows, "query mismatch: {sql}");
+}
+
 fn assert_exec_parity(mysql: &mut mysql::PooledConn, whatever: &mut mysql::PooledConn, sql: &str) {
     let mysql_stats = exec_drop_with_stats(mysql, sql).expect("mysql exec");
     let whatever_stats = exec_drop_with_stats(whatever, sql).expect("whatever exec");
@@ -257,6 +128,15 @@ fn assert_exec_parity(mysql: &mut mysql::PooledConn, whatever: &mut mysql::Poole
         whatever_stats.0, mysql_stats.0,
         "rows_affected mismatch for: {sql}"
     );
+}
+
+fn assert_exec_succeeds(
+    mysql: &mut mysql::PooledConn,
+    whatever: &mut mysql::PooledConn,
+    sql: &str,
+) {
+    mysql.query_drop(sql).expect("mysql exec");
+    whatever.query_drop(sql).expect("MySqweel exec");
 }
 
 fn assert_prepared_query_parity<P: Into<mysql::Params> + Clone>(
@@ -288,6 +168,7 @@ fn assert_prepared_exec_parity<P: Into<mysql::Params> + Clone>(
 
 #[test]
 fn parity_with_mysql_for_supported_semantics() {
+    let _guard = common::test_lock();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -308,15 +189,20 @@ fn parity_with_mysql_for_supported_semantics() {
     let posts = format!("wdb_parity_posts_{pid}");
     let parents = format!("wdb_parity_parents_{pid}");
     let children = format!("wdb_parity_children_{pid}");
+    let children_fk = format!("fk_children_parent_{pid}");
+    let features = format!("wdb_parity_features_{pid}");
     let scratch = format!("wdb_parity_scratch_{pid}");
     let posts_archive = format!("wdb_parity_posts_archive_{pid}");
+    let renamed_posts = format!("wdb_parity_posts_renamed_{pid}");
 
     for sql in [
         format!("DROP TABLE IF EXISTS {children}"),
         format!("DROP TABLE IF EXISTS {parents}"),
+        format!("DROP TABLE IF EXISTS {renamed_posts}"),
         format!("DROP TABLE IF EXISTS {posts_archive}"),
         format!("DROP TABLE IF EXISTS {posts}"),
         format!("DROP TABLE IF EXISTS {users}"),
+        format!("DROP TABLE IF EXISTS {features}"),
         format!("DROP DATABASE IF EXISTS {scratch}"),
     ] {
         let _ = mysql_conn.query_drop(&sql);
@@ -324,12 +210,22 @@ fn parity_with_mysql_for_supported_semantics() {
     }
 
     // Database compatibility commands should succeed on both backends.
-    assert_exec_parity(
+    assert_exec_succeeds(
         &mut mysql_conn,
         &mut whatever_conn,
         &format!("CREATE DATABASE {scratch}"),
     );
-    assert_query_parity_unordered(&mut mysql_conn, &mut whatever_conn, "SHOW DATABASES");
+    let mysql_databases = fetch_rows(&mut mysql_conn, "SHOW DATABASES").expect("mysql databases");
+    let mysqweel_databases =
+        fetch_rows(&mut whatever_conn, "SHOW DATABASES").expect("MySqweel databases");
+    assert!(mysql_databases.iter().any(|row| {
+        row.first()
+            .is_some_and(|database| database.eq_ignore_ascii_case("information_schema"))
+    }));
+    assert!(mysqweel_databases.iter().any(|row| {
+        row.first()
+            .is_some_and(|database| database.eq_ignore_ascii_case("information_schema"))
+    }));
 
     assert_exec_parity(
         &mut mysql_conn,
@@ -349,6 +245,45 @@ fn parity_with_mysql_for_supported_semantics() {
         &mut mysql_conn,
         &mut whatever_conn,
         &format!("CREATE INDEX idx_{users}_score ON {users} (score)"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "CREATE TABLE {features} (id BIGINT PRIMARY KEY, name VARCHAR(64), doubled BIGINT GENERATED ALWAYS AS (id * 2) STORED)"
+        ),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("CREATE INDEX idx_{features}_name_prefix ON {features} (name(8))"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("ALTER TABLE {features} ADD COLUMN note VARCHAR(16) AFTER name"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("ALTER TABLE {features} CHANGE COLUMN note description VARCHAR(32)"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "INSERT INTO {features} (id, name, description) VALUES (3, 'compatibility', 'works')"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("SELECT id, name, description, doubled FROM {features}"),
+    );
+    assert_show_index_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("SHOW INDEX FROM {features}"),
     );
     assert_exec_parity(
         &mut mysql_conn,
@@ -374,7 +309,7 @@ fn parity_with_mysql_for_supported_semantics() {
     assert_exec_parity(
         &mut mysql_conn,
         &mut whatever_conn,
-        &format!("UPDATE {users} SET display_name = CONCAT(name, '!') WHERE id <= 2"),
+        &format!("UPDATE {users} SET display_name = CONCAT(name, '!') WHERE id <= 3"),
     );
     assert_exec_parity(
         &mut mysql_conn,
@@ -583,6 +518,34 @@ fn parity_with_mysql_for_supported_semantics() {
         &mut mysql_conn,
         &mut whatever_conn,
         &format!(
+            "SELECT u.id, d.title FROM {users} AS u JOIN (SELECT user_id, title FROM {posts} WHERE title LIKE 'p%') AS d ON d.user_id = u.id ORDER BY u.id, d.title"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT p.id, u.email FROM {users} AS u RIGHT JOIN {posts} AS p ON p.user_id = u.id ORDER BY p.id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "WITH selected (user_id, user_email) AS (SELECT id, email FROM {users} WHERE score >= 20) SELECT user_id, user_email FROM selected ORDER BY user_id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY score, id) AS row_num, CUME_DIST() OVER (ORDER BY nickname IS NULL) AS cumulative_distribution, SUM(score) OVER (ORDER BY nickname IS NULL) AS peer_total FROM {users} ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
             "SELECT id, (SELECT MAX(score) FROM {users}) AS max_score FROM {users} WHERE id = 1"
         ),
     );
@@ -709,7 +672,23 @@ fn parity_with_mysql_for_supported_semantics() {
     );
 
     // SHOW/DESCRIBE and information_schema checks for claimed metadata compatibility.
-    assert_query_parity_unordered(&mut mysql_conn, &mut whatever_conn, &format!("SHOW TABLES"));
+    let mysql_tables = fetch_rows(&mut mysql_conn, "SHOW TABLES").expect("mysql show tables");
+    let whatever_tables =
+        fetch_rows(&mut whatever_conn, "SHOW TABLES").expect("MySqweel show tables");
+    for table in [&users, &posts, &posts_archive] {
+        assert!(
+            mysql_tables
+                .iter()
+                .any(|row| row.first().is_some_and(|value| value == table)),
+            "MySQL SHOW TABLES omitted {table}"
+        );
+        assert!(
+            whatever_tables
+                .iter()
+                .any(|row| row.first().is_some_and(|value| value == table)),
+            "MySqweel SHOW TABLES omitted {table}"
+        );
+    }
     assert_query_parity_unordered(
         &mut mysql_conn,
         &mut whatever_conn,
@@ -741,14 +720,25 @@ fn parity_with_mysql_for_supported_semantics() {
             "SELECT table_name FROM information_schema.tables WHERE table_name IN ('{users}', '{posts}') ORDER BY table_name"
         ),
     );
-    assert_query_parity_unordered(
-        &mut mysql_conn,
-        &mut whatever_conn,
-        &format!(
-            "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('app', '{MYSQL_DOCKER_DATABASE}')"
-        ),
+    assert_eq!(
+        fetch_rows(
+            &mut mysql_conn,
+            &format!(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name = '{MYSQL_DOCKER_DATABASE}'"
+            ),
+        )
+        .expect("mysql schema metadata"),
+        vec![vec![MYSQL_DOCKER_DATABASE.to_string()]]
     );
-    assert_query_parity_unordered(
+    assert_eq!(
+        fetch_rows(
+            &mut whatever_conn,
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'app'",
+        )
+        .expect("MySqweel schema metadata"),
+        vec![vec!["app".to_string()]]
+    );
+    assert_show_index_parity(
         &mut mysql_conn,
         &mut whatever_conn,
         &format!("SHOW INDEX FROM {users}"),
@@ -791,45 +781,65 @@ fn parity_with_mysql_for_supported_semantics() {
         &mut mysql_conn,
         &mut whatever_conn,
         &format!(
-            "CREATE TABLE {children} (id BIGINT PRIMARY KEY AUTO_INCREMENT, parent_id BIGINT, CONSTRAINT fk_children_parent FOREIGN KEY (parent_id) REFERENCES {parents} (id) ON DELETE CASCADE ON UPDATE RESTRICT)"
+            "CREATE TABLE {children} (id BIGINT PRIMARY KEY AUTO_INCREMENT, parent_id BIGINT, CONSTRAINT {children_fk} FOREIGN KEY (parent_id) REFERENCES {parents} (id) ON DELETE CASCADE ON UPDATE RESTRICT)"
+        ),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("INSERT INTO {parents} (id) VALUES (1)"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("INSERT INTO {children} (id, parent_id) VALUES (1, 1)"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("DELETE FROM {parents} WHERE id = 1"),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("SELECT COUNT(*) AS child_count FROM {children}"),
+    );
+    assert_query_parity_unordered(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = '{children}' AND constraint_name = '{children_fk}'"
         ),
     );
     assert_query_parity_unordered(
         &mut mysql_conn,
         &mut whatever_conn,
         &format!(
-            "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = '{children}' AND constraint_name = 'fk_children_parent'"
+            "SELECT constraint_name, column_name, referenced_table_name, referenced_column_name FROM information_schema.key_column_usage WHERE constraint_name = '{children_fk}' ORDER BY column_name"
         ),
     );
     assert_query_parity_unordered(
         &mut mysql_conn,
         &mut whatever_conn,
         &format!(
-            "SELECT constraint_name, column_name, referenced_table_name, referenced_column_name FROM information_schema.key_column_usage WHERE constraint_name = 'fk_children_parent' ORDER BY column_name"
-        ),
-    );
-    assert_query_parity_unordered(
-        &mut mysql_conn,
-        &mut whatever_conn,
-        &format!(
-            "SELECT constraint_name, delete_rule, update_rule FROM information_schema.referential_constraints WHERE constraint_name = 'fk_children_parent'"
+            "SELECT constraint_name, delete_rule, update_rule FROM information_schema.referential_constraints WHERE constraint_name = '{children_fk}'"
         ),
     );
 
     assert_exec_parity(
         &mut mysql_conn,
         &mut whatever_conn,
-        &format!("RENAME TABLE {posts} TO {posts_archive}"),
+        &format!("RENAME TABLE {posts} TO {renamed_posts}"),
     );
     assert_exec_parity(
         &mut mysql_conn,
         &mut whatever_conn,
-        &format!("TRUNCATE TABLE {posts_archive}"),
+        &format!("TRUNCATE TABLE {renamed_posts}"),
     );
     assert_query_parity(
         &mut mysql_conn,
         &mut whatever_conn,
-        &format!("SELECT COUNT(*) AS n FROM {posts_archive}"),
+        &format!("SELECT COUNT(*) AS n FROM {renamed_posts}"),
     );
     assert_exec_parity(
         &mut mysql_conn,
@@ -857,6 +867,11 @@ fn parity_with_mysql_for_supported_semantics() {
     assert_exec_parity(
         &mut mysql_conn,
         &mut whatever_conn,
+        &format!("DROP TABLE IF EXISTS {renamed_posts}"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
         &format!("DROP TABLE IF EXISTS {posts_archive}"),
     );
     assert_exec_parity(
@@ -865,6 +880,11 @@ fn parity_with_mysql_for_supported_semantics() {
         &format!("DROP TABLE IF EXISTS {users}"),
     );
     assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("DROP TABLE IF EXISTS {features}"),
+    );
+    assert_exec_succeeds(
         &mut mysql_conn,
         &mut whatever_conn,
         &format!("DROP DATABASE IF EXISTS {scratch}"),
@@ -876,10 +896,11 @@ fn parity_with_mysql_for_supported_semantics() {
 /// regression that recently caused `KEY_COLUMN_USAGE` to be unreliable: missing
 /// PK rows after ALTER, missing UNIQUE rows, dropped or renamed columns.
 ///
-/// Skipped silently if no MySQL is reachable (same gating as the broader parity
-/// test above).
+/// Optional locally if no MySQL is reachable; mandatory when
+/// `MYSQL_PARITY_REQUIRED=1` (as it is in CI).
 #[test]
 fn parity_with_mysql_for_information_schema() {
+    let _guard = common::test_lock();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -897,6 +918,7 @@ fn parity_with_mysql_for_information_schema() {
     let pid = std::process::id();
     let parents = format!("wdb_info_parents_{pid}");
     let children = format!("wdb_info_children_{pid}");
+    let children_fk = format!("fk_children_parents_{pid}");
     let composite = format!("wdb_info_composite_{pid}");
     let late_pk = format!("wdb_info_late_pk_{pid}");
 
@@ -928,9 +950,9 @@ fn parity_with_mysql_for_information_schema() {
                 parent_id BIGINT NOT NULL,\
                 slot BIGINT NOT NULL,\
                 email VARCHAR(255) NOT NULL,\
-                note TEXT,\
+                note VARCHAR(255),\
                 PRIMARY KEY (parent_id, slot),\
-                CONSTRAINT fk_children_parents FOREIGN KEY (parent_id) REFERENCES {parents} (id) ON DELETE CASCADE ON UPDATE RESTRICT\
+                CONSTRAINT {children_fk} FOREIGN KEY (parent_id) REFERENCES {parents} (id) ON DELETE CASCADE ON UPDATE RESTRICT\
             )"
         ),
     );
@@ -1026,7 +1048,7 @@ fn parity_with_mysql_for_information_schema() {
                 position_in_unique_constraint, referenced_table_name, referenced_column_name \
              FROM information_schema.key_column_usage \
              WHERE table_name IN ('{parents}', '{children}', '{composite}', '{late_pk}') \
-                AND (constraint_name = 'PRIMARY' OR constraint_name = 'fk_children_parents') \
+                AND (constraint_name = 'PRIMARY' OR constraint_name = '{children_fk}') \
              ORDER BY table_name, constraint_name, ordinal_position"
         ),
     );
@@ -1051,7 +1073,7 @@ fn parity_with_mysql_for_information_schema() {
             "SELECT constraint_name, unique_constraint_name, match_option, update_rule, \
                 delete_rule, table_name, referenced_table_name \
              FROM information_schema.referential_constraints \
-             WHERE constraint_name = 'fk_children_parents'"
+             WHERE constraint_name = '{children_fk}'"
         ),
     );
 
@@ -1125,8 +1147,10 @@ fn unsupported_queries_return_mysql_errors() {
     let mut conn = whatever_pool.get_conn().expect("whatever conn");
 
     let err = conn
-        .query_drop("SELECT * FROM (SELECT 1) AS a JOIN (SELECT 2) AS b ON 1 = 1")
-        .expect_err("unsupported derived-table join should return a MySQL error");
+        .query_drop(
+            "WITH RECURSIVE sequence AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM sequence WHERE n < 3) SELECT n FROM sequence",
+        )
+        .expect_err("unsupported recursive CTE should return a MySQL error");
     let message = err.to_string();
     assert!(
         message.contains("unsupported") || message.contains("not supported"),

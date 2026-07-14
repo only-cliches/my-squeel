@@ -85,8 +85,13 @@ fn queries_materialize_rows_against_current_schema_without_rewriting_storage() {
     );
     assert!(!row.contains_key("legacy"));
 
-    let dropped_column = engine.execute_sql("SELECT legacy FROM users").unwrap();
-    assert!(dropped_column[0].rows[0].get("legacy").unwrap().is_null());
+    let dropped_column = engine.execute_sql("SELECT legacy FROM users");
+    assert!(
+        dropped_column
+            .unwrap_err()
+            .to_string()
+            .contains("unknown column: legacy")
+    );
 
     let snapshot = engine.snapshot();
     let raw = snapshot

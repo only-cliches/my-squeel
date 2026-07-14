@@ -11,7 +11,7 @@ use msql_srv::{
 };
 use serde_json::{Map, Value};
 
-use crate::sql::engine::{Engine, QueryResult};
+use crate::sql::engine::{Engine, MysqlColumnType, QueryResult};
 
 #[derive(Clone)]
 pub struct WireServer {
@@ -118,7 +118,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             },
         );
         let params = parameter_columns(param_count);
-        let columns = prepared_result_columns(query);
+        let columns = prepared_result_columns(&self.engine, query, param_count);
         info.reply(stmt_id, &params, &columns)
     }
 
@@ -131,6 +131,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         let Some(statement) = self.statements.get(&id) else {
             return results.completed(0, 0);
         };
+        let statement_sql = statement.sql.clone();
         let params = params.into_iter().map(param_to_json).collect::<Vec<_>>();
         if params.len() != statement.param_count {
             tracing::debug!(
@@ -140,12 +141,12 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             );
             return results.completed(0, 0);
         }
-        let out = if is_last_insert_id_query(&statement.sql) {
+        let out = if is_last_insert_id_query(&statement_sql) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
-            self.engine.execute_sql_with_params(&statement.sql, &params)
+            self.engine.execute_sql_with_params(&statement_sql, &params)
         };
-        write_query_items(out, results, &mut self.last_insert_id)
+        write_query_items(out, results, &mut self.last_insert_id, Some(&statement_sql))
     }
 
     fn on_close(&mut self, stmt: u32) {
@@ -167,7 +168,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         } else {
             self.engine.execute_sql(query)
         };
-        write_query_items(out, results, &mut self.last_insert_id)
+        write_query_items(out, results, &mut self.last_insert_id, Some(query))
     }
 }
 
@@ -225,6 +226,7 @@ impl Backend {
             rows_affected: 0,
             last_insert_id: 0,
             columns,
+            column_metadata: vec![],
             rows: vec![row],
         })
     }
@@ -265,6 +267,7 @@ fn write_query_items<W: io::Read + io::Write>(
     items: anyhow::Result<Vec<QueryResult>>,
     results: QueryResultWriter<'_, W>,
     session_last_insert_id: &mut u64,
+    query: Option<&str>,
 ) -> io::Result<()> {
     match items {
         Ok(items) => {
@@ -272,18 +275,63 @@ fn write_query_items<W: io::Read + io::Write>(
             if out.last_insert_id != 0 {
                 *session_last_insert_id = out.last_insert_id;
             }
-            write_result(results, out)
+            write_result(results, out, query)
         }
         Err(err) => {
             tracing::debug!(error = %err, "query execution error");
-            results.error(ErrorKind::ER_NOT_SUPPORTED_YET, err.to_string().as_bytes())
+            let message = err.to_string();
+            results.error(mysql_error_kind(&message), message.as_bytes())
         }
+    }
+}
+
+fn mysql_error_kind(message: &str) -> ErrorKind {
+    let message = message.to_ascii_lowercase();
+    if message.contains("already exists") {
+        ErrorKind::ER_TABLE_EXISTS_ERROR
+    } else if message.contains("unknown table") || message.contains("missing table") {
+        ErrorKind::ER_NO_SUCH_TABLE
+    } else if message.contains("unknown column") {
+        ErrorKind::ER_BAD_FIELD_ERROR
+    } else if message.contains("duplicate column") || message.contains("specified twice") {
+        ErrorKind::ER_DUP_FIELDNAME
+    } else if message.contains("primary key conflict")
+        || message.contains("unique constraint violation")
+        || message.contains("duplicate entry")
+    {
+        ErrorKind::ER_DUP_ENTRY
+    } else if message.contains("cannot be null") {
+        ErrorKind::ER_BAD_NULL_ERROR
+    } else if message.contains("does not have a default") {
+        ErrorKind::ER_NO_DEFAULT_FOR_FIELD
+    } else if message.contains("column count doesn't match") {
+        ErrorKind::ER_WRONG_VALUE_COUNT_ON_ROW
+    } else if message.contains("referenced row") {
+        ErrorKind::ER_ROW_IS_REFERENCED_2
+    } else if message.contains("foreign key constraint fails") {
+        ErrorKind::ER_NO_REFERENCED_ROW_2
+    } else if message.contains("data too long") {
+        ErrorKind::ER_DATA_TOO_LONG
+    } else if message.contains("out of range") {
+        ErrorKind::ER_WARN_DATA_OUT_OF_RANGE
+    } else if message.contains("incorrect integer") || message.contains("incorrect decimal") {
+        ErrorKind::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+    } else if message.contains("incorrect date")
+        || message.contains("incorrect datetime")
+        || message.contains("incorrect time")
+    {
+        ErrorKind::ER_TRUNCATED_WRONG_VALUE
+    } else if message.contains("sql parser error") || message.contains("parse") {
+        ErrorKind::ER_PARSE_ERROR
+    } else {
+        ErrorKind::ER_NOT_SUPPORTED_YET
     }
 }
 
 fn write_result<W: io::Read + io::Write>(
     results: QueryResultWriter<'_, W>,
     out: QueryResult,
+    query: Option<&str>,
 ) -> io::Result<()> {
     let mut columns = out.columns;
     if columns.is_empty()
@@ -296,22 +344,85 @@ fn write_result<W: io::Read + io::Write>(
         return results.completed(out.rows_affected, out.last_insert_id);
     }
 
+    let mut decimal_columns = query.map(mysql_decimal_columns).unwrap_or_default();
+    for metadata in &out.column_metadata {
+        if metadata.column_type == MysqlColumnType::Decimal {
+            decimal_columns
+                .entry(metadata.name.clone())
+                .or_insert(metadata.decimals as usize);
+        }
+    }
     let defs: Vec<Column> = columns
         .iter()
-        .map(|name| Column {
-            table: "".to_string(),
-            column: name.clone(),
-            coltype: column_type_for(&out.rows, name),
-            colflags: ColumnFlags::empty(),
+        .enumerate()
+        .map(|(index, name)| {
+            let metadata = out.column_metadata.get(index);
+            let mut colflags = ColumnFlags::empty();
+            if metadata.is_some_and(|metadata| !metadata.nullable) {
+                colflags.insert(ColumnFlags::NOT_NULL_FLAG);
+            }
+            if metadata.is_some_and(|metadata| metadata.unsigned) {
+                colflags.insert(ColumnFlags::UNSIGNED_FLAG);
+            }
+            if metadata.is_some_and(|metadata| {
+                matches!(
+                    metadata.column_type,
+                    MysqlColumnType::Binary
+                        | MysqlColumnType::VarBinary
+                        | MysqlColumnType::Blob
+                        | MysqlColumnType::Bit
+                )
+            }) {
+                colflags.insert(ColumnFlags::BINARY_FLAG);
+            }
+            Column {
+                table: metadata
+                    .map(|metadata| metadata.table.clone())
+                    .unwrap_or_default(),
+                column: name.clone(),
+                coltype: metadata
+                    .map(|metadata| wire_column_type(metadata.column_type))
+                    .unwrap_or_else(|| {
+                        if decimal_columns.contains_key(name) {
+                            ColumnType::MYSQL_TYPE_NEWDECIMAL
+                        } else {
+                            column_type_for(&out.rows, name)
+                        }
+                    }),
+                colflags,
+            }
         })
         .collect();
 
     let mut rw = results.start(&defs)?;
     for row in out.rows {
-        write_row(&mut rw, &row, &columns)?;
+        write_row(&mut rw, &row, &columns, &defs, &decimal_columns)?;
         rw.end_row()?;
     }
     rw.finish()
+}
+
+fn wire_column_type(column_type: MysqlColumnType) -> ColumnType {
+    match column_type {
+        MysqlColumnType::Null => ColumnType::MYSQL_TYPE_NULL,
+        MysqlColumnType::TinyInt => ColumnType::MYSQL_TYPE_TINY,
+        MysqlColumnType::SmallInt => ColumnType::MYSQL_TYPE_SHORT,
+        MysqlColumnType::Integer => ColumnType::MYSQL_TYPE_LONG,
+        MysqlColumnType::BigInt => ColumnType::MYSQL_TYPE_LONGLONG,
+        MysqlColumnType::Float => ColumnType::MYSQL_TYPE_FLOAT,
+        MysqlColumnType::Double => ColumnType::MYSQL_TYPE_DOUBLE,
+        MysqlColumnType::Decimal => ColumnType::MYSQL_TYPE_NEWDECIMAL,
+        MysqlColumnType::Date => ColumnType::MYSQL_TYPE_DATE,
+        MysqlColumnType::Time => ColumnType::MYSQL_TYPE_TIME,
+        MysqlColumnType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
+        MysqlColumnType::Timestamp => ColumnType::MYSQL_TYPE_TIMESTAMP,
+        MysqlColumnType::Year => ColumnType::MYSQL_TYPE_YEAR,
+        MysqlColumnType::Char | MysqlColumnType::Binary => ColumnType::MYSQL_TYPE_STRING,
+        MysqlColumnType::VarChar | MysqlColumnType::VarBinary => ColumnType::MYSQL_TYPE_VAR_STRING,
+        MysqlColumnType::Text | MysqlColumnType::Blob => ColumnType::MYSQL_TYPE_BLOB,
+        MysqlColumnType::Json => ColumnType::MYSQL_TYPE_JSON,
+        MysqlColumnType::Bit => ColumnType::MYSQL_TYPE_BIT,
+    }
 }
 
 fn is_last_insert_id_query(query: &str) -> bool {
@@ -348,6 +459,7 @@ fn last_insert_id_result(value: u64) -> QueryResult {
         rows_affected: 0,
         last_insert_id: 0,
         columns: vec![column],
+        column_metadata: vec![],
         rows: vec![row],
     }
 }
@@ -461,26 +573,253 @@ fn write_row<W: io::Read + io::Write>(
     rw: &mut msql_srv::RowWriter<'_, W>,
     row: &Map<String, Value>,
     columns: &[String],
+    definitions: &[Column],
+    decimal_columns: &HashMap<String, usize>,
 ) -> io::Result<()> {
-    for key in columns {
+    for (index, key) in columns.iter().enumerate() {
+        let definition = &definitions[index];
         let value = row.get(key).cloned().unwrap_or(Value::Null);
         match value {
             Value::Null => rw.write_col(Option::<String>::None)?,
-            Value::Bool(v) => rw.write_col(if v { 1_i64 } else { 0_i64 })?,
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    rw.write_col(i)?;
-                } else if let Some(f) = n.as_f64() {
-                    rw.write_col(f)?;
+            Value::Number(number) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+                let value = number.as_f64().unwrap_or_default();
+                let scale = decimal_columns[key];
+                rw.write_col(format!("{value:.scale$}"))?;
+            }
+            Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+                let scale = decimal_columns.get(key).copied().unwrap_or(0);
+                let number = value.parse::<f64>().unwrap_or_default();
+                rw.write_col(format!("{number:.scale$}"))?;
+            }
+            Value::Bool(value) => {
+                write_numeric_column(rw, i64::from(value), definition)?;
+            }
+            Value::Number(number) => {
+                if is_integral_column(definition.coltype) {
+                    if definition.colflags.contains(ColumnFlags::UNSIGNED_FLAG)
+                        && let Some(value) = number.as_u64()
+                    {
+                        write_unsigned_numeric_column(rw, value, definition)?;
+                    } else {
+                        let value = number
+                            .as_i64()
+                            .unwrap_or_else(|| number.as_f64().unwrap_or_default() as i64);
+                        write_numeric_column(rw, value, definition)?;
+                    }
+                } else if definition.coltype == ColumnType::MYSQL_TYPE_FLOAT {
+                    rw.write_col(number.as_f64().unwrap_or_default() as f32)?;
+                } else if definition.coltype == ColumnType::MYSQL_TYPE_DOUBLE {
+                    rw.write_col(number.as_f64().unwrap_or_default())?;
                 } else {
-                    rw.write_col(n.to_string())?;
+                    rw.write_col(number.to_string())?;
                 }
             }
-            Value::String(s) => rw.write_col(s)?,
+            Value::String(value) => write_string_column(rw, &value, definition)?,
             other => rw.write_col(other.to_string())?,
         }
     }
     Ok(())
+}
+
+fn write_unsigned_numeric_column<W: io::Read + io::Write>(
+    rw: &mut msql_srv::RowWriter<'_, W>,
+    value: u64,
+    definition: &Column,
+) -> io::Result<()> {
+    match definition.coltype {
+        ColumnType::MYSQL_TYPE_TINY => rw.write_col(value as u8),
+        ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR => rw.write_col(value as u16),
+        ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24 => rw.write_col(value as u32),
+        ColumnType::MYSQL_TYPE_LONGLONG => rw.write_col(value),
+        _ => rw.write_col(value.to_string()),
+    }
+}
+
+fn is_integral_column(column_type: ColumnType) -> bool {
+    matches!(
+        column_type,
+        ColumnType::MYSQL_TYPE_TINY
+            | ColumnType::MYSQL_TYPE_SHORT
+            | ColumnType::MYSQL_TYPE_LONG
+            | ColumnType::MYSQL_TYPE_INT24
+            | ColumnType::MYSQL_TYPE_LONGLONG
+            | ColumnType::MYSQL_TYPE_YEAR
+    )
+}
+
+fn write_numeric_column<W: io::Read + io::Write>(
+    rw: &mut msql_srv::RowWriter<'_, W>,
+    value: i64,
+    definition: &Column,
+) -> io::Result<()> {
+    let unsigned = definition.colflags.contains(ColumnFlags::UNSIGNED_FLAG);
+    match (definition.coltype, unsigned) {
+        (ColumnType::MYSQL_TYPE_TINY, false) => rw.write_col(value as i8),
+        (ColumnType::MYSQL_TYPE_TINY, true) => rw.write_col(value as u8),
+        (ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR, false) => {
+            rw.write_col(value as i16)
+        }
+        (ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR, true) => {
+            rw.write_col(value as u16)
+        }
+        (ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24, false) => {
+            rw.write_col(value as i32)
+        }
+        (ColumnType::MYSQL_TYPE_LONG | ColumnType::MYSQL_TYPE_INT24, true) => {
+            rw.write_col(value as u32)
+        }
+        (ColumnType::MYSQL_TYPE_LONGLONG, false) => rw.write_col(value),
+        (ColumnType::MYSQL_TYPE_LONGLONG, true) => rw.write_col(value as u64),
+        _ => rw.write_col(value.to_string()),
+    }
+}
+
+fn write_string_column<W: io::Read + io::Write>(
+    rw: &mut msql_srv::RowWriter<'_, W>,
+    value: &str,
+    definition: &Column,
+) -> io::Result<()> {
+    match definition.coltype {
+        ColumnType::MYSQL_TYPE_DATE => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .and_then(|value| rw.write_col(value)),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+            ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"]
+                .into_iter()
+                .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid datetime value"))
+                .and_then(|value| rw.write_col(value))
+        }
+        ColumnType::MYSQL_TYPE_TIME => {
+            parse_mysql_time_value(value).and_then(|value| rw.write_col(value))
+        }
+        column_type if is_integral_column(column_type) => value
+            .parse::<i64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .and_then(|value| write_numeric_column(rw, value, definition)),
+        ColumnType::MYSQL_TYPE_FLOAT => value
+            .parse::<f32>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .and_then(|value| rw.write_col(value)),
+        ColumnType::MYSQL_TYPE_DOUBLE => value
+            .parse::<f64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            .and_then(|value| rw.write_col(value)),
+        _ => rw.write_col(value),
+    }
+}
+
+#[derive(Debug)]
+struct MysqlTimeValue {
+    negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micros: u32,
+}
+
+impl std::fmt::Display for MysqlTimeValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.negative { "-" } else { "" };
+        let hours = u64::from(self.days) * 24 + u64::from(self.hours);
+        if self.micros == 0 {
+            write!(
+                formatter,
+                "{sign}{hours:02}:{:02}:{:02}",
+                self.minutes, self.seconds
+            )
+        } else {
+            write!(
+                formatter,
+                "{sign}{hours:02}:{:02}:{:02}.{:06}",
+                self.minutes, self.seconds, self.micros
+            )
+        }
+    }
+}
+
+impl msql_srv::ToMysqlValue for MysqlTimeValue {
+    fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        msql_srv::ToMysqlValue::to_mysql_text(&self.to_string(), writer)
+    }
+
+    fn to_mysql_bin<W: io::Write>(&self, writer: &mut W, column: &Column) -> io::Result<()> {
+        if column.coltype != ColumnType::MYSQL_TYPE_TIME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "time value used with a non-TIME column",
+            ));
+        }
+        if self.days == 0
+            && self.hours == 0
+            && self.minutes == 0
+            && self.seconds == 0
+            && self.micros == 0
+        {
+            return writer.write_all(&[0]);
+        }
+
+        writer.write_all(&[if self.micros == 0 { 8 } else { 12 }])?;
+        writer.write_all(&[u8::from(self.negative)])?;
+        writer.write_all(&self.days.to_le_bytes())?;
+        writer.write_all(&[self.hours, self.minutes, self.seconds])?;
+        if self.micros != 0 {
+            writer.write_all(&self.micros.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_mysql_time_value(value: &str) -> io::Result<MysqlTimeValue> {
+    let (negative, value) = value
+        .strip_prefix('-')
+        .map(|value| (true, value))
+        .or_else(|| value.strip_prefix('+').map(|value| (false, value)))
+        .unwrap_or((false, value));
+    let mut parts = value.split(':');
+    let hours = parts.next().and_then(|value| value.parse::<u64>().ok());
+    let minutes = parts.next().and_then(|value| value.parse::<u8>().ok());
+    let seconds = parts.next();
+    if parts.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid TIME value",
+        ));
+    }
+    let (seconds, fraction) = seconds
+        .map(|value| value.split_once('.').unwrap_or((value, "")))
+        .unwrap_or(("", ""));
+    let seconds = seconds.parse::<u8>().ok();
+    let micros = if fraction.is_empty() {
+        Some(0)
+    } else if fraction.len() <= 6 && fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        format!("{fraction:0<6}").parse::<u32>().ok()
+    } else {
+        None
+    };
+    let (Some(hours), Some(minutes), Some(seconds), Some(micros)) =
+        (hours, minutes, seconds, micros)
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid TIME value",
+        ));
+    };
+    if hours > 838 || minutes > 59 || seconds > 59 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid TIME value",
+        ));
+    }
+    Ok(MysqlTimeValue {
+        negative,
+        days: (hours / 24) as u32,
+        hours: (hours % 24) as u8,
+        minutes,
+        seconds,
+        micros,
+    })
 }
 
 fn column_type_for(rows: &[Map<String, Value>], column: &str) -> ColumnType {
@@ -509,16 +848,52 @@ fn parameter_columns(count: usize) -> Vec<Column> {
         .collect()
 }
 
-fn prepared_result_columns(query: &str) -> Vec<Column> {
+fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> Vec<Column> {
+    let decimal_columns = mysql_decimal_columns(query);
     let Ok(statements) = crate::sql::parse(query) else {
         return Vec::new();
     };
 
-    let Some(sqlparser::ast::Statement::Query(query)) = statements.into_iter().next() else {
+    let Some(sqlparser::ast::Statement::Query(parsed_query)) = statements.into_iter().next() else {
         return Vec::new();
     };
 
-    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+    // Zero is accepted by LIMIT/OFFSET placeholders and generally produces an
+    // empty SELECT while still allowing the engine to derive schema metadata.
+    if let Ok(mut results) = engine.execute_sql_with_params(
+        query,
+        &vec![Value::Number(serde_json::Number::from(0)); param_count],
+    ) && let Some(result) = results.pop()
+        && !result.column_metadata.is_empty()
+    {
+        return result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let metadata = result.column_metadata.get(index);
+                let mut flags = ColumnFlags::empty();
+                if metadata.is_some_and(|metadata| !metadata.nullable) {
+                    flags.insert(ColumnFlags::NOT_NULL_FLAG);
+                }
+                if metadata.is_some_and(|metadata| metadata.unsigned) {
+                    flags.insert(ColumnFlags::UNSIGNED_FLAG);
+                }
+                Column {
+                    table: metadata
+                        .map(|metadata| metadata.table.clone())
+                        .unwrap_or_default(),
+                    column: name.clone(),
+                    coltype: metadata
+                        .map(|metadata| wire_column_type(metadata.column_type))
+                        .unwrap_or(ColumnType::MYSQL_TYPE_VAR_STRING),
+                    colflags: flags,
+                }
+            })
+            .collect();
+    }
+
+    let sqlparser::ast::SetExpr::Select(select) = *parsed_query.body else {
         return Vec::new();
     };
 
@@ -542,12 +917,73 @@ fn prepared_result_columns(query: &str) -> Vec<Column> {
 
             Some(Column {
                 table: "".to_string(),
+                coltype: if decimal_columns.contains_key(&column) {
+                    ColumnType::MYSQL_TYPE_NEWDECIMAL
+                } else {
+                    ColumnType::MYSQL_TYPE_STRING
+                },
                 column,
-                coltype: ColumnType::MYSQL_TYPE_STRING,
                 colflags: ColumnFlags::empty(),
             })
         })
         .collect()
+}
+
+fn mysql_decimal_columns(query: &str) -> HashMap<String, usize> {
+    let Ok(statements) = crate::sql::parse(query) else {
+        return HashMap::new();
+    };
+    let Some(sqlparser::ast::Statement::Query(query)) = statements.into_iter().next() else {
+        return HashMap::new();
+    };
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        return HashMap::new();
+    };
+
+    select
+        .projection
+        .iter()
+        .filter_map(|item| {
+            let (expr, column) = match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(expr) => (expr, expr.to_string()),
+                sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+                    (expr, alias.value.clone())
+                }
+                _ => return None,
+            };
+            mysql_decimal_scale(expr).map(|scale| (column, scale))
+        })
+        .collect()
+}
+
+fn mysql_decimal_scale(expr: &sqlparser::ast::Expr) -> Option<usize> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value};
+
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let name = function.name.0.last()?.value.to_ascii_uppercase();
+    if name == "AVG" {
+        return Some(4);
+    }
+    if !matches!(name.as_str(), "ROUND" | "TRUNCATE") {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let Some(argument) = arguments.args.get(1) else {
+        return Some(0);
+    };
+    let argument = match argument {
+        FunctionArg::Named { arg, .. }
+        | FunctionArg::ExprNamed { arg, .. }
+        | FunctionArg::Unnamed(arg) => arg,
+    };
+    let FunctionArgExpr::Expr(Expr::Value(Value::Number(scale, _))) = argument else {
+        return None;
+    };
+    Some(scale.parse::<i32>().ok()?.max(0) as usize)
 }
 
 fn count_query_params(query: &str) -> usize {
@@ -580,9 +1016,69 @@ fn param_to_json(param: ParamValue<'_>) -> Value {
         ValueInner::Double(value) => serde_json::Number::from_f64(value)
             .map(Value::Number)
             .unwrap_or(Value::Null),
-        ValueInner::Date(bytes) | ValueInner::Time(bytes) | ValueInner::Datetime(bytes) => {
-            Value::String(String::from_utf8_lossy(bytes).to_string())
-        }
+        ValueInner::Date(bytes) => Value::String(
+            decode_mysql_date_parameter(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+        ),
+        ValueInner::Time(bytes) => Value::String(
+            decode_mysql_time_parameter(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+        ),
+        ValueInner::Datetime(bytes) => Value::String(
+            decode_mysql_datetime_parameter(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+        ),
+    }
+}
+
+fn decode_mysql_date_parameter(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some("0000-00-00".to_string());
+    }
+    if bytes.len() != 4 {
+        return None;
+    }
+    let year = u16::from_le_bytes([bytes[0], bytes[1]]);
+    Some(format!("{year:04}-{:02}-{:02}", bytes[2], bytes[3]))
+}
+
+fn decode_mysql_datetime_parameter(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some("0000-00-00 00:00:00".to_string());
+    }
+    if !matches!(bytes.len(), 4 | 7 | 11) {
+        return None;
+    }
+    let date = decode_mysql_date_parameter(&bytes[..4])?;
+    if bytes.len() == 4 {
+        return Some(format!("{date} 00:00:00"));
+    }
+    let base = format!("{date} {:02}:{:02}:{:02}", bytes[4], bytes[5], bytes[6]);
+    if bytes.len() == 11 {
+        let micros = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
+        Some(format!("{base}.{micros:06}"))
+    } else {
+        Some(base)
+    }
+}
+
+fn decode_mysql_time_parameter(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some("00:00:00".to_string());
+    }
+    if !matches!(bytes.len(), 8 | 12) {
+        return None;
+    }
+    let negative = bytes[0] != 0;
+    let days = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let hours = u64::from(days) * 24 + u64::from(bytes[5]);
+    let sign = if negative { "-" } else { "" };
+    let base = format!("{sign}{hours:02}:{:02}:{:02}", bytes[6], bytes[7]);
+    if bytes.len() == 12 {
+        let micros = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        Some(format!("{base}.{micros:06}"))
+    } else {
+        Some(base)
     }
 }
 

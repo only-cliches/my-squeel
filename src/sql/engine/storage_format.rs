@@ -94,6 +94,8 @@ pub(super) fn persist_column_hint(
     store.hset(key, "default", hint.default.as_deref().unwrap_or(""))?;
     store.hset(key, "primary_key", bool_string(hint.primary_key))?;
     store.hset(key, "auto_increment", bool_string(hint.auto_increment))?;
+    store.hset(key, "generated", hint.generated.as_deref().unwrap_or(""))?;
+    store.hset(key, "generated_stored", bool_string(hint.generated_stored))?;
     Ok(())
 }
 
@@ -113,6 +115,10 @@ pub(super) fn decode_column_hint_from_hash(fields: &BTreeMap<String, String>) ->
             .is_some_and(|value| value == "true"),
         auto_increment: fields
             .get("auto_increment")
+            .is_some_and(|value| value == "true"),
+        generated: non_empty(fields.get("generated")),
+        generated_stored: fields
+            .get("generated_stored")
             .is_some_and(|value| value == "true"),
     }
 }
@@ -254,23 +260,51 @@ pub(super) fn decode_unique_columns(value: &str) -> Option<Vec<String>> {
 }
 
 pub(super) fn encode_index_hint(index: &IndexHint) -> String {
-    [
+    let mut parts = vec![
         index.name.clone(),
         bool_string(index.unique).to_string(),
         index.columns.join(&UNIQUE_SEPARATOR.to_string()),
-    ]
-    .join(&UNIQUE_SEPARATOR.to_string())
+    ];
+    if index.prefix_lengths.iter().any(Option::is_some) {
+        parts.push(format!(
+            "@prefix={}",
+            index
+                .prefix_lengths
+                .iter()
+                .map(|length| length.map(|length| length.to_string()).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    parts.join(&UNIQUE_SEPARATOR.to_string())
 }
 
 pub(super) fn decode_index_hint(value: &str) -> Option<IndexHint> {
     let mut parts = value.split(UNIQUE_SEPARATOR);
     let name = parts.next()?.to_string();
     let unique = parts.next()? == "true";
-    let columns = parts.map(ToString::to_string).collect::<Vec<_>>();
+    let mut columns = parts.map(ToString::to_string).collect::<Vec<_>>();
+    let prefix_lengths = columns
+        .last()
+        .and_then(|part| part.strip_prefix("@prefix="))
+        .map(|prefixes| {
+            prefixes
+                .split(',')
+                .map(|length| (!length.is_empty()).then(|| length.parse().ok()).flatten())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if columns
+        .last()
+        .is_some_and(|part| part.starts_with("@prefix="))
+    {
+        columns.pop();
+    }
     (!name.is_empty() && !columns.is_empty()).then_some(IndexHint {
         name,
         columns,
         unique,
+        prefix_lengths,
     })
 }
 

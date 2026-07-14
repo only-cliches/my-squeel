@@ -251,7 +251,7 @@ fn evaluates_json_string_math_and_conversion_functions() {
     assert_eq!(row.get("exp_value").and_then(|v| v.as_i64()), Some(1));
     assert_eq!(
         row.get("truncate_value").and_then(|v| v.as_f64()),
-        Some(3.14)
+        Some(314.0 / 100.0)
     );
     assert_eq!(row.get("mod_value").and_then(|v| v.as_i64()), Some(2));
     assert_eq!(

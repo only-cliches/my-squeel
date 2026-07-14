@@ -2,6 +2,75 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.3.0 July 13, 2026
+
+### Added
+
+- Added an opt-in `--mysql-strict` compatibility profile. Strict mode disables implicit table and
+  column creation, enforces declared types, ranges, lengths, nullability, defaults, generated
+  columns, unique keys, and foreign keys, and returns MySQL wire error numbers for common failures.
+  The default profile remains drift tolerant.
+- Added declared and inferred result-column metadata for integer widths, unsigned values, floating
+  point and decimal types, date/time, binary, JSON, nullability, source tables, character sets,
+  collations, and scale. Prepared statements now expose this metadata before execution.
+- Added typed MySQL wire result encoding for signed and unsigned numeric widths, floats, doubles,
+  decimals, `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` (including negative and fractional values),
+  JSON, and binary data, plus prepared-parameter decoding for native binary date/time values.
+- Added qualified wildcards; `RIGHT`, `CROSS`, `USING`, `NATURAL`, and derived-table joins; and
+  nonrecursive common table expressions with optional column aliases.
+- Added `UNION`, `INTERSECT`, and `EXCEPT` set semantics, including `ALL`/`DISTINCT` handling,
+  left-branch column names, and branch-arity validation.
+- Added named and inline window specifications, common `ROWS` and peer-aware `RANGE` frames,
+  aggregate windows, and `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`,
+  `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE`.
+- Added MySQL multi-table `DELETE` target-list and `DELETE ... USING` forms.
+- Added migration-oriented DDL support for temporary tables; virtual and stored generated columns;
+  prefix indexes; `ALTER TABLE` add, drop, rename, change, modify, default/type/nullability, column
+  positioning, table rename, and index operations; and matching `SHOW CREATE TABLE` output.
+- Added foreign-key schema validation and insert/update/delete enforcement with `CASCADE`,
+  `SET NULL`, `RESTRICT`, and `NO ACTION` behavior for referenced rows.
+- Added a fail-closed SQL support validator so unsupported operators, expressions, functions, query
+  modifiers, table factors, and join forms return explicit errors instead of partial results.
+- Added a deterministic 2,500-query differential corpus with a 95% compatibility floor, exact
+  row/result parity tests, MySQL wire error-code checks, and ORM-shaped migration, prepared CRUD,
+  relation, and introspection coverage for Diesel, Drizzle/Knex, Prisma, and SeaORM patterns.
+- Added GitHub Actions coverage against MySQL 8.0.43. Real-MySQL parity is non-skippable in CI, and
+  local compatibility tests provision the same image when Docker and the image are available.
+
+### Changed
+
+- Aligned expression evaluation with MySQL three-valued logic, numeric-prefix coercion,
+  case-insensitive string equality, `DIV` and bitwise behavior, byte versus character string
+  lengths, and NULL propagation through unary, comparison, `IN`, `BETWEEN`, and logical operators.
+- Aligned `SELECT DISTINCT`, nested aggregate expressions, empty aggregate sets, scalar-subquery
+  cardinality errors, qualified-name resolution, derived columns, ordering aliases, and set-result
+  naming with MySQL behavior.
+- Improved `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, and `information_schema` metadata for
+  data types, nullability, ordinal positions, primary/unique/secondary keys, index prefix lengths,
+  generated columns, and referential constraints.
+- Aligned affected-row counts with MySQL: changed `ON DUPLICATE KEY UPDATE` rows report two,
+  unchanged duplicate updates report zero, and replacements of existing rows report two.
+- Changed declared schemas to be authoritative for reads: unknown tables, ambiguous references, and
+  columns removed by `ALTER TABLE` now return errors instead of silently producing NULL values.
+- Reworked the README around an accurate quick start, compatibility-profile comparison, verified
+  SQL contract, local-data and search workflows, security warning, and explicit limitations.
+
+### Fixed
+
+- Fixed foreign-key insert validation deadlocking when child and parent tables occupied the same
+  internal map shard.
+- Fixed `ALTER TABLE RENAME COLUMN` and `CHANGE COLUMN` to move existing stored values to the new
+  column name and keep primary, unique, index, and local foreign-key column metadata consistent.
+- Fixed peer-aware default `RANGE` window frames and `CUME_DIST`/`PERCENT_RANK` result typing so
+  fractional results are not truncated based on the first row.
+- Fixed prepared binary `DATE`, `DATETIME`, and signed fractional `TIME` parameter handling and
+  result encoding.
+
+### Compatibility notes
+
+- Recursive CTEs, `FULL JOIN`, stored programs, and transaction semantics remain outside the
+  supported compatibility surface and now fail explicitly where parsed.
+
 ## 0.2.4 - Jun 30, 2026
 
 - Added broader MySQL date/time scalar support, including `DATE_ADD`/`ADDDATE`, `DATE_SUB`/`SUBDATE`, `TIMESTAMPADD`, `TIMESTAMPDIFF`, `DATEDIFF`, `ADDTIME`, `SUBTIME`, `TIMEDIFF`, `EXTRACT`, current/UTC date-time functions, date/time part functions, and expanded `DATE_FORMAT` tokens.
@@ -25,7 +94,10 @@ All notable changes to MySqweel will be documented in this file.
 - Added explicit errors for unsupported `UPDATE ... FROM`, multi-table `DELETE`, `DELETE ... USING`, `DELETE` joins, and qualified correlated subqueries so they cannot be silently mis-evaluated.
 - Improved `ON DUPLICATE KEY UPDATE` evaluation for expressions that mix existing row values with `VALUES(...)`.
 - Added expanded regression and MySQL parity coverage for DML edge cases, including `UPDATE ... JOIN`, `UPDATE ... LEFT JOIN`, `INSERT ... SELECT` modifiers, limited deletes, duplicate-key update expressions, and unsupported syntax guards.
-- Updated README presentation and release package metadata for the next publish.
+
+## 0.2.2 - Jun 27, 2026
+
+- Refreshed the README branding and corrected the introductory project description.
 
 ## 0.2.1 - Jun 27, 2026
 

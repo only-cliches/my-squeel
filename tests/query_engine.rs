@@ -59,7 +59,7 @@ fn supports_alias_qualified_joins_without_ambiguous_fallbacks() {
     assert_eq!(joined[0].rows.len(), 1);
     assert_eq!(
         joined[0].rows[0]
-            .get("p.title")
+            .get("title")
             .and_then(|value| value.as_str()),
         Some("second")
     );
@@ -641,7 +641,7 @@ fn delete_order_by_limit_deletes_only_selected_rows() {
 }
 
 #[test]
-fn unsupported_delete_join_shapes_fail_without_mutating() {
+fn mysql_delete_join_shapes_remove_the_selected_targets() {
     let _guard = test_lock();
     let engine = Engine::default();
     engine
@@ -656,28 +656,26 @@ fn unsupported_delete_join_shapes_fail_without_mutating() {
         )
         .unwrap();
     engine
-        .execute_sql("INSERT INTO posts (id, user_id) VALUES (10, 1);")
+        .execute_sql("INSERT INTO posts (id, user_id) VALUES (10, 1), (11, 2);")
         .unwrap();
 
-    assert!(
-        engine
-            .execute_sql(
-                "DELETE users FROM users JOIN posts ON posts.user_id = users.id WHERE posts.id = 10",
-            )
-            .is_err()
-    );
-    assert!(
-        engine
-            .execute_sql("DELETE FROM users USING posts WHERE posts.user_id = users.id")
-            .is_err()
-    );
+    let first = engine
+        .execute_sql(
+            "DELETE users FROM users JOIN posts ON posts.user_id = users.id WHERE posts.id = 10",
+        )
+        .unwrap();
+    assert_eq!(first[0].rows_affected, 1);
+    let second = engine
+        .execute_sql(
+            "DELETE FROM users USING users JOIN posts ON posts.user_id = users.id WHERE posts.id = 11",
+        )
+        .unwrap();
+    assert_eq!(second[0].rows_affected, 1);
 
     let rows = engine
         .execute_sql("SELECT id, email FROM users ORDER BY id")
         .unwrap();
-    assert_eq!(rows[0].rows.len(), 2);
-    assert_eq!(rows[0].rows[0].get("id").and_then(|v| v.as_i64()), Some(1));
-    assert_eq!(rows[0].rows[1].get("id").and_then(|v| v.as_i64()), Some(2));
+    assert!(rows[0].rows.is_empty());
 }
 
 #[test]
@@ -699,7 +697,15 @@ fn on_duplicate_key_update_can_mix_existing_and_incoming_values() {
              ON DUPLICATE KEY UPDATE score = score + VALUES(score), touched = touched + VALUES(touched);",
         )
         .unwrap();
-    assert_eq!(updated[0].rows_affected, 1);
+    assert_eq!(updated[0].rows_affected, 2);
+
+    let unchanged = engine
+        .execute_sql(
+            "INSERT INTO counters (email, score, touched) VALUES ('a@example.com', 99, 99) \
+             ON DUPLICATE KEY UPDATE score = score, touched = touched;",
+        )
+        .unwrap();
+    assert_eq!(unchanged[0].rows_affected, 0);
 
     let rows = engine
         .execute_sql("SELECT score, touched FROM counters WHERE email = 'a@example.com'")
@@ -749,11 +755,12 @@ fn delete_returns_predicate_errors_instead_of_suppressing_them() {
         .unwrap();
 
     let err = engine
-        .execute_sql(
-            "DELETE FROM users WHERE EXISTS (SELECT id FROM users INTERSECT SELECT id FROM users)",
-        )
+        .execute_sql("DELETE FROM users WHERE UNSUPPORTED_PREDICATE(email) = 1")
         .unwrap_err();
-    assert!(err.to_string().contains("unsupported set operation"));
+    assert!(err.to_string().contains("unsupported"));
+
+    let rows = engine.execute_sql("SELECT id FROM users").unwrap();
+    assert_eq!(rows[0].rows.len(), 1);
 }
 
 #[test]
@@ -976,7 +983,7 @@ fn supports_common_subquery_shapes() {
         .unwrap();
     assert_eq!(derived[0].rows.len(), 1);
     assert_eq!(
-        derived[0].rows[0].get("d.email").unwrap().as_str(),
+        derived[0].rows[0].get("email").unwrap().as_str(),
         Some("b@example.com")
     );
 

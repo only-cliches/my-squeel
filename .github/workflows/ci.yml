@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      mysql:
+        image: mysql:8.0.43
+        env:
+          MYSQL_ROOT_PASSWORD: my-sqweel
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent -h 127.0.0.1 -pmy-sqweel"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      CARGO_BUILD_JOBS: 1
+      MYSQL_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3306/test
+      MYSQL_PARITY_REQUIRED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test all targets against real MySQL
+        run: cargo test --all-targets --locked

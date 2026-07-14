@@ -11,6 +11,39 @@
 # - Use `killme` only when the user explicitly asks you to end this container.
 # """
 #
+# Hostdo (host-side command execution)
+#
+# default_policy: what happens when a command doesn't match any rule below.
+#   auto   — run without prompting (use with caution)
+#   prompt — ask the developer in the TUI (default)
+#   deny   — reject silently
+#
+# Passthrough command (exact argv match, auto-approved):
+#   [[hostdo.commands]]
+#   argv = ["cargo", "test"] # run inside container with `hostdo run cargo test`
+#   cwd = "$WORKSPACE"         # execution cwd only, not part of approval matching
+#   timeout_secs = 60
+#   approval_mode = "auto"
+#
+# Short-lived Docker runner (exact argv + image match, auto-approved):
+#   [[hostdo.commands]]
+#   argv = ["npm", "test"]   # run with `hostdo run --image node:20 npm test`
+#   image = "node:20"
+#   cwd = "$WORKSPACE"
+#   timeout_secs = 60
+#   approval_mode = "auto"
+#
+# $WORKSPACE = workspace path on the host.
+#
+# Environment scrubbing (optional, passthrough commands only):
+#   env_allowlist = ["CARGO_TERM_COLOR", "CI"]
+# When env_allowlist is present the command runs from a cleared environment
+# containing only a small base set (PATH, HOME, USER, LOGNAME, SHELL, TMPDIR,
+# LANG, LC_ALL, LC_CTYPE, TERM) plus the variables listed, instead of
+# inheriting the manager's full host environment. An empty list grants just
+# the base set. Not supported on image rules — the runner container already
+# starts with a clean environment.
+#
 # Network (HTTP/HTTPS proxy policy)
 #
 # Coder-style network rules. Deny matches win over allow matches; if no rule
@@ -35,6 +68,35 @@
 # - raw CONNECT to other ports requires an explicit `port=...` allow rule
 
 version = 1
+
+[hostdo]
+default_policy = "prompt"
+
+[[hostdo.commands]]
+argv = [
+    "cargo",
+    "test",
+]
+cwd = "$WORKSPACE"
+timeout_secs = 60
+approval_mode = "auto"
+
+[[hostdo.commands]]
+argv = [
+    "cargo",
+    "test",
+    "--test",
+    "mysql_parity",
+    "--test",
+    "mysql_compatibility_corpus",
+    "--test",
+    "mysql_error_compatibility",
+    "--",
+    "--nocapture",
+]
+cwd = "$WORKSPACE"
+timeout_secs = 120
+approval_mode = "auto"
 
 [network]
 allowlist = [

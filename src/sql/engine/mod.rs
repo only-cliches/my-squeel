@@ -28,12 +28,14 @@ mod eval;
 mod maintenance;
 mod query;
 mod storage_format;
+mod support;
 mod values;
 
 use compat::*;
 use ddl::*;
 use eval::*;
 use storage_format::*;
+use support::*;
 use values::*;
 
 const STORAGE_NAMESPACE: &str = "my-sqweel";
@@ -48,6 +50,26 @@ pub enum UniqueMode {
     #[default]
     Overwrite,
     Enforce,
+}
+
+/// Controls whether MySqweel favors schema-drift convenience or MySQL's
+/// fail-fast behavior. The default remains drift tolerant for backwards
+/// compatibility; callers that need MySQL parity should select `MysqlStrict`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityProfile {
+    #[default]
+    Drift,
+    MysqlStrict,
+}
+
+impl CompatibilityProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drift => "drift",
+            Self::MysqlStrict => "mysql_strict",
+        }
+    }
 }
 
 impl UniqueMode {
@@ -79,6 +101,8 @@ impl SeedMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub unique_mode: UniqueMode,
+    #[serde(default)]
+    pub compatibility_profile: CompatibilityProfile,
     pub failure_injection: FailureInjectionConfig,
 }
 
@@ -93,7 +117,20 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             unique_mode: UniqueMode::Overwrite,
+            compatibility_profile: CompatibilityProfile::Drift,
             failure_injection: FailureInjectionConfig::default(),
+        }
+    }
+}
+
+impl EngineConfig {
+    /// A parity-oriented configuration that rejects schema drift and enforces
+    /// declared uniqueness in the same places MySQL does.
+    pub fn mysql_strict() -> Self {
+        Self {
+            unique_mode: UniqueMode::Enforce,
+            compatibility_profile: CompatibilityProfile::MysqlStrict,
+            ..Self::default()
         }
     }
 }
@@ -103,7 +140,157 @@ pub struct QueryResult {
     pub rows_affected: u64,
     pub last_insert_id: u64,
     pub columns: Vec<String>,
+    pub column_metadata: Vec<ColumnMetadata>,
     pub rows: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlColumnType {
+    Null,
+    TinyInt,
+    SmallInt,
+    Integer,
+    BigInt,
+    Float,
+    Double,
+    Decimal,
+    Date,
+    Time,
+    DateTime,
+    Timestamp,
+    Year,
+    Char,
+    #[default]
+    VarChar,
+    Text,
+    Binary,
+    VarBinary,
+    Blob,
+    Json,
+    Bit,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnMetadata {
+    pub name: String,
+    #[serde(default)]
+    pub table: String,
+    #[serde(default)]
+    pub column_type: MysqlColumnType,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+    #[serde(default)]
+    pub unsigned: bool,
+    #[serde(default)]
+    pub decimals: u8,
+    pub character_set: Option<String>,
+    pub collation: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ColumnMetadata {
+    pub fn from_declared(
+        name: impl Into<String>,
+        table: impl Into<String>,
+        hint: &ColumnHint,
+    ) -> Self {
+        let declared = hint.sql_type.as_deref().unwrap_or("VARCHAR");
+        let upper = declared.to_ascii_uppercase();
+        Self {
+            name: name.into(),
+            table: table.into(),
+            column_type: mysql_column_type_from_declared(&upper),
+            nullable: hint.nullable.unwrap_or(true) && !hint.primary_key,
+            unsigned: upper.contains("UNSIGNED"),
+            decimals: declared_type_scale(&upper),
+            character_set: is_character_type(&upper).then(|| "utf8mb4".to_string()),
+            collation: is_character_type(&upper).then(|| "utf8mb4_general_ci".to_string()),
+        }
+    }
+
+    pub fn from_value(name: impl Into<String>, value: Option<&Value>) -> Self {
+        let name = name.into();
+        let column_type = match value {
+            None | Some(Value::Null) => MysqlColumnType::VarChar,
+            Some(Value::Bool(_)) => MysqlColumnType::TinyInt,
+            Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+                MysqlColumnType::BigInt
+            }
+            Some(Value::Number(_)) => MysqlColumnType::Double,
+            Some(Value::Array(_) | Value::Object(_)) => MysqlColumnType::Json,
+            Some(Value::String(_)) => MysqlColumnType::VarChar,
+        };
+        Self {
+            name,
+            column_type,
+            ..Self::default()
+        }
+    }
+}
+
+fn is_character_type(upper: &str) -> bool {
+    ["CHAR", "TEXT", "ENUM", "SET"]
+        .iter()
+        .any(|kind| upper.contains(kind))
+}
+
+fn declared_type_scale(upper: &str) -> u8 {
+    if !(upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC")) {
+        return 0;
+    }
+    upper
+        .split_once('(')
+        .and_then(|(_, tail)| tail.split_once(',').map(|(_, scale)| scale))
+        .and_then(|scale| scale.trim_end_matches(')').trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn mysql_column_type_from_declared(upper: &str) -> MysqlColumnType {
+    if upper.starts_with("TINYINT") || upper.starts_with("BOOL") {
+        MysqlColumnType::TinyInt
+    } else if upper.starts_with("SMALLINT") {
+        MysqlColumnType::SmallInt
+    } else if upper.starts_with("MEDIUMINT") || upper.starts_with("INT") {
+        MysqlColumnType::Integer
+    } else if upper.starts_with("BIGINT") {
+        MysqlColumnType::BigInt
+    } else if upper.starts_with("FLOAT") {
+        MysqlColumnType::Float
+    } else if upper.starts_with("DOUBLE") || upper.starts_with("REAL") {
+        MysqlColumnType::Double
+    } else if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
+        MysqlColumnType::Decimal
+    } else if upper.starts_with("TIMESTAMP") {
+        MysqlColumnType::Timestamp
+    } else if upper.starts_with("DATETIME") {
+        MysqlColumnType::DateTime
+    } else if upper.starts_with("DATE") {
+        MysqlColumnType::Date
+    } else if upper.starts_with("TIME") {
+        MysqlColumnType::Time
+    } else if upper.starts_with("YEAR") {
+        MysqlColumnType::Year
+    } else if upper.starts_with("VARBINARY") {
+        MysqlColumnType::VarBinary
+    } else if upper.starts_with("BINARY") {
+        MysqlColumnType::Binary
+    } else if upper.starts_with("BIT") {
+        MysqlColumnType::Bit
+    } else if upper.contains("BLOB") {
+        MysqlColumnType::Blob
+    } else if upper.starts_with("JSON") {
+        MysqlColumnType::Json
+    } else if upper.contains("TEXT") {
+        MysqlColumnType::Text
+    } else if upper.starts_with("CHAR") {
+        MysqlColumnType::Char
+    } else {
+        MysqlColumnType::VarChar
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +362,18 @@ impl Engine {
         Ok(engine)
     }
 
+    pub fn compatibility_profile(&self) -> CompatibilityProfile {
+        self.cfg.compatibility_profile
+    }
+
+    pub(super) fn mysql_strict(&self) -> bool {
+        self.cfg.compatibility_profile == CompatibilityProfile::MysqlStrict
+    }
+
+    pub(super) fn enforces_uniqueness(&self) -> bool {
+        self.mysql_strict() || self.cfg.unique_mode == UniqueMode::Enforce
+    }
+
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<QueryResult>> {
         tracing::debug!(sql, "sql.execute");
         let mut out = Vec::new();
@@ -188,6 +387,7 @@ impl Engine {
                 continue;
             }
             for statement in super::parse(&raw)? {
+                validate_statement_support(&statement)?;
                 out.push(self.execute_statement(statement)?);
             }
         }
@@ -229,12 +429,19 @@ impl Engine {
 
     pub fn execute_statement(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
-            Statement::CreateTable(create) => {
-                self.create_table(create.name, create.columns, create.constraints)
-            }
+            Statement::CreateTable(create) => self.create_table(
+                create.name,
+                create.columns,
+                create.constraints,
+                create.if_not_exists,
+                create.temporary,
+            ),
             Statement::AlterTable {
-                name, operations, ..
-            } => self.alter_table(name, operations),
+                name,
+                operations,
+                if_exists,
+                ..
+            } => self.alter_table(name, operations, if_exists),
             Statement::CreateIndex(create) => self.create_index_from_sql(&create.to_string()),
             Statement::Insert(insert) => self.insert_rows(insert),
             Statement::Query(query) => self.select_query(*query),
@@ -250,8 +457,9 @@ impl Engine {
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Table,
                 names,
+                if_exists,
                 ..
-            } => self.drop_table(names),
+            } => self.drop_table(names, if_exists),
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Index,
                 names,
@@ -280,6 +488,9 @@ impl Engine {
 
         if upper.starts_with("CREATE DATABASE") || upper.starts_with("DROP DATABASE") {
             return Ok(Some(QueryResult::default()));
+        }
+        if let Some((table, index)) = parse_alter_table_drop_index(trimmed) {
+            return Ok(Some(self.drop_index_from_table(&table, &index)?));
         }
         if upper.starts_with("SHOW DATABASES") || upper.starts_with("SHOW SCHEMAS") {
             return Ok(Some(show_databases_result()));
