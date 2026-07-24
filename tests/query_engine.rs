@@ -883,6 +883,27 @@ fn supports_conditional_and_date_functions() {
 }
 
 #[test]
+fn computed_projection_metadata_preserves_nullable() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql("CREATE TABLE users (id BIGINT PRIMARY KEY AUTO_INCREMENT, name TEXT);")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO users (name) VALUES ('Alice'), ('Bob');")
+        .unwrap();
+
+    let result = engine
+        .execute_sql("SELECT NULLIF(name, 'Alice') AS not_alice FROM users ORDER BY id")
+        .unwrap();
+    assert_eq!(result[0].column_metadata[0].nullable, true);
+    assert_eq!(
+        result[0].rows[0].get("not_alice"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
 fn supports_mysql_compatibility_query_edges() {
     let _guard = test_lock();
     let engine = Engine::default();

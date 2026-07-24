@@ -217,7 +217,7 @@ fn evaluates_json_string_math_and_conversion_functions() {
         .unwrap();
     let row = &out[0].rows[0];
 
-    assert_eq!(row.get("json_name"), Some(&json!("Ada")));
+    assert_eq!(row.get("json_name"), Some(&json!("\"Ada\"")));
     assert_eq!(row.get("unquoted_name"), Some(&json!("Ada")));
     assert_eq!(
         row.get("json_object"),

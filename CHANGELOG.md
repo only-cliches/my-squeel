@@ -2,6 +2,22 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.3.2 July 24, 2026
+
+### Added
+
+- Added the `mysql-test-server` helper under `vendor/` and installed MySQL client/server packages in the Rust image (`vendor/rust.dockerfile`) so image-based test flows can provision a local MySQL instance for parity checks.
+- Added dedicated MySQL parity coverage for conditional and null-control expressions (`COALESCE`, `NULLIF`, `IF`, `CASE`) including prepared-statement execution.
+- Added MySQL parity coverage for `CASE` combined with window functions under prepared execution.
+- Added MySQL parity coverage for `CASE` combined with ranking window functions (`ROW_NUMBER`, `RANK`) under prepared execution.
+- Added MySQL parity coverage for JSON/datetime expressions, including prepared JSON construction and extraction paths.
+- Added MySQL parity coverage for JSON collection-path semantics (nested arrays/objects, multi-path extraction, index mutation/removal, and prepared JSON mutation/composition).
+
+### Fixed
+
+- Improved `mysql-test-server` startup behavior to be deterministic for already-running servers vs. servers started by the helper, and removed `MYSQL_ROOT_PASSWORD`-specific URL/user setup from helper flow.
+- Fixed SQL projection metadata inference so computed expressions now default to nullable metadata when value-based inference cannot prove non-nullability, preventing MySQL protocol `NOT NULL` false positives (for example `NULLIF(...) AS not_alice`).
+
 ## 0.3.1 July 24, 2026
 
 ### Added

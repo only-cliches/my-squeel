@@ -23,9 +23,18 @@ pub(super) fn eval_json_extract(
     }
     match matches.len() {
         0 => Ok(Value::Null),
-        1 => Ok(matches.pop().unwrap_or(Value::Null)),
-        _ => Ok(Value::Array(matches)),
+        1 => {
+            let value = matches.pop().unwrap_or(Value::Null);
+            json_text_value(value)
+        }
+        _ => json_text_value(Value::Array(matches)),
     }
+}
+
+fn json_text_value(value: Value) -> Result<Value> {
+    Ok(Value::String(
+        serde_json::to_string(&value).map_err(|error| anyhow!("invalid json value: {error}"))?,
+    ))
 }
 
 pub(super) fn eval_json_unquote(

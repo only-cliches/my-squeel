@@ -1157,3 +1157,395 @@ fn unsupported_queries_return_mysql_errors() {
         "unexpected error message: {message}"
     );
 }
+
+#[test]
+fn parity_with_mysql_for_json_expressions() {
+    let _guard = common::test_lock();
+    let Some(mysql_target) = mysql_compare_target() else {
+        return;
+    };
+    let mysql_url = mysql_target.url();
+    let whatever_url = start_whatever_server();
+
+    let mysql_pool = Pool::new(Opts::from_url(mysql_url).expect("valid MySQL compare URL"))
+        .expect("connect to mysql");
+    let whatever_pool = Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL"))
+        .expect("connect to my-sqweel");
+
+    let mut mysql_conn = mysql_pool.get_conn().expect("mysql conn");
+    let mut whatever_conn = whatever_pool.get_conn().expect("whatever conn");
+
+    let pid = std::process::id();
+    let payloads = format!("wdb_json_payload_{pid}");
+
+    let _ = mysql_conn.query_drop(&format!("DROP TABLE IF EXISTS {payloads}"));
+    let _ = whatever_conn.query_drop(&format!("DROP TABLE IF EXISTS {payloads}"));
+
+    let ada_payload = r#"{"name":"Ada","tier":"pro","flags":[1,2]}"#;
+    let bob_payload = r#"{"name":"Bob","tier":"basic"}"#;
+    let has_pro_payload = r#"{"tier":"pro"}"#;
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "CREATE TABLE {payloads} \
+             (id BIGINT PRIMARY KEY AUTO_INCREMENT, username TEXT, score BIGINT, payload TEXT)"
+        ),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "INSERT INTO {payloads} (username, score, payload) VALUES \
+            ('Ada', 10, '{ada_payload}'), \
+            ('Bob', 20, '{bob_payload}'), \
+            ('Eve', 30, NULL)"
+        ),
+    );
+
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_EXTRACT(payload, '$.name') AS name_json, \
+                JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name')) AS name_plain, \
+                JSON_CONTAINS(payload, '{has_pro_payload}', '$') AS has_pro_tier \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('name', username, 'score', score, 'tier', JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tier'))), '$.name')) AS metadata_name, \
+                JSON_EXTRACT(JSON_OBJECT('name', username, 'score', score, 'tier', JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tier'))), '$.score') AS metadata_score, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('name', username, 'score', score, 'tier', JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tier'))), '$.tier')) AS metadata_tier, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_ARRAY(username, score, JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name'))), '$[0]')) AS array_username, \
+                JSON_EXTRACT(JSON_ARRAY(username, score, JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name'))), '$[1]') AS array_score, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_ARRAY(username, score, JSON_UNQUOTE(JSON_EXTRACT(payload, '$.name'))), '$[2]')) AS array_name \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_SET(payload, '$.tier', 'enterprise'), '$.name')) AS promoted_name, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_SET(payload, '$.tier', 'enterprise'), '$.tier')) AS promoted_tier, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_REMOVE(payload, '$.flags'), '$.name')) AS no_flags_name, \
+                JSON_EXTRACT(JSON_REMOVE(payload, '$.flags'), '$.tier') AS no_flags_tier, \
+                JSON_EXTRACT(JSON_REMOVE(payload, '$.flags'), '$.flags') AS no_flags_flags \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                TIMESTAMPDIFF(DAY, '2026-01-01 00:00:00', '2026-01-07 12:00:00') AS day_delta, \
+                DATE_ADD('2026-01-02 00:00:00', INTERVAL 3 HOUR) AS shifted \
+             "
+        ),
+    );
+
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT \
+            JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('name', ?, 'score', ?), '$.name')) AS object_name, \
+            JSON_EXTRACT(JSON_OBJECT('name', ?, 'score', ?), '$.score') AS object_score",
+        ("Zoe", 99, "Zoe", 99),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT \
+            JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('name', ?, 'score', ?), '$.name')) AS object_name, \
+            JSON_EXTRACT(JSON_OBJECT('name', ?, 'score', ?), '$.score') AS object_score",
+        ("Zoe", 99, "same-name", 123),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT JSON_CONTAINS(?, ?, '$') AS found",
+        ("{\"a\":1,\"b\":2}", "{\"a\":1}"),
+    );
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("DROP TABLE IF EXISTS {payloads}"),
+    );
+}
+
+#[test]
+fn parity_with_mysql_for_json_collection_paths() {
+    let _guard = common::test_lock();
+    let Some(mysql_target) = mysql_compare_target() else {
+        return;
+    };
+    let mysql_url = mysql_target.url();
+    let whatever_url = start_whatever_server();
+
+    let mysql_pool = Pool::new(Opts::from_url(mysql_url).expect("valid MySQL compare URL"))
+        .expect("connect to mysql");
+    let whatever_pool = Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL"))
+        .expect("connect to my-sqweel");
+
+    let mut mysql_conn = mysql_pool.get_conn().expect("mysql conn");
+    let mut whatever_conn = whatever_pool.get_conn().expect("whatever conn");
+
+    let pid = std::process::id();
+    let payloads = format!("wdb_json_collection_{pid}");
+
+    let _ = mysql_conn.query_drop(&format!("DROP TABLE IF EXISTS {payloads}"));
+    let _ = whatever_conn.query_drop(&format!("DROP TABLE IF EXISTS {payloads}"));
+
+    let payload_alpha = r#"{"team":{"lead":{"name":"Ada","score":10},"scores":[10,20,30],"labels":["pro","basic"]},"meta":{"active":true}}"#;
+    let payload_beta = r#"{"team":{"lead":{"name":"Bob","score":25},"scores":[40,50],"labels":["basic","trial"]},"meta":{"active":false}}"#;
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("CREATE TABLE {payloads} (id BIGINT PRIMARY KEY AUTO_INCREMENT, payload TEXT)"),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("INSERT INTO {payloads} (payload) VALUES ('{payload_alpha}'), ('{payload_beta}')"),
+    );
+
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_UNQUOTE(JSON_EXTRACT(payload, '$.team.lead.name')) AS lead_name, \
+                JSON_EXTRACT(payload, '$.team.scores[1]') AS score_mid, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_EXTRACT(payload, '$.team.labels[0]', '$.team.labels[1]'), '$[0]')) AS first_label, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_EXTRACT(payload, '$.team.labels[0]', '$.team.labels[1]'), '$[1]')) AS second_label \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_SET(payload, '$.team.scores[1]', 99, '$.team.labels[2]', 'enterprise'), '$.team.lead.name')) AS updated_lead, \
+                JSON_EXTRACT(JSON_SET(payload, '$.team.scores[1]', 99, '$.team.labels[2]', 'enterprise'), '$.team.scores[1]') AS updated_score_mid, \
+                JSON_UNQUOTE(JSON_EXTRACT(JSON_SET(payload, '$.team.scores[1]', 99, '$.team.labels[2]', 'enterprise'), '$.team.labels[2]')) AS appended_label, \
+                JSON_EXTRACT(JSON_REMOVE(payload, '$.meta.active', '$.team.labels[0]'), '$.team.labels') AS remaining_labels \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                JSON_EXTRACT(payload, '$.team.labels[5]') AS missing_value, \
+                JSON_EXTRACT(payload, '$.missing.key') AS missing_path, \
+                JSON_CONTAINS(payload, '[\"basic\"]', '$.team.labels') AS has_basic_label \
+             FROM {payloads} \
+             ORDER BY id"
+        ),
+    );
+
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT \
+            JSON_EXTRACT(JSON_SET(?, '$.team.scores[0]', ?, '$.team.scores[1]', ?), '$.team.scores[0]') AS score_zero, \
+            JSON_EXTRACT(JSON_SET(?, '$.team.scores[0]', ?, '$.team.scores[1]', ?), '$.team.scores[1]') AS score_one, \
+            JSON_CONTAINS(?, '\"Alice\"', '$.team.labels') AS has_label",
+        (
+            r#"{"team":{"lead":{"name":"Zed","score":3},"scores":[1,2],"labels":["alpha","beta"]}}"#,
+            99_i64,
+            100_i64,
+            r#"{"team":{"lead":{"name":"Zed","score":3},"scores":[1,2],"labels":["alpha","beta"]}}"#,
+            99_i64,
+            100_i64,
+            r#"{"team":{"lead":{"name":"Zed","score":3},"scores":[1,2,3],"labels":["alpha","Alice"]}}"#,
+        ),
+    );
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("DROP TABLE IF EXISTS {payloads}"),
+    );
+}
+
+#[test]
+fn parity_with_mysql_for_conditional_expressions() {
+    let _guard = common::test_lock();
+    let Some(mysql_target) = mysql_compare_target() else {
+        return;
+    };
+    let mysql_url = mysql_target.url();
+    let whatever_url = start_whatever_server();
+
+    let mysql_pool = Pool::new(Opts::from_url(mysql_url).expect("valid MySQL compare URL"))
+        .expect("connect to mysql");
+    let whatever_pool = Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL"))
+        .expect("connect to my-sqweel");
+
+    let mut mysql_conn = mysql_pool.get_conn().expect("mysql conn");
+    let mut whatever_conn = whatever_pool.get_conn().expect("whatever conn");
+
+    let pid = std::process::id();
+    let conditional = format!("wdb_conditional_sql_{pid}");
+
+    let _ = mysql_conn.query_drop(&format!("DROP TABLE IF EXISTS {conditional}"));
+    let _ = whatever_conn.query_drop(&format!("DROP TABLE IF EXISTS {conditional}"));
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "CREATE TABLE {conditional} (id BIGINT PRIMARY KEY AUTO_INCREMENT, username TEXT, score BIGINT, nickname TEXT)"
+        ),
+    );
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "INSERT INTO {conditional} (username, score, nickname) VALUES \
+             ('Alice', 10, NULL), \
+             (NULL, NULL, NULL), \
+             ('Carol', 25, 'carol'), \
+             ('Dave', 30, '')"
+        ),
+    );
+
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                IF(username IS NULL, 'missing', username) AS username_or_default, \
+                NULLIF(nickname, '') AS trimmed_optional, \
+                COALESCE(NULLIF(username, 'Alice'), 'fallback') AS non_alice, \
+                CASE WHEN score IS NULL THEN 0 WHEN score >= 20 THEN 1 ELSE -1 END AS score_bucket \
+            FROM {conditional} \
+            ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                CASE WHEN score >= 20 THEN 'high' WHEN score IS NULL THEN 'unknown' ELSE 'low' END AS score_label, \
+                NULLIF(score, 10) AS not_ten, \
+                COALESCE(NULLIF(score, 30), 99) AS null_if_30_or_default \
+            FROM {conditional} \
+            ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT username, IFNULL(nickname, '<missing>') AS nick_value FROM {conditional} ORDER BY id"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(score), 0) AS score_total, MIN(score) AS min_score \
+             FROM {conditional}"
+        ),
+    );
+
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT NULLIF(?, ?) AS passthrough",
+        ("same", "same"),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT NULLIF(?, ?) AS passthrough",
+        ("left", "right"),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT IF(? IS NULL, 'missing', 'present') AS marker, COALESCE(?, ?, ?) AS label",
+        (Option::<&str>::None, Option::<&str>::None, "alpha", "omega"),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT id, CASE WHEN username = ? THEN 'match' ELSE 'mismatch' END AS flagged \
+             FROM {conditional} \
+             WHERE score >= ? \
+             ORDER BY id"
+        ),
+        ("Alice", 20_i64),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("SELECT id, COALESCE(nickname, ?, ?) AS source FROM {conditional} ORDER BY id"),
+        ("none", ""),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                CASE WHEN score >= ? THEN 'high' ELSE 'low' END AS prepared_score_band, \
+                SUM(CASE WHEN username IS NULL OR username = ? THEN 1 ELSE 0 END) \
+                    OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS running_flag_count \
+             FROM {conditional} \
+             ORDER BY id"
+        ),
+        (20_i64, "Carol"),
+    );
+    assert_prepared_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                id, \
+                CASE WHEN username = ? THEN 'match' ELSE 'mismatch' END AS match_state, \
+                ROW_NUMBER() OVER (ORDER BY (score IS NULL), score, id) AS row_order, \
+                RANK() OVER (ORDER BY score >= ?) AS score_rank \
+             FROM {conditional} \
+             WHERE (username IS NOT NULL) \
+             ORDER BY row_order"
+        ),
+        ("Carol", 20_i64),
+    );
+
+    assert_exec_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!("DROP TABLE IF EXISTS {conditional}"),
+    );
+}

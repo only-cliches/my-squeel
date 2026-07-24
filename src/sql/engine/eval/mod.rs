@@ -211,13 +211,7 @@ pub(super) fn aggregate_select_result(
         if let Some(having) = &select.having {
             let mut context = base.clone();
             context.extend(row.clone());
-            materialize_aggregate_exprs(
-                having,
-                &group,
-                &base,
-                last_insert_id,
-                &mut context,
-            )?;
+            materialize_aggregate_exprs(having, &group, &base, last_insert_id, &mut context)?;
             let having_value = eval_expr(having, &context, last_insert_id)?;
             if !matches!(sql_truth(&having_value), SqlTruth::True) {
                 continue;

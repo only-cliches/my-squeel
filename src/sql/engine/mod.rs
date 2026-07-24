@@ -227,6 +227,7 @@ impl ColumnMetadata {
         Self {
             name,
             column_type,
+            nullable: true,
             ..Self::default()
         }
     }
