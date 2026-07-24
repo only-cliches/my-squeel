@@ -24,6 +24,12 @@ pub(super) fn split_sql_statements(sql: &str) -> Vec<String> {
 
     while let Some(ch) = chars.next() {
         match ch {
+            '\\' if in_single || in_double => {
+                current.push(ch);
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
             '\'' if !in_double && !in_backtick => {
                 current.push(ch);
                 if in_single && chars.peek() == Some(&'\'') {

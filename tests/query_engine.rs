@@ -2,6 +2,32 @@ mod common;
 
 use common::test_lock;
 use my_sqweel::sql::engine::{Engine, EngineConfig, FailureInjectionConfig};
+use serde_json::Value;
+
+#[test]
+fn accepts_mysql2_query_protocol_escaped_json_with_apostrophes() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE virtual_email (id VARCHAR(191) PRIMARY KEY, payload JSON NOT NULL);",
+        )
+        .unwrap();
+
+    let query = r##"INSERT INTO virtual_email (id, payload) VALUES ('email-1', '{\"from\":{\"name\":\"Here\'s My Brain Support\"},\"html\":\"<!doctype html>\\n<html lang=\\\"und\\\" dir=\\\"auto\\\" xmlns=\\\"http://www.w3.org/1999/xhtml\\\">\\n<style>font-family:\'Nunito\'; color:red;</style>\"}')"##;
+    engine.execute_sql(query).unwrap();
+
+    let rows = engine
+        .execute_sql("SELECT payload FROM virtual_email WHERE id = 'email-1'")
+        .unwrap();
+    assert_eq!(
+        rows[0].rows[0].get("payload"),
+        Some(&serde_json::json!({
+            "from": { "name": "Here's My Brain Support" },
+            "html": "<!doctype html>\n<html lang=\"und\" dir=\"auto\" xmlns=\"http://www.w3.org/1999/xhtml\">\n<style>font-family:'Nunito'; color:red;</style>",
+        })),
+    );
+}
 
 #[test]
 fn supports_naive_join_and_basic_introspection() {
@@ -34,6 +60,28 @@ fn supports_naive_join_and_basic_introspection() {
         .execute_sql("SELECT table_name, column_name FROM information_schema.columns")
         .unwrap();
     assert!(!info_cols[0].rows.is_empty());
+}
+
+#[test]
+fn delete_resolves_table_and_alias_qualified_predicates() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql("CREATE TABLE sessions (id BIGINT PRIMARY KEY, session_token TEXT);")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO sessions (id, session_token) VALUES (1, 'one'), (2, 'two');")
+        .unwrap();
+
+    let qualified = engine
+        .execute_sql("DELETE FROM sessions WHERE sessions.session_token = 'one';")
+        .unwrap();
+    assert_eq!(qualified[0].rows_affected, 1);
+
+    let aliased = engine
+        .execute_sql("DELETE FROM sessions AS active WHERE active.session_token = 'two';")
+        .unwrap();
+    assert_eq!(aliased[0].rows_affected, 1);
 }
 
 #[test]
@@ -109,6 +157,21 @@ fn supports_order_limit_offset_count_truncate_and_params() {
         "high@example.com"
     );
 
+    let prepared_limit = engine
+        .execute_sql_with_params(
+            "SELECT email FROM users ORDER BY score DESC LIMIT ? OFFSET ?",
+            &[serde_json::json!(1.0), serde_json::json!(1.0)],
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_limit[0].rows[0]
+            .get("email")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "mid@example.com"
+    );
+
     engine.execute_sql("TRUNCATE TABLE users").unwrap();
     let after_truncate = engine.execute_sql("SELECT count(*) FROM users").unwrap();
     assert_eq!(
@@ -125,6 +188,43 @@ fn supports_order_limit_offset_count_truncate_and_params() {
         .unwrap();
     let reset = engine.execute_sql("SELECT id FROM users").unwrap();
     assert_eq!(reset[0].rows[0].get("id").unwrap().as_i64().unwrap(), 1);
+}
+
+#[test]
+fn resolves_explicit_default_without_overwriting_explicit_null() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE defaults_test (id BIGINT PRIMARY KEY NOT NULL, name TEXT NOT NULL, tenant TEXT NOT NULL, optional_at TIMESTAMP, label TEXT DEFAULT 'fallback');",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO defaults_test (id, name, tenant, optional_at, label) VALUES (1, 'first', 'default', DEFAULT, DEFAULT), (2, 'second', 'DEFAULT', NULL, NULL);",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql("SELECT id, name, tenant, optional_at, label FROM defaults_test ORDER BY name")
+        .unwrap();
+    assert_eq!(result[0].rows.len(), 2);
+    assert!(result[0].rows[0].get("id").is_some_and(Value::is_number));
+    assert_eq!(result[0].rows[0].get("optional_at"), Some(&Value::Null));
+    assert_eq!(
+        result[0].rows[0].get("tenant").and_then(Value::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        result[0].rows[0].get("label").and_then(Value::as_str),
+        Some("fallback")
+    );
+    assert_eq!(result[0].rows[1].get("optional_at"), Some(&Value::Null));
+    assert_eq!(
+        result[0].rows[1].get("tenant").and_then(Value::as_str),
+        Some("DEFAULT")
+    );
+    assert_eq!(result[0].rows[1].get("label"), Some(&Value::Null));
 }
 
 #[test]

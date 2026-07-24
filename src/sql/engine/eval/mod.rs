@@ -11,6 +11,15 @@ use json::*;
 use scalar::*;
 
 const HIDDEN_HISTORICAL_COLUMN_PREFIX: &str = "\0my_sqweel_historical:";
+const SQL_DEFAULT_VALUE_SENTINEL: &str = "\0my_sqweel_sql_default";
+
+pub(super) fn sql_default_value() -> Value {
+    Value::String(SQL_DEFAULT_VALUE_SENTINEL.to_string())
+}
+
+pub(super) fn is_default_keyword(value: &Value) -> bool {
+    value.as_str() == Some(SQL_DEFAULT_VALUE_SENTINEL)
+}
 
 pub(super) fn is_bare_datetime_keyword(name: &str) -> bool {
     eval_bare_datetime_keyword(name).is_some()
@@ -200,15 +209,24 @@ pub(super) fn aggregate_select_result(
             project_aggregate_item(item, &group, &base, last_insert_id, &mut row)?;
         }
         if let Some(having) = &select.having {
-            materialize_aggregate_exprs(having, &group, &base, last_insert_id, &mut row)?;
+            let mut context = base.clone();
+            context.extend(row.clone());
+            materialize_aggregate_exprs(
+                having,
+                &group,
+                &base,
+                last_insert_id,
+                &mut context,
+            )?;
+            let having_value = eval_expr(having, &context, last_insert_id)?;
+            if !matches!(sql_truth(&having_value), SqlTruth::True) {
+                continue;
+            }
         }
         for order in order_by {
             materialize_aggregate_exprs(&order.expr, &group, &base, last_insert_id, &mut row)?;
         }
-
-        if matches_selection(select.having.as_ref(), &row)? {
-            output.push(row);
-        }
+        output.push(row);
     }
 
     if select.distinct.is_some() {
@@ -861,10 +879,24 @@ pub(super) fn offset_to_usize(offset: &Offset) -> Result<usize> {
 pub(super) fn expr_to_usize(expr: &Expr) -> Result<usize> {
     let value = eval_expr(expr, &Map::new(), 0)?;
     match value {
-        Value::Number(n) => n
-            .as_u64()
-            .map(|v| v as usize)
-            .ok_or_else(|| anyhow!("numeric expression is not a valid usize")),
+        Value::Number(n) => {
+            if let Some(value) = n.as_u64() {
+                return usize::try_from(value)
+                    .map_err(|_| anyhow!("numeric expression is not a valid usize"));
+            }
+            // Binary-protocol clients such as mysql2 encode JavaScript numbers
+            // as DOUBLE parameters. A prepared `LIMIT ?` therefore reaches the
+            // parser as `1.0`, even though MySQL accepts it as an integer limit.
+            // Preserve strict LIMIT semantics while accepting integral floats.
+            let value = n
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+                .ok_or_else(|| anyhow!("numeric expression is not a valid usize"))?;
+            if value > usize::MAX as f64 {
+                return Err(anyhow!("numeric expression is not a valid usize"));
+            }
+            Ok(value as usize)
+        }
         Value::String(s) => s
             .parse::<usize>()
             .map_err(|_| anyhow!("string expression is not a valid usize")),
@@ -900,11 +932,35 @@ fn mysql_cmp_non_null(left: &Value, right: &Value) -> Ordering {
         | (Value::Number(_), Value::Bool(_))
         | (Value::Bool(_), Value::String(_))
         | (Value::String(_), Value::Bool(_))
-        | (Value::Bool(_), Value::Bool(_)) => json_to_f64_lossy(left)
-            .unwrap_or(0.0)
-            .partial_cmp(&json_to_f64_lossy(right).unwrap_or(0.0))
-            .unwrap_or(Ordering::Equal),
+        | (Value::Bool(_), Value::Bool(_)) => {
+            if let (Some(left), Some(right)) = (json_to_i128_exact(left), json_to_i128_exact(right))
+            {
+                return left.cmp(&right);
+            }
+            json_to_f64_lossy(left)
+                .unwrap_or(0.0)
+                .partial_cmp(&json_to_f64_lossy(right).unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal)
+        }
         _ => left.to_string().cmp(&right.to_string()),
+    }
+}
+
+/// Return an exact integer only when the complete SQL scalar represents one.
+///
+/// Falling back to MySQL's floating-point coercion remains important for
+/// decimal, exponent, and numeric-prefix strings. Exact integral values must
+/// not pass through `f64`, however: doing so aliases adjacent BIGINT values
+/// above 2^53 and breaks equality, ordering, and keyset cursors.
+pub(super) fn json_to_i128_exact(value: &Value) -> Option<i128> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| number.as_u64().map(i128::from)),
+        Value::String(value) => value.trim().parse::<i128>().ok(),
+        Value::Bool(value) => Some(i128::from(*value)),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -1035,10 +1091,7 @@ fn comparison_value(left: &Value, right: &Value, operator: BinaryOperator) -> Va
 }
 
 pub(super) fn is_defaultish(value: &Value) -> bool {
-    matches!(value, Value::Null)
-        || value
-            .as_str()
-            .is_some_and(|value| value.eq_ignore_ascii_case("DEFAULT"))
+    matches!(value, Value::Null) || is_default_keyword(value)
 }
 
 pub(super) fn try_index_lookup(selection: Option<&Expr>, table: &str) -> Option<(String, String)> {
@@ -1287,7 +1340,10 @@ pub(super) fn expr_to_json(expr: &Expr) -> Result<Value> {
             match inner {
                 Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
-                        Ok(Value::Number(Number::from(-i)))
+                        i.checked_neg()
+                            .map(Number::from)
+                            .map(Value::Number)
+                            .ok_or_else(|| anyhow!("integer overflow"))
                     } else if let Some(f) = n.as_f64() {
                         Number::from_f64(-f)
                             .map(Value::Number)
@@ -1325,12 +1381,26 @@ pub(super) fn eval_expr(
             if value == Value::Null {
                 return Ok(Value::Null);
             }
+            if let Some(integer) = json_to_i128_exact(&value) {
+                if let Some(integer) = integer
+                    .checked_neg()
+                    .and_then(|integer| i64::try_from(integer).ok())
+                {
+                    return Ok(Value::Number(Number::from(integer)));
+                }
+            }
             Ok(number_from_f64(-json_to_f64_lossy(&value)?))
         }
         Expr::UnaryOp { op, expr } if op.to_string() == "+" => {
             let value = eval_expr(expr, data, last_insert_id)?;
             if value == Value::Null {
                 Ok(Value::Null)
+            } else if let Some(integer) = json_to_i128_exact(&value) {
+                if let Ok(integer) = i64::try_from(integer) {
+                    Ok(Value::Number(Number::from(integer)))
+                } else {
+                    Ok(number_from_f64(json_to_f64_lossy(&value)?))
+                }
             } else {
                 Ok(number_from_f64(json_to_f64_lossy(&value)?))
             }
@@ -2053,7 +2123,7 @@ pub(super) fn parse_scalar_expr(sql: &str) -> Option<Expr> {
 pub(super) fn split_function_call(text: &str) -> Option<(String, Vec<String>)> {
     let text = text.trim();
     let start = text.find('(')?;
-    if !text.ends_with(')') {
+    if !function_call_is_wrapped(text, start) {
         return None;
     }
     let name = text[..start]
@@ -2064,6 +2134,37 @@ pub(super) fn split_function_call(text: &str) -> Option<(String, Vec<String>)> {
         .to_ascii_uppercase();
     let args = split_sql_args(&text[start + 1..text.len() - 1]);
     Some((name, args))
+}
+
+fn function_call_is_wrapped(text: &str, start: usize) -> bool {
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut chars = text[start..].char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '\'' if !in_double && !in_backtick => {
+                if in_single && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            '"' if !in_single && !in_backtick => in_double = !in_double,
+            '`' if !in_single && !in_double => in_backtick = !in_backtick,
+            '(' if !in_single && !in_double && !in_backtick => depth += 1,
+            ')' if !in_single && !in_double && !in_backtick => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return text[end..].trim().is_empty();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 pub(super) fn split_sql_args(args: &str) -> Vec<String> {
@@ -2125,6 +2226,15 @@ pub(super) fn cast_json_value(value: Value, data_type: &str) -> Result<Value> {
         return Ok(Value::Null);
     }
     if data_type.contains("int") || data_type == "signed" || data_type == "unsigned" {
+        if let Some(integer) = json_to_i128_exact(&value) {
+            if data_type == "unsigned" || data_type.contains("unsigned") {
+                if let Ok(integer) = u64::try_from(integer) {
+                    return Ok(Value::Number(Number::from(integer)));
+                }
+            } else if let Ok(integer) = i64::try_from(integer) {
+                return Ok(Value::Number(Number::from(integer)));
+            }
+        }
         return Ok(Value::Number(Number::from(
             json_to_f64_lossy(&value)? as i64
         )));

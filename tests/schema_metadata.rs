@@ -716,9 +716,14 @@ fn engine_with_full_schema() -> Engine {
 fn information_schema_tables_lists_every_user_table() {
     let _guard = test_lock();
     let engine = engine_with_full_schema();
+    engine
+        .execute_sql("INSERT INTO parents (code) VALUES ('parent-one')")
+        .unwrap();
     let rows = engine
         .execute_sql(
-            "SELECT table_schema, table_name FROM information_schema.tables ORDER BY table_name",
+            "SELECT table_schema, table_name, COALESCE(engine, '') AS engine, \
+                    COALESCE(table_rows, 0) AS table_rows \
+             FROM information_schema.tables ORDER BY table_name",
         )
         .unwrap();
     let names: Vec<&str> = rows[0]
@@ -734,7 +739,14 @@ fn information_schema_tables_lists_every_user_table() {
             Some("app"),
             "every row should report the app schema"
         );
+        assert_eq!(row.get("engine").and_then(|v| v.as_str()), Some("InnoDB"));
     }
+    let parents = rows[0]
+        .rows
+        .iter()
+        .find(|row| row.get("table_name").and_then(|v| v.as_str()) == Some("parents"))
+        .unwrap();
+    assert_eq!(parents.get("table_rows").and_then(|v| v.as_u64()), Some(1));
 }
 
 #[test]

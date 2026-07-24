@@ -394,6 +394,11 @@ fn write_result<W: io::Read + io::Write>(
         })
         .collect();
 
+    if let Err(error) = validate_wire_rows(&out.rows, &columns, &defs) {
+        let message = error.to_string();
+        return results.error(mysql_error_kind(&message), message.as_bytes());
+    }
+
     let mut rw = results.start(&defs)?;
     for row in out.rows {
         write_row(&mut rw, &row, &columns, &defs, &decimal_columns)?;
@@ -583,7 +588,7 @@ fn write_row<W: io::Read + io::Write>(
             Value::Null => rw.write_col(Option::<String>::None)?,
             Value::Number(number) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
                 let value = number.as_f64().unwrap_or_default();
-                let scale = decimal_columns[key];
+                let scale = decimal_columns.get(key).copied().unwrap_or(0);
                 rw.write_col(format!("{value:.scale$}"))?;
             }
             Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
@@ -684,9 +689,7 @@ fn write_string_column<W: io::Read + io::Write>(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             .and_then(|value| rw.write_col(value)),
         ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
-            ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"]
-                .into_iter()
-                .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            parse_mysql_datetime_value(value)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid datetime value"))
                 .and_then(|value| rw.write_col(value))
         }
@@ -706,6 +709,71 @@ fn write_string_column<W: io::Read + io::Write>(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             .and_then(|value| rw.write_col(value)),
         _ => rw.write_col(value),
+    }
+}
+
+fn parse_mysql_datetime_value(value: &str) -> Option<chrono::NaiveDateTime> {
+    let decoded = serde_json::from_str::<String>(value).ok();
+    let value = decoded.as_deref().unwrap_or(value);
+    [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ]
+    .into_iter()
+    .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+    .or_else(|| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|value| value.naive_utc())
+    })
+}
+
+fn validate_wire_rows(
+    rows: &[Map<String, Value>],
+    columns: &[String],
+    definitions: &[Column],
+) -> io::Result<()> {
+    for row in rows {
+        for (index, key) in columns.iter().enumerate() {
+            let definition = &definitions[index];
+            let value = row.get(key).unwrap_or(&Value::Null);
+            match value {
+                Value::Null if definition.colflags.contains(ColumnFlags::NOT_NULL_FLAG) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("column '{key}' cannot be null"),
+                    ));
+                }
+                Value::String(value) => validate_wire_string(value, definition)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_wire_string(value: &str, definition: &Column) -> io::Result<()> {
+    let valid = match definition.coltype {
+        ColumnType::MYSQL_TYPE_DATE => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok(),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
+            parse_mysql_datetime_value(value).is_some()
+        }
+        ColumnType::MYSQL_TYPE_TIME => parse_mysql_time_value(value).is_ok(),
+        column_type if is_integral_column(column_type) => value.parse::<i64>().is_ok(),
+        ColumnType::MYSQL_TYPE_FLOAT | ColumnType::MYSQL_TYPE_DOUBLE => {
+            value.parse::<f64>().is_ok()
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incorrect datetime or numeric value in result row",
+        ))
     }
 }
 
@@ -1086,7 +1154,10 @@ fn decode_mysql_time_parameter(bytes: &[u8]) -> Option<String> {
 mod tests {
     use std::sync::Arc;
 
-    use super::Backend;
+    use msql_srv::{Column, ColumnFlags, ColumnType};
+    use serde_json::{Map, json};
+
+    use super::{Backend, parse_mysql_datetime_value, validate_wire_rows};
     use crate::sql::engine::Engine;
 
     #[test]
@@ -1108,5 +1179,28 @@ mod tests {
                 .select_session_values("SELECT DATABASE() AS db, email FROM users")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn datetime_wire_parser_accepts_mysql_and_rfc3339_values() {
+        assert!(parse_mysql_datetime_value("2026-07-15 12:34:56.123456").is_some());
+        assert!(parse_mysql_datetime_value("2026-07-15T12:34:56.123Z").is_some());
+        assert!(parse_mysql_datetime_value("\"2026-07-15T12:34:56.123Z\"").is_some());
+    }
+
+    #[test]
+    fn invalid_result_values_are_rejected_before_starting_a_row_writer() {
+        let columns = vec!["createdAt".to_string()];
+        let definitions = vec![Column {
+            table: "events".to_string(),
+            column: "createdAt".to_string(),
+            coltype: ColumnType::MYSQL_TYPE_TIMESTAMP,
+            colflags: ColumnFlags::NOT_NULL_FLAG,
+        }];
+        let mut row = Map::new();
+        row.insert("createdAt".to_string(), json!("not-a-date"));
+
+        let error = validate_wire_rows(&[row], &columns, &definitions).unwrap_err();
+        assert!(error.to_string().contains("incorrect datetime"));
     }
 }

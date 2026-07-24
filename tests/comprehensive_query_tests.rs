@@ -539,6 +539,88 @@ fn type_coercion_in_comparisons() {
     assert_eq!(result[0].rows.len(), 1);
 }
 
+#[test]
+fn signed_bigint_comparisons_and_casts_remain_exact() {
+    let engine = Engine::default();
+    engine
+        .execute_sql("CREATE TABLE cursor_rows (id BIGINT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO cursor_rows VALUES (-1871577507584136252), (-1871577507584136251), (-1871577507584136250), (-1871577507584136249)",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql_with_params(
+            "SELECT id FROM cursor_rows WHERE CAST(id AS SIGNED) < CAST(? AS SIGNED) ORDER BY id DESC",
+            &[serde_json::json!("-1871577507584136250")],
+        )
+        .unwrap();
+    assert_eq!(result[0].rows.len(), 2);
+    assert_eq!(
+        result[0].rows[0].get("id"),
+        Some(&serde_json::json!(-1871577507584136251_i64))
+    );
+    assert_eq!(
+        result[0].rows[1].get("id"),
+        Some(&serde_json::json!(-1871577507584136252_i64))
+    );
+
+    let distinct = engine
+        .execute_sql(
+            "SELECT CAST('-1871577507584136251' AS SIGNED) < CAST('-1871577507584136250' AS SIGNED) AS below_cursor, CAST('-1871577507584136251' AS SIGNED) = CAST('-1871577507584136250' AS SIGNED) AS aliased",
+        )
+        .unwrap();
+    assert_eq!(
+        distinct[0].rows[0].get("below_cursor"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        distinct[0].rows[0].get("aliased"),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[test]
+fn grouped_left_join_cursor_predicates_remain_exact() {
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE cursor_comments (id BIGINT PRIMARY KEY, post_id BIGINT, created_at DATETIME)",
+        )
+        .unwrap();
+    engine
+        .execute_sql("CREATE TABLE cursor_comment_votes (id BIGINT PRIMARY KEY, comment_id BIGINT)")
+        .unwrap();
+    let mut values = Vec::new();
+    for id in -1871577507584136275_i64..=-1871577507584136251_i64 {
+        values.push(format!("({id}, 1, '2026-02-03 04:05:06')"));
+    }
+    engine
+        .execute_sql(&format!(
+            "INSERT INTO cursor_comments VALUES {}",
+            values.join(",")
+        ))
+        .unwrap();
+    let result = engine
+        .execute_sql(
+            "SELECT c.id, COUNT(v.id) AS likes
+             FROM cursor_comments c
+             LEFT JOIN cursor_comment_votes v ON v.comment_id = c.id
+             WHERE c.post_id = 1
+             GROUP BY c.id, c.created_at
+             HAVING COUNT(v.id) = 0
+               AND (CAST(c.created_at AS CHAR) < '2026-02-03 04:05:06'
+                OR (CAST(c.created_at AS CHAR) = '2026-02-03 04:05:06'
+                    AND CAST(c.id AS SIGNED) < CAST('-1871577507584136265' AS SIGNED)))
+             ORDER BY COUNT(v.id) DESC, c.created_at DESC, c.id DESC
+             LIMIT 11",
+        )
+        .unwrap();
+    assert_eq!(result[0].rows.len(), 10);
+}
+
 // Complex real-world scenarios
 #[test]
 fn ecommerce_order_summary() {

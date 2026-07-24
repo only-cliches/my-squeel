@@ -1456,12 +1456,22 @@ impl Engine {
                 if value == Value::Null {
                     return Ok(Value::Null);
                 }
+                if let Some(integer) = json_to_i128_exact(&value)
+                    .and_then(|integer| integer.checked_neg())
+                    .and_then(|integer| i64::try_from(integer).ok())
+                {
+                    return Ok(Value::Number(Number::from(integer)));
+                }
                 Ok(number_from_f64(-json_to_f64_lossy(&value)?))
             }
             Expr::UnaryOp { op, expr } if op.to_string() == "+" => {
                 let value = self.eval_expr_ctx(expr, data, last_insert_id)?;
                 if value == Value::Null {
                     Ok(Value::Null)
+                } else if let Some(integer) =
+                    json_to_i128_exact(&value).and_then(|integer| i64::try_from(integer).ok())
+                {
+                    Ok(Value::Number(Number::from(integer)))
                 } else {
                     Ok(number_from_f64(json_to_f64_lossy(&value)?))
                 }
@@ -1631,11 +1641,21 @@ impl Engine {
         let mut rows = Vec::new();
         for table in self.schemas.iter() {
             let mut row = Map::new();
+            let table_rows = self
+                .rows
+                .get(table.key())
+                .map(|rows| rows.len())
+                .unwrap_or(0);
             row.insert("table_schema".to_string(), Value::String("app".to_string()));
             row.insert("table_name".to_string(), Value::String(table.key().clone()));
             row.insert(
                 "table_type".to_string(),
                 Value::String("BASE TABLE".to_string()),
+            );
+            row.insert("engine".to_string(), Value::String("InnoDB".to_string()));
+            row.insert(
+                "table_rows".to_string(),
+                Value::Number(Number::from(table_rows as u64)),
             );
             rows.push(row);
         }

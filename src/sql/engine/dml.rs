@@ -31,7 +31,7 @@ impl Engine {
                                 Expr::Identifier(identifier)
                                     if identifier.value.eq_ignore_ascii_case("DEFAULT") =>
                                 {
-                                    Value::String("DEFAULT".to_string())
+                                    sql_default_value()
                                 }
                                 _ => self.eval_expr_ctx(&expr, &Map::new(), 0)?,
                             };
@@ -581,9 +581,15 @@ impl Engine {
             .get(&table_name)
             .map(|rows| rows.clone())
             .unwrap_or_default();
+        let (_, table_alias) = table_factor_name_and_alias(&root.relation)?;
         let mut candidates = Vec::new();
         for (k, row) in &current_rows {
-            let view = self.current_schema_row(&table_name, &row.data);
+            let base_view = self.current_schema_row(&table_name, &row.data);
+            let mut view = base_view.clone();
+            add_qualified_columns(&mut view, &table_name, &base_view);
+            if let Some(alias) = &table_alias {
+                add_qualified_columns(&mut view, alias, &base_view);
+            }
             if self.matches_selection_ctx(delete.selection.as_ref(), &view, 0)? {
                 candidates.push((k.clone(), row.clone(), view));
             }
@@ -807,11 +813,22 @@ impl Engine {
             return Ok(());
         };
         for (column, hint) in &schema.columns {
-            if data.contains_key(column) && !data.get(column).is_some_and(is_defaultish) {
+            let explicitly_default = data.get(column).is_some_and(is_default_keyword);
+            if data.contains_key(column) && !explicitly_default {
                 continue;
             }
             if let Some(default) = &hint.default {
                 data.insert(column.clone(), eval_default_value(default)?);
+            } else if explicitly_default {
+                // MySQL treats DEFAULT on a nullable column without a declared
+                // default as its implicit NULL default. Removing it for a
+                // required/auto-increment column lets the normal missing-value
+                // validation or identifier generation take over. An explicit
+                // SQL NULL is intentionally not considered DEFAULT here.
+                data.remove(column);
+                if hint.nullable != Some(false) && !hint.auto_increment {
+                    data.insert(column.clone(), Value::Null);
+                }
             }
         }
         Ok(())

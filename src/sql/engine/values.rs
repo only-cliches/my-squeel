@@ -11,7 +11,7 @@ pub(super) fn eval_insert_update_value(
 
     match expr {
         Expr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case("DEFAULT") => {
-            Ok(Value::String("DEFAULT".to_string()))
+            Ok(sql_default_value())
         }
         Expr::Nested(expr) => eval_insert_update_value(expr, existing, incoming),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
@@ -19,12 +19,22 @@ pub(super) fn eval_insert_update_value(
             if value == Value::Null {
                 return Ok(Value::Null);
             }
+            if let Some(integer) = json_to_i128_exact(&value)
+                .and_then(|integer| integer.checked_neg())
+                .and_then(|integer| i64::try_from(integer).ok())
+            {
+                return Ok(Value::Number(Number::from(integer)));
+            }
             Ok(number_from_f64(-json_to_f64_lossy(&value)?))
         }
         Expr::UnaryOp { op, expr } if op.to_string() == "+" => {
             let value = eval_insert_update_value(expr, existing, incoming)?;
             if value == Value::Null {
                 Ok(Value::Null)
+            } else if let Some(integer) =
+                json_to_i128_exact(&value).and_then(|integer| i64::try_from(integer).ok())
+            {
+                Ok(Value::Number(Number::from(integer)))
             } else {
                 Ok(number_from_f64(json_to_f64_lossy(&value)?))
             }

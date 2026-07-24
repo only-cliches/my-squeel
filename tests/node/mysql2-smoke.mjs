@@ -28,6 +28,12 @@ try {
   );
   assert.deepEqual(rows, [{ email: "a@example.com", name: "Alice" }]);
 
+  const [limited] = await connection.execute(
+    "SELECT email FROM node_mysql2_users ORDER BY id LIMIT ? OFFSET ?",
+    [1, 1]
+  );
+  assert.deepEqual(limited, [{ email: "b@example.com" }]);
+
   await connection.query(
     "INSERT INTO node_mysql2_users (email, name) VALUES ('a@example.com', 'Updated') ON DUPLICATE KEY UPDATE name = VALUES(name)"
   );

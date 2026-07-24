@@ -2,74 +2,60 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.3.1 July 24, 2026
+
+### Added
+
+- Added `engine` (`InnoDB`) and live `table_rows` values to `information_schema.tables` metadata.
+
+### Fixed
+
+- Fixed MySQL wire results to accept MySQL, ISO 8601, and RFC 3339 datetime values, and to return a MySQL error for invalid non-null, date/time, or numeric result values before beginning a result set.
+- Fixed mysql2 prepared `LIMIT` and `OFFSET` parameters encoded as integral floating-point values.
+- Fixed integer and `BIGINT` comparisons/casts to preserve exact 64-bit integer semantics for parseable integral values, avoiding lossy float coercion and overflow in unary arithmetic.
+- Fixed SQL statement splitting when quoted values contain backslash-escaped quotes, including mysql2 query-protocol JSON payloads.
+- Fixed `DEFAULT` handling in inserts and updates: it no longer conflicts with the literal string `DEFAULT`, nullable columns without declared defaults receive `NULL`, and explicit `NULL` values remain unchanged.
+- Fixed single-table `DELETE` predicates that qualify columns with the table name or its alias.
+- Fixed aggregate `HAVING` evaluation to correctly use both grouped aggregate aliases and base-row expressions (including predicates that combine grouped and non-grouped terms).
+- Fixed SQL function-call parsing to only treat `name(...)` as a function when the closing parenthesis is the terminal wrapper, avoiding false positives while parsing function-like text.
+- Fixed MySQL decimal result encoding to avoid panicking when per-column scale metadata is missing by defaulting to zero scale.
+
 ## 0.3.0 July 13, 2026
 
 ### Added
 
-- Added an opt-in `--mysql-strict` compatibility profile. Strict mode disables implicit table and
-  column creation, enforces declared types, ranges, lengths, nullability, defaults, generated
-  columns, unique keys, and foreign keys, and returns MySQL wire error numbers for common failures.
-  The default profile remains drift tolerant.
-- Added declared and inferred result-column metadata for integer widths, unsigned values, floating
-  point and decimal types, date/time, binary, JSON, nullability, source tables, character sets,
-  collations, and scale. Prepared statements now expose this metadata before execution.
-- Added typed MySQL wire result encoding for signed and unsigned numeric widths, floats, doubles,
-  decimals, `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` (including negative and fractional values),
-  JSON, and binary data, plus prepared-parameter decoding for native binary date/time values.
-- Added qualified wildcards; `RIGHT`, `CROSS`, `USING`, `NATURAL`, and derived-table joins; and
-  nonrecursive common table expressions with optional column aliases.
-- Added `UNION`, `INTERSECT`, and `EXCEPT` set semantics, including `ALL`/`DISTINCT` handling,
-  left-branch column names, and branch-arity validation.
-- Added named and inline window specifications, common `ROWS` and peer-aware `RANGE` frames,
-  aggregate windows, and `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`,
-  `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE`.
+- Added an opt-in `--mysql-strict` compatibility profile. Strict mode disables implicit table and column creation, enforces declared types, ranges, lengths, nullability, defaults, generated columns, unique keys, and foreign keys, and returns MySQL wire error numbers for common failures. The default profile remains drift tolerant.
+- Added declared and inferred result-column metadata for integer widths, unsigned values, floating point and decimal types, date/time, binary, JSON, nullability, source tables, character sets, collations, and scale. Prepared statements now expose this metadata before execution.
+- Added typed MySQL wire result encoding for signed and unsigned numeric widths, floats, doubles, decimals, `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` (including negative and fractional values), JSON, and binary data, plus prepared-parameter decoding for native binary date/time values.
+- Added qualified wildcards; `RIGHT`, `CROSS`, `USING`, `NATURAL`, and derived-table joins; and nonrecursive common table expressions with optional column aliases.
+- Added `UNION`, `INTERSECT`, and `EXCEPT` set semantics, including `ALL`/`DISTINCT` handling, left-branch column names, and branch-arity validation.
+- Added named and inline window specifications, common `ROWS` and peer-aware `RANGE` frames, aggregate windows, and `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE`.
 - Added MySQL multi-table `DELETE` target-list and `DELETE ... USING` forms.
-- Added migration-oriented DDL support for temporary tables; virtual and stored generated columns;
-  prefix indexes; `ALTER TABLE` add, drop, rename, change, modify, default/type/nullability, column
-  positioning, table rename, and index operations; and matching `SHOW CREATE TABLE` output.
-- Added foreign-key schema validation and insert/update/delete enforcement with `CASCADE`,
-  `SET NULL`, `RESTRICT`, and `NO ACTION` behavior for referenced rows.
-- Added a fail-closed SQL support validator so unsupported operators, expressions, functions, query
-  modifiers, table factors, and join forms return explicit errors instead of partial results.
-- Added a deterministic 2,500-query differential corpus with a 95% compatibility floor, exact
-  row/result parity tests, MySQL wire error-code checks, and ORM-shaped migration, prepared CRUD,
-  relation, and introspection coverage for Diesel, Drizzle/Knex, Prisma, and SeaORM patterns.
-- Added GitHub Actions coverage against MySQL 8.0.43. Real-MySQL parity is non-skippable in CI, and
-  local compatibility tests provision the same image when Docker and the image are available.
+- Added migration-oriented DDL support for temporary tables; virtual and stored generated columns; prefix indexes; `ALTER TABLE` add, drop, rename, change, modify, default/type/nullability, column positioning, table rename, and index operations; and matching `SHOW CREATE TABLE` output.
+- Added foreign-key schema validation and insert/update/delete enforcement with `CASCADE`, `SET NULL`, `RESTRICT`, and `NO ACTION` behavior for referenced rows.
+- Added a fail-closed SQL support validator so unsupported operators, expressions, functions, query modifiers, table factors, and join forms return explicit errors instead of partial results.
+- Added a deterministic 2,500-query differential corpus with a 95% compatibility floor, exact row/result parity tests, MySQL wire error-code checks, and ORM-shaped migration, prepared CRUD, relation, and introspection coverage for Diesel, Drizzle/Knex, Prisma, and SeaORM patterns.
+- Added GitHub Actions coverage against MySQL 8.0.43. Real-MySQL parity is non-skippable in CI, and local compatibility tests provision the same image when Docker and the image are available.
 
 ### Changed
 
-- Aligned expression evaluation with MySQL three-valued logic, numeric-prefix coercion,
-  case-insensitive string equality, `DIV` and bitwise behavior, byte versus character string
-  lengths, and NULL propagation through unary, comparison, `IN`, `BETWEEN`, and logical operators.
-- Aligned `SELECT DISTINCT`, nested aggregate expressions, empty aggregate sets, scalar-subquery
-  cardinality errors, qualified-name resolution, derived columns, ordering aliases, and set-result
-  naming with MySQL behavior.
-- Improved `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, and `information_schema` metadata for
-  data types, nullability, ordinal positions, primary/unique/secondary keys, index prefix lengths,
-  generated columns, and referential constraints.
-- Aligned affected-row counts with MySQL: changed `ON DUPLICATE KEY UPDATE` rows report two,
-  unchanged duplicate updates report zero, and replacements of existing rows report two.
-- Changed declared schemas to be authoritative for reads: unknown tables, ambiguous references, and
-  columns removed by `ALTER TABLE` now return errors instead of silently producing NULL values.
-- Reworked the README around an accurate quick start, compatibility-profile comparison, verified
-  SQL contract, local-data and search workflows, security warning, and explicit limitations.
+- Aligned expression evaluation with MySQL three-valued logic, numeric-prefix coercion, case-insensitive string equality, `DIV` and bitwise behavior, byte versus character string lengths, and NULL propagation through unary, comparison, `IN`, `BETWEEN`, and logical operators.
+- Aligned `SELECT DISTINCT`, nested aggregate expressions, empty aggregate sets, scalar-subquery cardinality errors, qualified-name resolution, derived columns, ordering aliases, and set-result naming with MySQL behavior.
+- Improved `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, and `information_schema` metadata for data types, nullability, ordinal positions, primary/unique/secondary keys, index prefix lengths, generated columns, and referential constraints.
+- Aligned affected-row counts with MySQL: changed `ON DUPLICATE KEY UPDATE` rows report two, unchanged duplicate updates report zero, and replacements of existing rows report two.
+- Changed declared schemas to be authoritative for reads: unknown tables, ambiguous references, and columns removed by `ALTER TABLE` now return errors instead of silently producing NULL values.
+- Reworked the README around an accurate quick start, compatibility-profile comparison, verified SQL contract, local-data and search workflows, security warning, and explicit limitations.
 
 ### Fixed
 
-- Fixed foreign-key insert validation deadlocking when child and parent tables occupied the same
-  internal map shard.
-- Fixed `ALTER TABLE RENAME COLUMN` and `CHANGE COLUMN` to move existing stored values to the new
-  column name and keep primary, unique, index, and local foreign-key column metadata consistent.
-- Fixed peer-aware default `RANGE` window frames and `CUME_DIST`/`PERCENT_RANK` result typing so
-  fractional results are not truncated based on the first row.
-- Fixed prepared binary `DATE`, `DATETIME`, and signed fractional `TIME` parameter handling and
-  result encoding.
+- Fixed foreign-key insert validation deadlocking when child and parent tables occupied the same internal map shard.
+- Fixed `ALTER TABLE RENAME COLUMN` and `CHANGE COLUMN` to move existing stored values to the new column name and keep primary, unique, index, and local foreign-key column metadata consistent.
+- Fixed peer-aware default `RANGE` window frames and `CUME_DIST`/`PERCENT_RANK` result typing so fractional results are not truncated based on the first row.
+- Fixed prepared binary `DATE`, `DATETIME`, and signed fractional `TIME` parameter handling and result encoding.
 
 ### Compatibility notes
 
-- Recursive CTEs, `FULL JOIN`, stored programs, and transaction semantics remain outside the
-  supported compatibility surface and now fail explicitly where parsed.
+- Recursive CTEs, `FULL JOIN`, stored programs, and transaction semantics remain outside the supported compatibility surface and now fail explicitly where parsed.
 
 ## 0.2.4 - Jun 30, 2026
 
