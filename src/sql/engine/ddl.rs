@@ -503,6 +503,11 @@ impl Engine {
                 }
                 continue;
             }
+            if let Some(rows) = self.rows.get(&table) {
+                for _ in rows.values() {
+                    record_query_row_write(0);
+                }
+            }
             self.rows.insert(table.clone(), BTreeMap::new());
             self.indexes.remove(&table);
             self.clear_auto_inc(&table);
@@ -765,12 +770,10 @@ pub(super) fn table_schema_from_create(
         }
         if let Some(foreign_key) = parse_foreign_key_hint(&hint.table, &constraint_text) {
             if !foreign_key.columns.is_empty()
+                && !hint.primary_key.starts_with(&foreign_key.columns)
+                && !hint.unique.iter().any(|columns| columns.starts_with(&foreign_key.columns))
                 && !hint.indexes.iter().any(|index| {
-                    index.columns == foreign_key.columns
-                        || index
-                            .columns
-                            .first()
-                            .is_some_and(|column| Some(column) == foreign_key.columns.first())
+                    index.columns.starts_with(&foreign_key.columns)
                 })
             {
                 add_index_metadata(

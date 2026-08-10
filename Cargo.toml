@@ -2,7 +2,7 @@
 name = "my-sqweel"
 version = "0.4.0"
 edition = "2024"
-description = "A schema-drift-tolerant, development-only MySQL facade for fast local iteration."
+description = "Streamlined, embeddable MySQL for applications, integration testing, and QA."
 license = "MIT"
 repository = "https://github.com/only-cliches/my-sqweel"
 readme = "README.md"

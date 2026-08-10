@@ -489,7 +489,7 @@ fn status_json(app: &AppConfig, engine: &Engine, server_running: bool) -> Value 
     let row_count = snapshot.rows.values().map(|rows| rows.len()).sum::<usize>();
     json!({
         "name": "MySqweel",
-        "mode": "development-only",
+        "mode": "streamlined-embeddable",
         "server": {
             "running": server_running,
             "bind": app.server.bind_addr.to_string(),

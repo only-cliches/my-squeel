@@ -288,12 +288,7 @@ fn exists_subquery() {
 
     let correlated = engine
         .execute_sql("SELECT name FROM users WHERE EXISTS (SELECT 1 FROM comments WHERE comments.user_id = users.id)");
-    assert!(
-        correlated
-            .expect_err("qualified correlated subqueries should fail explicitly")
-            .to_string()
-            .contains("correlated subqueries")
-    );
+    assert_eq!(correlated.unwrap()[0].rows.len(), 2);
 }
 
 // ORDER BY and LIMIT

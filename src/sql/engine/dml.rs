@@ -11,6 +11,7 @@ impl Engine {
             let keys = table_rows
                 .iter()
                 .filter_map(|(key, row)| {
+                    record_query_row_read(row.data.len());
                     let is_two = row
                         .data
                         .get("a")
@@ -25,7 +26,9 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
             for key in keys {
-                table_rows.remove(&key);
+                if table_rows.remove(&key).is_some() {
+                    record_query_row_write(0);
+                }
                 let _ = self.delete_row_from_storage(table, &key);
             }
             self.rows.insert((*table).to_string(), table_rows);
@@ -252,6 +255,8 @@ impl Engine {
         let mut rows_to_persist: BTreeMap<String, StoredRow> = BTreeMap::new();
         let mut rows_to_delete: BTreeSet<String> = BTreeSet::new();
         let mut returned_rows = Vec::new();
+        let mut pending_rows_written = 0_usize;
+        let mut pending_cells_written = 0_usize;
         for mut data in rows {
             if single_row
                 && let Some(schema) = self.schemas.get(table).map(|schema| schema.clone())
@@ -329,6 +334,7 @@ impl Engine {
                     let existing = table_rows
                         .get_mut(conflict_key)
                         .ok_or_else(|| anyhow!("conflict row disappeared"))?;
+                    record_query_row_read(existing.data.len());
                     let original_data = existing.data.clone();
                     let mut existing_context = existing.data.clone();
                     add_qualified_columns(&mut existing_context, table, &existing.data);
@@ -345,6 +351,7 @@ impl Engine {
                     }
                     returned_rows.push(existing.data.clone());
                     if existing.data != original_data {
+                        record_query_row_write(changed_cell_count(&original_data, &existing.data));
                         existing.version += 1;
                         existing.updated_at = Utc::now();
                         rows_to_persist.insert(conflict_key.clone(), existing.clone());
@@ -358,6 +365,7 @@ impl Engine {
                 if options.replace || !self.enforces_uniqueness() {
                     for conflict_key in conflict_keys {
                         if table_rows.remove(&conflict_key).is_some() {
+                            record_query_row_write(0);
                             if options.replace {
                                 affected += 1;
                             }
@@ -377,6 +385,8 @@ impl Engine {
             data.retain(|column, _| !column.contains('.'));
             let stored = StoredRow::new(table.to_string(), row_id, data);
             table_rows.insert(key.clone(), stored.clone());
+            pending_rows_written += 1;
+            pending_cells_written += stored.data.len();
             if first_insert_id == 0 {
                 first_insert_id = generated_insert_id.unwrap_or(0);
             }
@@ -405,6 +415,7 @@ impl Engine {
                 self.persist_row(table, &key, &row)?;
             }
         }
+        record_query_writes(pending_rows_written, pending_cells_written);
         if first_insert_id != 0 {
             self.last_insert_id
                 .store(first_insert_id, AtomicOrdering::Relaxed);
@@ -585,6 +596,8 @@ impl Engine {
         let mut deleted_keys: BTreeSet<String> = BTreeSet::new();
         let mut returned_rows = Vec::new();
         let mut parent_updates = Vec::new();
+        let mut pending_rows_written = 0_usize;
+        let mut pending_cells_written = 0_usize;
 
         for (old_key, current_row) in &current_rows {
             if !self.enforces_uniqueness() && !next_rows.contains_key(old_key) {
@@ -639,6 +652,11 @@ impl Engine {
             updated_row.data = updated_data;
             updated_row.version += 1;
             updated_row.updated_at = Utc::now();
+            let changed_cells = changed_cell_count(&current_row.data, &updated_row.data);
+            if changed_cells > 0 {
+                pending_rows_written += 1;
+                pending_cells_written += changed_cells;
+            }
             if current_row.data != updated_row.data {
                 parent_updates.push((current_row.data.clone(), updated_row.data.clone()));
             }
@@ -654,6 +672,7 @@ impl Engine {
                     self.find_conflict_keys(&table_name, &new_key, &updated_row.data, &next_rows);
                 for conflict_key in conflict_keys {
                     if next_rows.remove(&conflict_key).is_some() {
+                        pending_rows_written += 1;
                         deleted_keys.insert(conflict_key.clone());
                         changed_rows.remove(&conflict_key);
                     }
@@ -678,6 +697,7 @@ impl Engine {
         for (pk, row) in changed_rows {
             self.persist_row(&table_name, &pk, &row)?;
         }
+        record_query_writes(pending_rows_written, pending_cells_written);
 
         self.returning_result(&table_name, returning.as_deref(), returned_rows, updated, 0)
     }
@@ -839,6 +859,7 @@ impl Engine {
             let mut next_rows = current_rows;
             for (key, _, _) in candidates {
                 if let Some(row) = next_rows.remove(&key) {
+                    record_query_row_write(0);
                     returned_rows.push(row.data);
                     deleted_keys.push(key);
                     deleted += 1;
@@ -965,6 +986,7 @@ impl Engine {
                 .unwrap_or_default();
             for key in keys {
                 if let Some(row) = table_rows.remove(&key) {
+                    record_query_row_write(0);
                     rows_affected += 1;
                     if targets.len() == 1 {
                         returned_rows.push(row.data);
@@ -1250,7 +1272,10 @@ impl Engine {
             .filter_map(|key| {
                 parent_rows
                     .get(key)
-                    .map(|row| (key.clone(), row.data.clone()))
+                    .map(|row| {
+                        record_query_row_read(row.data.len());
+                        (key.clone(), row.data.clone())
+                    })
             })
             .collect::<Vec<_>>();
         if parent_values.is_empty() {
@@ -1284,6 +1309,7 @@ impl Engine {
                 .unwrap_or_default();
             let mut matching = BTreeSet::new();
             for (child_key, child) in &child_rows {
+                record_query_row_read(child.data.len());
                 if child_table.eq_ignore_ascii_case(parent_table) && parent_keys.contains(child_key)
                 {
                     continue;
@@ -1320,6 +1346,7 @@ impl Engine {
                     let mut next_rows = child_rows;
                     for key in fresh {
                         if next_rows.remove(&key).is_some() {
+                            record_query_row_write(0);
                             self.delete_row_from_storage(&child_table, &key)?;
                         }
                     }
@@ -1330,9 +1357,11 @@ impl Engine {
                     let mut next_rows = child_rows;
                     for key in matching {
                         if let Some(row) = next_rows.get_mut(&key) {
+                            let before = row.data.clone();
                             for column in &foreign_key.columns {
                                 row.data.insert(column.clone(), Value::Null);
                             }
+                            record_query_row_write(changed_cell_count(&before, &row.data));
                             row.version += 1;
                             row.updated_at = Utc::now();
                             self.persist_row(&child_table, &key, row)?;
@@ -1377,8 +1406,8 @@ impl Engine {
                     .cloned()
                     .map(move |foreign_key| (table.clone(), foreign_key))
                     .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
         let mut actions = Vec::<(String, String, ForeignKeyHint, Vec<Value>)>::new();
         for (child_table, foreign_key) in referencing {
@@ -1407,6 +1436,7 @@ impl Engine {
                 let matching = child_rows
                     .iter()
                     .filter(|(_, child)| {
+                        record_query_row_read(child.data.len());
                         foreign_key
                             .columns
                             .iter()
@@ -1458,9 +1488,11 @@ impl Engine {
                     .unwrap_or_default()
             });
             if let Some(row) = rows.get_mut(&key) {
+                let before = row.data.clone();
                 for (column, value) in foreign_key.columns.iter().zip(values) {
                     row.data.insert(column.clone(), value);
                 }
+                record_query_row_write(changed_cell_count(&before, &row.data));
                 row.version += 1;
                 row.updated_at = Utc::now();
             }
@@ -1592,6 +1624,7 @@ impl Engine {
                 continue;
             };
             for existing in table_rows.values() {
+                record_query_row_read(existing.data.len());
                 if &existing.id == row_id {
                     continue;
                 }
@@ -1621,6 +1654,7 @@ impl Engine {
         for unique_cols in &schema.unique {
             let mut seen: BTreeMap<String, String> = BTreeMap::new();
             for (pk, row) in table_rows {
+                record_query_row_read(row.data.len());
                 let Some(key) = schema_unique_key(&schema, &row.data, unique_cols) else {
                     continue;
                 };
@@ -1653,6 +1687,7 @@ impl Engine {
                     continue;
                 };
                 for (existing_key, existing) in table_rows {
+                    record_query_row_read(existing.data.len());
                     if schema_unique_key(&schema, &existing.data, unique_cols).as_ref()
                         == Some(&incoming)
                     {

@@ -4639,7 +4639,7 @@ fn build_create_index_sql(uid: &str, primary_key: Option<&str>) -> String {
     if let Some(primary_key) = primary_key {
         let key = quote_identifier(primary_key).unwrap_or_else(|_| format!("`{primary_key}`"));
         if key == id {
-            format!("CREATE TABLE {table} ({key} TEXT)")
+            format!("CREATE TABLE {table} ({key} TEXT, PRIMARY KEY ({key}))")
         } else {
             format!("CREATE TABLE {table} ({id} TEXT, {key} TEXT, PRIMARY KEY ({key}))")
         }

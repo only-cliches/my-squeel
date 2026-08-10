@@ -2,8 +2,9 @@
 
 All notable changes to MySqweel will be documented in this file.
 
-## 0.4.0 Future
+## 0.4.0 Aug 10, 2026
 
+- Repositioned MySqweel as streamlined, embeddable MySQL for applications, testing, and QA, with a prominent in-process `Engine` workflow and an explicit transactions/atomicity compatibility boundary.
 - Added an opt-in query event stream for embedded Rust users, with unique query IDs, received/completed lifecycle events, query text, execution duration, result-set counts and row sizes, and failure details.
 - Added optional full query-result payloads to completion events; result payloads remain disabled by default to avoid copying large result sets.
 - Expanded MySQL sorting parity across primitive and compound ordering, including exact integer/decimal handling, FLOAT rounding, temporal, binary, text collation, JSON, ENUM, and SET behavior across window, aggregate, DML, derived-table, and set-operation paths.
@@ -15,7 +16,10 @@ All notable changes to MySqweel will be documented in this file.
 - Expanded DDL and metadata coverage for case-insensitive schemas, foreign-key indexes, index comments, `SHOW FULL COLUMNS`, `SHOW TABLE STATUS`, `information_schema` engines, process lists, variables, indexes, constraints, and richer table/index introspection.
 - Added MySQL date/time and scalar compatibility for `TIME_FORMAT`, `STR_TO_DATE`, `GET_FORMAT`, `FROM_UNIXTIME`, `INTERVAL`, `SOUNDEX`, `MD5`, `SHA`, `SHA2`, `CRC32`, `BIT_LENGTH`, and expanded aggregate support including variance, standard deviation, and bitwise aggregates.
 - Verified the supported MySQL 8.0.43 MTR surface at 19/19 tests passing (100%) against both the MySQL baseline and MySqweel.
-- Performance improvements.
+- Added a persistent engine performance benchmark covering filtered and compound `ORDER BY`/`LIMIT` queries over 4,000 rows.
+- Improved query execution by resolving sort keys once per row, reusing stored schema column order, avoiding unnecessary row/schema/projection/window/aggregate allocations, and using hash-based lookup and deduplication paths where ordering is not required.
+- Added a no-subscriber fast path that avoids query-event timing, IDs, and result processing when query lifecycle events are not being observed.
+- Added logical row/cell read and physical row/cell write metrics to query completion events, including filtered rows and aggregate multi-statement totals.
 
 ## 0.3.2 July 24, 2026
 
@@ -185,4 +189,4 @@ All notable changes to MySqweel will be documented in this file.
 
 ### Notes
 
-- MySqweel remains development-only and is not intended to provide production database correctness, ACID guarantees, or full MySQL compatibility.
+- MySqweel does not provide ACID guarantees, transaction semantics, or full MySQL compatibility.

@@ -6,7 +6,7 @@ many tests exercise behavior that MySqweel intentionally does not provide.
 
 | Excluded area | Reason |
 | --- | --- |
-| Transactions, isolation, savepoints, locking, and XA | Outside the development-only compatibility contract. |
+| Transactions, isolation, savepoints, locking, and XA | Outside the streamlined compatibility contract. |
 | Replication, binary logging, group replication, and NDB | Require server topology or storage engines that MySqweel does not implement. |
 | Users, grants, authentication plugins, and TLS | MySqweel exposes a local development wire endpoint, not MySQL access control. |
 | Stored procedures, stored functions, triggers, and events | Outside the supported SQL surface. |

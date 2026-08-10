@@ -1,5 +1,7 @@
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -167,6 +169,21 @@ pub struct QueryEventOptions {
     pub include_results: bool,
 }
 
+/// Logical data-access counters for one query execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryMetrics {
+    /// Number of stored rows examined or materialized, including rows later
+    /// rejected by a predicate.
+    pub rows_read: u64,
+    /// Number of stored field values loaded into execution row contexts.
+    pub cells_read: u64,
+    /// Number of rows whose stored state changed, including deleted rows.
+    pub rows_written: u64,
+    /// Number of inserted or changed stored field values. Deleted rows do not
+    /// contribute cell writes.
+    pub cells_written: u64,
+}
+
 pub type QueryId = u64;
 
 impl QueryEventOptions {
@@ -196,6 +213,7 @@ pub struct QueryCompletedEvent {
     pub result_set_count: usize,
     /// Total number of rows across all result sets.
     pub result_set_size: usize,
+    pub metrics: QueryMetrics,
     pub results: Option<Vec<QueryResult>>,
     pub error: Option<String>,
 }
@@ -236,6 +254,103 @@ impl Iterator for QueryEventStream {
 struct QueryEventSubscriber {
     sender: Sender<QueryEvent>,
     include_results: bool,
+}
+
+#[derive(Default)]
+struct QueryMetricsRecorder {
+    enabled: bool,
+    rows_read: Cell<u64>,
+    cells_read: Cell<u64>,
+    rows_written: Cell<u64>,
+    cells_written: Cell<u64>,
+}
+
+impl QueryMetricsRecorder {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
+    fn record_read(&self, cells: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.rows_read.set(self.rows_read.get().saturating_add(1));
+        self.cells_read
+            .set(self.cells_read.get().saturating_add(cells as u64));
+    }
+
+    fn record_write(&self, rows: usize, cells: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.rows_written
+            .set(self.rows_written.get().saturating_add(rows as u64));
+        self.cells_written
+            .set(self.cells_written.get().saturating_add(cells as u64));
+    }
+
+    fn snapshot(&self) -> QueryMetrics {
+        QueryMetrics {
+            rows_read: self.rows_read.get(),
+            cells_read: self.cells_read.get(),
+            rows_written: self.rows_written.get(),
+            cells_written: self.cells_written.get(),
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_QUERY_METRICS: RefCell<Vec<Rc<QueryMetricsRecorder>>> = const { RefCell::new(Vec::new()) };
+}
+
+struct QueryMetricsGuard;
+
+impl QueryMetricsGuard {
+    fn install(metrics: Rc<QueryMetricsRecorder>) -> Self {
+        ACTIVE_QUERY_METRICS.with(|active| active.borrow_mut().push(metrics));
+        Self
+    }
+}
+
+impl Drop for QueryMetricsGuard {
+    fn drop(&mut self) {
+        ACTIVE_QUERY_METRICS.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
+fn with_query_metrics(callback: impl FnOnce(&QueryMetricsRecorder)) {
+    ACTIVE_QUERY_METRICS.with(|active| {
+        if let Some(metrics) = active.borrow().last() {
+            callback(metrics);
+        }
+    });
+}
+
+pub(super) fn record_query_row_read(cells: usize) {
+    with_query_metrics(|metrics| metrics.record_read(cells));
+}
+
+pub(super) fn record_query_row_write(cells: usize) {
+    with_query_metrics(|metrics| metrics.record_write(1, cells));
+}
+
+pub(super) fn record_query_writes(rows: usize, cells: usize) {
+    with_query_metrics(|metrics| metrics.record_write(rows, cells));
+}
+
+pub(super) fn changed_cell_count(before: &Map<String, Value>, after: &Map<String, Value>) -> usize {
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|column| before.get(*column) != after.get(*column))
+        .count()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,7 +625,8 @@ impl Engine {
 
     pub(super) fn strict_value_mode(&self) -> bool {
         let mode = self.sql_mode.lock().to_ascii_uppercase();
-        mode.contains("TRADITIONAL")
+        self.mysql_strict()
+            || mode.contains("TRADITIONAL")
             || mode.contains("STRICT_TRANS_TABLES")
             || mode.contains("STRICT_ALL_TABLES")
     }
@@ -554,6 +670,8 @@ impl Engine {
     ) -> Result<Vec<QueryResult>> {
         let query_id = (emit_events && self.query_events_enabled())
             .then(|| self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed));
+        let metrics = query_id.map(|_| Rc::new(QueryMetricsRecorder::new(true)));
+        let _metrics_guard = metrics.clone().map(QueryMetricsGuard::install);
         let started = query_id.map(|_| Instant::now());
         if let Some(query_id) = query_id {
             self.publish_query_event(QueryEvent::Received(QueryReceivedEvent {
@@ -622,7 +740,6 @@ impl Engine {
                         .replace(" value ", " values ");
                 }
                 parse_sql = rewrite_insert_set(&parse_sql);
-                parse_sql = rewrite_insert_on_duplicate(&parse_sql);
                 parse_sql = self.expand_views(&parse_sql);
                 if raw
                     .trim_start()
@@ -741,6 +858,10 @@ impl Engine {
                     self.publish_query_completed(
                         query_id,
                         started.expect("query event start time").elapsed(),
+                        metrics
+                            .as_ref()
+                            .expect("query metrics for observed query")
+                            .snapshot(),
                         Some(results),
                         None,
                     )
@@ -748,6 +869,10 @@ impl Engine {
                 Err(error) => self.publish_query_completed(
                     query_id,
                     started.expect("query event start time").elapsed(),
+                    metrics
+                        .as_ref()
+                        .expect("query metrics for observed query")
+                        .snapshot(),
                     None,
                     Some(error.to_string()),
                 ),
@@ -840,6 +965,7 @@ impl Engine {
         &self,
         query_id: u64,
         duration: StdDuration,
+        metrics: QueryMetrics,
         results: Option<&[QueryResult]>,
         error: Option<String>,
     ) {
@@ -859,6 +985,7 @@ impl Engine {
                 .send(QueryEvent::Completed(QueryCompletedEvent {
                     query_id,
                     duration,
+                    metrics,
                     result_set_count,
                     result_set_size,
                     results: event_results,
@@ -882,7 +1009,13 @@ impl Engine {
             query_id,
             query: query.to_string(),
         }));
-        self.publish_query_completed(query_id, started.elapsed(), None, Some(error.to_string()));
+        self.publish_query_completed(
+            query_id,
+            started.elapsed(),
+            QueryMetrics::default(),
+            None,
+            Some(error.to_string()),
+        );
         Err(error)
     }
 
@@ -950,6 +1083,8 @@ impl Engine {
             return self.execute_statement_unobserved(stmt);
         }
         let query_id = self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed);
+        let metrics = Rc::new(QueryMetricsRecorder::new(true));
+        let _metrics_guard = QueryMetricsGuard::install(metrics.clone());
         let started = Instant::now();
         self.publish_query_event(QueryEvent::Received(QueryReceivedEvent { query_id, query }));
         let outcome = self.execute_statement_unobserved(stmt);
@@ -957,12 +1092,14 @@ impl Engine {
             Ok(result) => self.publish_query_completed(
                 query_id,
                 started.elapsed(),
+                metrics.snapshot(),
                 Some(std::slice::from_ref(result)),
                 None,
             ),
             Err(error) => self.publish_query_completed(
                 query_id,
                 started.elapsed(),
+                metrics.snapshot(),
                 None,
                 Some(error.to_string()),
             ),
@@ -3103,7 +3240,7 @@ impl Engine {
                 .ok_or_else(|| anyhow!("invalid DROP TABLE statement"))?;
             return Ok(Some(self.execute_statement_unobserved(statement)?));
         }
-        if upper.starts_with("DROP TABLE") && !upper.contains("IF EXISTS") {
+        if self.mysql_strict() && upper.starts_with("DROP TABLE") && !upper.contains("IF EXISTS") {
             let names = trimmed["DROP TABLE".len()..]
                 .split(',')
                 .map(|name| name.trim().trim_matches('`').trim_end_matches(';'));
@@ -3254,6 +3391,29 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
         return;
     }
     let body = &trimmed["SELECT ".len()..];
+    if body.split_whitespace().next().is_some_and(|token| {
+        [
+            "ALL",
+            "DISTINCT",
+            "HIGH_PRIORITY",
+            "STRAIGHT_JOIN",
+            "SQL_SMALL_RESULT",
+            "SQL_BIG_RESULT",
+            "SQL_BUFFER_RESULT",
+            "SQL_NO_CACHE",
+            "SQL_CALC_FOUND_ROWS",
+        ]
+        .iter()
+        .any(|modifier| modifier.eq_ignore_ascii_case(token))
+    }) {
+        return;
+    }
+    if ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|operator| find_top_level_keyword(body, operator).is_some())
+    {
+        return;
+    }
     let projection_end = find_top_level_keyword(body, "FROM").unwrap_or(body.len());
     let expressions = eval::split_sql_args(body[..projection_end].trim());
     if expressions.len() != result.columns.len() {
@@ -3272,6 +3432,7 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
             find_top_level_keyword(&expression, "AS")
                 .map(|index| expression[index + 2..].trim().trim_matches('`').to_string())
                 .filter(|alias| !alias.is_empty())
+                .or_else(|| simple_qualified_column_name(&expression))
                 .unwrap_or(expression)
                 .if_empty_then(current)
         })
@@ -3289,6 +3450,22 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
         }
     }
     result.columns = headers;
+}
+
+fn simple_qualified_column_name(expression: &str) -> Option<String> {
+    let parts = expression
+        .trim()
+        .split('.')
+        .map(|part| part.trim().trim_matches('`'))
+        .collect::<Vec<_>>();
+    (parts.len() > 1
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }))
+    .then(|| parts.last().expect("qualified column has a final part").to_string())
 }
 
 fn projection_is_modifier_wildcard(expression: &str) -> bool {
@@ -3516,9 +3693,13 @@ fn strip_select_modifiers(sql: &str) -> String {
         let is_modifier = modifiers
             .iter()
             .any(|modifier| modifier.eq_ignore_ascii_case(token));
-        if !(in_select_prefix && is_modifier) {
+        let skip_modifier = in_select_prefix && is_modifier;
+        if !skip_modifier {
             result.push(' ');
             result.push_str(token);
+            if !token.eq_ignore_ascii_case("DISTINCT") {
+                in_select_prefix = false;
+            }
         }
         if token.eq_ignore_ascii_case("FROM") {
             in_select_prefix = false;
@@ -3607,10 +3788,21 @@ fn strip_unsigned_for_parser(sql: &str) -> String {
     let upper = sql.to_ascii_uppercase();
     let mut result = String::with_capacity(sql.len());
     let mut cursor = 0;
-    while let Some(offset) = upper[cursor..].find(needle) {
-        let start = cursor + offset;
-        result.push_str(&sql[cursor..start]);
-        cursor = start + needle.len();
+    let mut search = 0;
+    while let Some(offset) = upper[search..].find(needle) {
+        let start = search + offset;
+        let end = start + needle.len();
+        let standalone = (start == 0
+            || !upper.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && upper.as_bytes()[start - 1] != b'_')
+            && (end == upper.len()
+                || !upper.as_bytes()[end].is_ascii_alphanumeric()
+                    && upper.as_bytes()[end] != b'_');
+        if standalone {
+            result.push_str(&sql[cursor..start]);
+            cursor = end;
+        }
+        search = end;
     }
     result.push_str(&sql[cursor..]);
     result
@@ -3904,17 +4096,6 @@ fn rewrite_delete_wildcard_targets(sql: &str) -> String {
         targets.replace(".*", ""),
         &sql[from_at..]
     )
-}
-
-fn rewrite_insert_on_duplicate(sql: &str) -> String {
-    let upper = sql.to_ascii_uppercase();
-    if !upper.trim_start().starts_with("INSERT") {
-        return sql.to_string();
-    }
-    let Some(on_duplicate) = find_top_level_keyword(&upper, "ON DUPLICATE KEY UPDATE") else {
-        return sql.to_string();
-    };
-    sql[..on_duplicate].trim_end().to_string()
 }
 
 fn duplicate_insert_column(sql: &str) -> Option<String> {

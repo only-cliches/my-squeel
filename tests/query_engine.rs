@@ -1116,9 +1116,8 @@ fn supports_common_subquery_shapes() {
         Some("a@example.com")
     );
 
-    let correlated = engine.execute_sql(
-        "SELECT email FROM users WHERE EXISTS (SELECT id FROM posts WHERE posts.user_id = users.id)",
-    );
-    let err = correlated.expect_err("qualified correlated subqueries should fail explicitly");
-    assert!(err.to_string().contains("correlated subqueries"));
+    let correlated = engine
+        .execute_sql("SELECT email FROM users WHERE EXISTS (SELECT id FROM posts WHERE posts.user_id = users.id)")
+        .unwrap();
+    assert_eq!(correlated[0].rows.len(), 2);
 }

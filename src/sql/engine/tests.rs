@@ -14,7 +14,7 @@ fn supports_mysql_user_variables_and_server_prepared_statements() {
         )
         .expect("user variables and prepared statements should execute");
     assert_eq!(result[1].rows[0]["@a"], 7);
-    assert_eq!(result[1].rows[0]["@a + 1"], 8);
+    assert_eq!(result[1].rows[0]["@a+1"], 8);
     assert_eq!(result[5].rows[0].values().next(), Some(&json!(5)));
 }
 
@@ -136,11 +136,11 @@ fn evaluates_mysql_date_time_scalar_functions() {
 
     assert_eq!(
         row.get("plus_month").and_then(|v| v.as_str()),
-        Some("2026-02-28 00:00:00")
+        Some("2026-02-28")
     );
     assert_eq!(
         row.get("minus_day").and_then(|v| v.as_str()),
-        Some("2026-02-28 00:00:00")
+        Some("2026-02-28")
     );
     assert_eq!(
         row.get("ts_added").and_then(|v| v.as_str()),
@@ -606,4 +606,92 @@ fn query_events_report_lifecycle_timing_size_and_optional_results() {
         }
         QueryEvent::Received(_) => panic!("completed event should follow received event"),
     }
+}
+
+#[test]
+fn query_events_report_logical_read_and_write_metrics() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    engine
+        .execute_sql(
+            "CREATE TABLE metric_rows (id INT PRIMARY KEY, category VARCHAR(16))",
+        )
+        .unwrap();
+    let stream = engine.subscribe_query_events(QueryEventOptions::metadata_only());
+
+    engine
+        .execute_sql("INSERT INTO metric_rows VALUES (1, 'a'), (2, 'b'), (3, 'a')")
+        .unwrap();
+    let _ = stream.recv().unwrap();
+    let inserted = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert_eq!(inserted.metrics.rows_read, 3);
+    assert_eq!(inserted.metrics.cells_read, 6);
+    assert_eq!(inserted.metrics.rows_written, 3);
+    assert_eq!(inserted.metrics.cells_written, 6);
+
+    let result = engine
+        .execute_sql("SELECT id FROM metric_rows WHERE category = 'a'")
+        .unwrap();
+    assert_eq!(result[0].rows.len(), 2);
+    let _ = stream.recv().unwrap();
+    let selected = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert_eq!(selected.metrics.rows_read, 3);
+    assert_eq!(selected.metrics.cells_read, 6);
+    assert_eq!(selected.metrics.rows_written, 0);
+    assert_eq!(selected.metrics.cells_written, 0);
+
+    engine
+        .execute_sql("UPDATE metric_rows SET category = 'z' WHERE id = 1")
+        .unwrap();
+    let _ = stream.recv().unwrap();
+    let updated = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert!(updated.metrics.rows_read >= 3);
+    assert!(updated.metrics.cells_read >= 6);
+    assert_eq!(updated.metrics.rows_written, 1);
+    assert_eq!(updated.metrics.cells_written, 1);
+
+    engine
+        .execute_sql("UPDATE metric_rows SET category = 'z' WHERE id = 1")
+        .unwrap();
+    let _ = stream.recv().unwrap();
+    let unchanged = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert!(unchanged.metrics.rows_read >= 3);
+    assert!(unchanged.metrics.cells_read >= 6);
+    assert_eq!(unchanged.metrics.rows_written, 0);
+    assert_eq!(unchanged.metrics.cells_written, 0);
+
+    engine
+        .execute_sql("DELETE FROM metric_rows WHERE id = 2")
+        .unwrap();
+    let _ = stream.recv().unwrap();
+    let deleted = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert!(deleted.metrics.rows_read >= 3);
+    assert!(deleted.metrics.cells_read >= 6);
+    assert_eq!(deleted.metrics.rows_written, 1);
+    assert_eq!(deleted.metrics.cells_written, 0);
+
+    engine
+        .execute_sql("SELECT id FROM metric_rows; SELECT id FROM metric_rows")
+        .unwrap();
+    let _ = stream.recv().unwrap();
+    let multi_statement = match stream.recv().unwrap() {
+        QueryEvent::Completed(event) => event,
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    };
+    assert!(multi_statement.metrics.rows_read >= 4);
+    assert!(multi_statement.metrics.cells_read >= 4);
 }

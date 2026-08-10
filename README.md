@@ -5,29 +5,31 @@
 # MySqweel
 
 <p align="center">
-  <strong>A disposable, MySQL-shaped development database for apps that are still becoming themselves.</strong>
+  <strong>Streamlined, embeddable MySQL for applications, testing, and QA.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/only-cliches/my-sqweel/actions/workflows/ci.yml"><img src="https://github.com/only-cliches/my-sqweel/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
 </p>
 
-MySqweel is a development-only database server that speaks the MySQL wire protocol. It gives an
-application a real database connection while keeping local state easy to infer, inspect, seed,
-snapshot, reset, and deliberately break.
+MySqweel is a lightweight reimplementation of core MySQL behavior. Embed the engine directly in a
+Rust application like SQLite, or expose it through the MySQL wire protocol for existing clients,
+ORMs, and migration tools. State stays easy to infer, inspect, seed, snapshot, reset, and
+deliberately break.
 
 Choose the default drift-tolerant profile for rapid iteration, or enable the strict profile when
-testing migrations, ORMs, prepared statements, result metadata, and MySQL error handling. The same
-process also exposes a debug API and a Meilisearch-shaped local search surface.
+compatibility matters more than convenience. The server process can also expose a debug API and a
+Meilisearch-shaped search surface.
 
-> **Development only.** MySqweel is not a production database and does not provide ACID guarantees,
-> transaction semantics, replication, access control, secure multi-tenant isolation, or complete
-> MySQL compatibility.
+> **Compatibility boundary.** MySqweel is designed for workloads where transactions and atomicity
+> are not critical. It does not provide ACID transactions, replication, access control, secure
+> multi-tenant isolation, or complete MySQL compatibility.
 
 ## At a glance
 
 | Surface | Default | Purpose |
 | --- | --- | --- |
+| Embedded Rust engine | In process | SQLite-like SQL execution without network or HTTP listeners |
 | MySQL wire protocol | `127.0.0.1:3307` | Application, ORM, migration, and MySQL-client connections |
 | Debug and search HTTP | `127.0.0.1:3407` | Drift inspection, seeding, snapshots, and local search |
 | Storage | In memory | Disposable state; optional locked Lux-backed directory persistence |
@@ -38,8 +40,10 @@ process also exposes a debug API and a Meilisearch-shaped local search surface.
 
 MySqweel is useful for:
 
+- embedding streamlined SQL storage directly in Rust applications
 - early application development while the schema is changing
 - local integration tests that need a disposable MySQL endpoint
+- test harnesses, QA environments, and deterministic fixtures
 - ORM, query-builder, migration, and seed-script development
 - realistic UI flows without a full production-shaped stack
 - schema-drift inspection and fixture management
@@ -47,8 +51,30 @@ MySqweel is useful for:
 - local text, facet, and vector-search development
 - demos, teaching, and experiments
 
-Use real MySQL—or the database you deploy—when you need production durability, transactions,
-permissions, replication, optimizer fidelity, security boundaries, scale, or compliance guarantees.
+Use real MySQL when your workload depends on transactions, atomic multi-statement writes,
+permissions, replication, optimizer fidelity, security boundaries, high-concurrency durability,
+scale, or compliance guarantees.
+
+## Embed it
+
+The engine can run entirely in process. This starts no TCP or HTTP listener:
+
+```rust
+use my_sqweel::sql::engine::{Engine, EngineConfig};
+
+fn main() -> anyhow::Result<()> {
+    let db = Engine::new(EngineConfig::mysql_strict());
+    db.execute_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
+    db.execute_sql("INSERT INTO users VALUES (1, 'Ada')")?;
+
+    let results = db.execute_sql("SELECT id, name FROM users")?;
+    println!("{:?}", results[0].rows);
+    Ok(())
+}
+```
+
+Use `Engine::default()` for drift-tolerant in-memory storage, or
+`Engine::open_with_data_dir(...)` for directory-backed persistence.
 
 ## Quick start
 
@@ -119,9 +145,31 @@ For fail-fast compatibility work, start with the strict profile instead:
 sqwl --mysql-strict serve
 ```
 
+### Embed the engine and observe query metrics
+
+Library users can subscribe to query lifecycle events. Completion events include logical rows and
+cells read, including rows examined but rejected by a predicate, plus physical row and cell writes:
+
+```rust
+use my_sqweel::sql::engine::{Engine, QueryEvent, QueryEventOptions};
+
+let engine = Engine::default();
+let events = engine.subscribe_query_events(QueryEventOptions::metadata_only());
+engine.execute_sql("SELECT id FROM users WHERE email LIKE '%example.test'")?;
+
+let _received = events.recv()?;
+if let QueryEvent::Completed(event) = events.recv()? {
+    println!("rows read: {}", event.metrics.rows_read);
+    println!("cells read: {}", event.metrics.cells_read);
+}
+```
+
+These are logical execution metrics, not storage-I/O counters. Repeated join or subquery
+examinations count repeatedly, and multi-statement API calls report aggregate totals.
+
 ## Choose a compatibility profile
 
-MySqweel has two intentionally different development workflows.
+MySqweel has two intentionally different compatibility profiles.
 
 | Behavior | Drift tolerant (default) | MySQL strict (`--mysql-strict`) |
 | --- | --- | --- |
@@ -130,7 +178,7 @@ MySqweel has two intentionally different development workflows.
 | Declared types, ranges, lengths, nulls, and defaults | Best-effort coercion | Validate and reject invalid values |
 | Unique conflicts | Overwrite by default; configurable | Enforce uniqueness |
 | Foreign keys | Enforce declared relationships and actions | Enforce relationships with MySQL-style errors |
-| Best use | Prototypes, fixtures, changing DTOs | ORMs, migrations, protocol and compatibility tests |
+| Best use | Embedded apps, prototypes, fixtures, changing DTOs | Application integration, ORMs, migrations, and compatibility tests |
 
 Strict mode also returns common MySQL wire error numbers for missing tables and columns, duplicate
 entries, null/default violations, invalid values, length/range errors, and foreign-key failures.
@@ -174,8 +222,8 @@ Global options in the table below must appear before the subcommand.
 | `--snapshot-dir <path>` | REPL snapshot directory; default `.my-sqweel/snapshots` |
 | `--log-filter <filter>` | Tracing filter; default `my_sqweel=info` |
 
-The debug/search API is always enabled. `--allow-remote` can expose unauthenticated, state-mutating
-development endpoints; never bind MySqweel to an untrusted network.
+The debug/search API is always enabled for `sqwl serve`. `--allow-remote` can expose unauthenticated,
+state-mutating HTTP endpoints; never bind MySqweel to an untrusted network.
 
 ### Explain SQL without executing it
 
@@ -210,7 +258,7 @@ sqwl --data-dir .my-sqweel/data serve
 ```
 
 The embedded Lux store locks the directory so two MySqweel processes cannot open it concurrently.
-Durable local mode is still not production durability.
+Directory persistence does not add transaction or atomic multi-statement guarantees.
 
 ### Maintenance REPL
 

@@ -1675,6 +1675,7 @@ impl Engine {
         table: &str,
         data: &Map<String, Value>,
     ) -> Map<String, Value> {
+        record_query_row_read(data.len());
         let Some(schema) = self.schemas.get(table) else {
             return data.clone();
         };
@@ -1859,10 +1860,6 @@ impl Engine {
                 }
             }
             _ => {}
-        }
-        let expression_text = expr.to_string();
-        if expression_text.starts_with('@') && !expression_text.starts_with("@@") {
-            return Ok(self.user_variable(expression_text.trim_start_matches('@')));
         }
         if let Some(name) = user_variable_name(expr) {
             return Ok(self.user_variable(name));

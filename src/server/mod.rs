@@ -127,7 +127,9 @@ pub fn spawn_with_engine(cfg: ServerConfig, engine: Arc<Engine>) -> Result<Serve
 }
 
 fn log_runtime(cfg: &ServerConfig) {
-    tracing::warn!("MySqweel is development-only and must not be used for production data");
+    tracing::warn!(
+        "MySqweel does not provide transactions, isolation, or atomic multi-statement guarantees"
+    );
     if cfg.allow_remote {
         tracing::warn!(
             address = %cfg.bind_addr,

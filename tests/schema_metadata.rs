@@ -488,7 +488,7 @@ fn captures_primary_key_metadata_added_via_alter_table() {
 #[test]
 fn applies_type_defaults_and_null_semantics() {
     let _guard = test_lock();
-    let engine = Engine::default();
+    let engine = Engine::new(EngineConfig::mysql_strict());
     engine
         .execute_sql("CREATE TABLE typed_rows (id BIGINT PRIMARY KEY AUTO_INCREMENT, age BIGINT NOT NULL DEFAULT 7, active BOOLEAN DEFAULT TRUE, label TEXT NOT NULL);")
         .unwrap();
