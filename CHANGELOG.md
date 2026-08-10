@@ -2,6 +2,13 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.4.0 Future
+
+- Added an opt-in query event stream for embedded Rust users, with unique query IDs, received/completed lifecycle events, query text, execution duration, result-set counts and row sizes, and failure details.
+- Added optional full query-result payloads to completion events; result payloads remain disabled by default to avoid copying large result sets.
+- Expanded MySQL sorting parity across primitive and compound ordering, including exact integer/decimal handling, FLOAT rounding, temporal, binary, text collation, JSON, ENUM, and SET behavior across window, aggregate, DML, derived-table, and set-operation paths.
+- Added regression coverage for sorting edge cases, compound-key stress, aliases and expressions, `GROUP_CONCAT` ordering, `DELETE ... ORDER BY`, windows, derived tables, and `UNION` results.
+
 ## 0.3.2 July 24, 2026
 
 ### Added

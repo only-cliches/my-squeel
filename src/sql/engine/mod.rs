@@ -2,12 +2,15 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Result, anyhow};
 use chrono::{
     DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc,
 };
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sqlparser::ast::{
@@ -43,6 +46,7 @@ const STORAGE_NAMESPACE_PATTERN: &str = "my-sqweel:*";
 const STORAGE_AUTO_INC_KEY: &str = "my-sqweel:auto_inc";
 const UNIQUE_SEPARATOR: char = '\u{1f}';
 const FK_FIELD_SEPARATOR: char = '\u{1e}';
+pub(crate) const JSON_NULL_SENTINEL: &str = "\0my_sqweel_json_null";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +146,85 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub column_metadata: Vec<ColumnMetadata>,
     pub rows: Vec<Map<String, Value>>,
+}
+
+/// Options controlling the amount of data copied into query completion events.
+/// Result payloads are disabled by default because a query can return a large
+/// number of rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryEventOptions {
+    pub include_results: bool,
+}
+
+pub type QueryId = u64;
+
+impl QueryEventOptions {
+    pub const fn metadata_only() -> Self {
+        Self {
+            include_results: false,
+        }
+    }
+
+    pub const fn with_results() -> Self {
+        Self {
+            include_results: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryReceivedEvent {
+    pub query_id: QueryId,
+    pub query: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryCompletedEvent {
+    pub query_id: QueryId,
+    pub duration: StdDuration,
+    pub result_set_count: usize,
+    /// Total number of rows across all result sets.
+    pub result_set_size: usize,
+    pub results: Option<Vec<QueryResult>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum QueryEvent {
+    Received(QueryReceivedEvent),
+    Completed(QueryCompletedEvent),
+}
+
+/// A blocking stream of query lifecycle events.
+pub struct QueryEventStream {
+    receiver: Receiver<QueryEvent>,
+}
+
+impl QueryEventStream {
+    pub fn recv(&self) -> Result<QueryEvent, mpsc::RecvError> {
+        self.receiver.recv()
+    }
+
+    pub fn try_recv(&self) -> Result<QueryEvent, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: StdDuration) -> Result<QueryEvent, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+impl Iterator for QueryEventStream {
+    type Item = QueryEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.recv().ok()
+    }
+}
+
+struct QueryEventSubscriber {
+    sender: Sender<QueryEvent>,
+    include_results: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,8 +410,10 @@ pub struct Engine {
     auto_inc: DashMap<String, i64>,
     indexes: DashMap<String, BTreeMap<String, BTreeMap<String, BTreeSet<String>>>>,
     last_insert_id: AtomicU64,
+    next_query_id: AtomicU64,
     read_query_count: AtomicU64,
     write_query_count: AtomicU64,
+    query_event_subscribers: Mutex<Vec<QueryEventSubscriber>>,
 }
 
 impl Default for Engine {
@@ -356,8 +441,10 @@ impl Engine {
             auto_inc: DashMap::default(),
             indexes: DashMap::default(),
             last_insert_id: AtomicU64::new(0),
+            next_query_id: AtomicU64::new(1),
             read_query_count: AtomicU64::new(0),
             write_query_count: AtomicU64::new(0),
+            query_event_subscribers: Mutex::new(Vec::new()),
         };
         engine.load_from_storage()?;
         Ok(engine)
@@ -365,6 +452,20 @@ impl Engine {
 
     pub fn compatibility_profile(&self) -> CompatibilityProfile {
         self.cfg.compatibility_profile
+    }
+
+    /// Subscribe to query lifecycle events. Each subscription has its own
+    /// result-payload policy and receives events for queries executed after
+    /// the subscription is created.
+    pub fn subscribe_query_events(&self, options: QueryEventOptions) -> QueryEventStream {
+        let (sender, receiver) = mpsc::channel();
+        self.query_event_subscribers
+            .lock()
+            .push(QueryEventSubscriber {
+                sender,
+                include_results: options.include_results,
+            });
+        QueryEventStream { receiver }
     }
 
     pub(super) fn mysql_strict(&self) -> bool {
@@ -376,23 +477,128 @@ impl Engine {
     }
 
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<QueryResult>> {
-        tracing::debug!(sql, "sql.execute");
+        self.execute_sql_internal(sql, sql, true, true)
+    }
+
+    /// Execute a statement without converting the internal JSON-null marker
+    /// to SQL `NULL`. The MySQL wire layer needs that distinction so a JSON
+    /// literal `null` is sent as the bytes `null`, while an actual SQL NULL is
+    /// sent as a protocol NULL.
+    pub(crate) fn execute_sql_for_wire(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_sql_internal(sql, sql, false, true)
+    }
+
+    fn execute_sql_internal(
+        &self,
+        event_sql: &str,
+        execution_sql: &str,
+        normalize_json_nulls: bool,
+        emit_events: bool,
+    ) -> Result<Vec<QueryResult>> {
+        let query_id =
+            emit_events.then(|| self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed));
+        let started = Instant::now();
+        if let Some(query_id) = query_id {
+            self.publish_query_event(QueryEvent::Received(QueryReceivedEvent {
+                query_id,
+                query: event_sql.to_string(),
+            }));
+        }
+
+        tracing::debug!(sql = execution_sql, "sql.execute");
         let mut out = Vec::new();
-        for raw in split_sql_statements(sql) {
-            if raw.is_empty() {
-                continue;
+        let outcome: Result<Vec<QueryResult>> = (|| {
+            for raw in split_sql_statements(execution_sql) {
+                if raw.is_empty() {
+                    continue;
+                }
+                self.maybe_inject_failure(&raw)?;
+                if let Some(result) = self.execute_compat_statement(&raw)? {
+                    out.push(result);
+                    continue;
+                }
+                for statement in super::parse(&raw)? {
+                    validate_statement_support(&statement)?;
+                    let mut result = self.execute_statement_unobserved(statement)?;
+                    if normalize_json_nulls {
+                        for row in &mut result.rows {
+                            for value in row.values_mut() {
+                                *value = eval::public_json_value(value);
+                            }
+                        }
+                    }
+                    out.push(result);
+                }
             }
-            self.maybe_inject_failure(&raw)?;
-            if let Some(result) = self.execute_compat_statement(&raw)? {
-                out.push(result);
-                continue;
-            }
-            for statement in super::parse(&raw)? {
-                validate_statement_support(&statement)?;
-                out.push(self.execute_statement(statement)?);
+            Ok(out)
+        })();
+
+        if let Some(query_id) = query_id {
+            match &outcome {
+                Ok(results) => {
+                    self.publish_query_completed(query_id, started.elapsed(), Some(results), None)
+                }
+                Err(error) => self.publish_query_completed(
+                    query_id,
+                    started.elapsed(),
+                    None,
+                    Some(error.to_string()),
+                ),
             }
         }
-        Ok(out)
+        outcome
+    }
+
+    fn publish_query_event(&self, event: QueryEvent) {
+        let mut subscribers = self.query_event_subscribers.lock();
+        subscribers.retain(|subscriber| subscriber.sender.send(event.clone()).is_ok());
+    }
+
+    fn publish_query_completed(
+        &self,
+        query_id: u64,
+        duration: StdDuration,
+        results: Option<&[QueryResult]>,
+        error: Option<String>,
+    ) {
+        let result_set_count = results.map_or(0, <[QueryResult]>::len);
+        let result_set_size = results.map_or(0, |results| {
+            results.iter().map(|result| result.rows.len()).sum()
+        });
+        let mut subscribers = self.query_event_subscribers.lock();
+        subscribers.retain(|subscriber| {
+            let event_results = if subscriber.include_results {
+                results.map(|results| results.iter().cloned().map(public_query_result).collect())
+            } else {
+                None
+            };
+            subscriber
+                .sender
+                .send(QueryEvent::Completed(QueryCompletedEvent {
+                    query_id,
+                    duration,
+                    result_set_count,
+                    result_set_size,
+                    results: event_results,
+                    error: error.clone(),
+                }))
+                .is_ok()
+        });
+    }
+
+    fn query_failed_before_execution(
+        &self,
+        query: &str,
+        error: anyhow::Error,
+    ) -> Result<Vec<QueryResult>> {
+        let query_id = self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed);
+        let started = Instant::now();
+        self.publish_query_event(QueryEvent::Received(QueryReceivedEvent {
+            query_id,
+            query: query.to_string(),
+        }));
+        self.publish_query_completed(query_id, started.elapsed(), None, Some(error.to_string()));
+        Err(error)
     }
 
     fn maybe_inject_failure(&self, sql: &str) -> Result<()> {
@@ -425,10 +631,58 @@ impl Engine {
     }
 
     pub fn execute_sql_with_params(&self, sql: &str, params: &[Value]) -> Result<Vec<QueryResult>> {
-        self.execute_sql(&substitute_params(sql, params)?)
+        let execution_sql = match substitute_params(sql, params) {
+            Ok(execution_sql) => execution_sql,
+            Err(error) => return self.query_failed_before_execution(sql, error),
+        };
+        self.execute_sql_internal(sql, &execution_sql, true, true)
+    }
+
+    pub(crate) fn execute_sql_with_params_for_wire(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        let execution_sql = match substitute_params(sql, params) {
+            Ok(execution_sql) => execution_sql,
+            Err(error) => return self.query_failed_before_execution(sql, error),
+        };
+        self.execute_sql_internal(sql, &execution_sql, false, true)
+    }
+
+    pub(crate) fn execute_sql_with_params_without_events(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        let execution_sql = substitute_params(sql, params)?;
+        self.execute_sql_internal(sql, &execution_sql, true, false)
     }
 
     pub fn execute_statement(&self, stmt: Statement) -> Result<QueryResult> {
+        let query = stmt.to_string();
+        let query_id = self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed);
+        let started = Instant::now();
+        self.publish_query_event(QueryEvent::Received(QueryReceivedEvent { query_id, query }));
+        let outcome = self.execute_statement_unobserved(stmt);
+        match &outcome {
+            Ok(result) => self.publish_query_completed(
+                query_id,
+                started.elapsed(),
+                Some(std::slice::from_ref(result)),
+                None,
+            ),
+            Err(error) => self.publish_query_completed(
+                query_id,
+                started.elapsed(),
+                None,
+                Some(error.to_string()),
+            ),
+        }
+        outcome
+    }
+
+    fn execute_statement_unobserved(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::CreateTable(create) => self.create_table(
                 create.name,
@@ -519,6 +773,15 @@ impl Engine {
 
         Ok(None)
     }
+}
+
+fn public_query_result(mut result: QueryResult) -> QueryResult {
+    for row in &mut result.rows {
+        for value in row.values_mut() {
+            *value = eval::public_json_value(value);
+        }
+    }
+    result
 }
 
 pub type SharedEngine = Arc<Engine>;

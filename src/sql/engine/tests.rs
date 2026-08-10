@@ -1,6 +1,7 @@
-use super::{Engine, EngineConfig, UniqueMode};
+use super::{Engine, EngineConfig, QueryEvent, QueryEventOptions, UniqueMode};
 use chrono::{Duration, NaiveDateTime, Utc};
 use serde_json::json;
+use std::time::Duration as StdDuration;
 
 #[test]
 fn create_insert_select_alter_roundtrip() {
@@ -299,4 +300,277 @@ fn evaluates_group_concat_order_separator_and_multi_distinct_count() {
         Some("high,low,mid")
     );
     assert_eq!(row.get("distinct_pairs").and_then(|v| v.as_u64()), Some(3));
+}
+
+#[test]
+fn order_by_uses_mysql_declared_type_rules_for_non_integer_columns() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    engine
+        .execute_sql(
+            "CREATE TABLE sort_types (
+                id INT PRIMARY KEY,
+                decimal_value DECIMAL(12,3),
+                time_value TIME(6),
+                enum_value ENUM('low','Medium','HIGH'),
+                set_value SET('red','Green','blue'),
+                json_value JSON
+            )",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO sort_types VALUES
+                (1, 10.000, '02:00:00', 'HIGH', 'red,blue', '10'),
+                (2, 2.500, '10:00:00', 'low', 'Green', '\"text\"'),
+                (3, NULL, NULL, NULL, NULL, NULL),
+                (4, 10.000, '03:00:00', 'Medium', 'red', 'true')",
+        )
+        .unwrap();
+
+    let ids = |sql: &str| {
+        engine
+            .execute_sql(sql)
+            .unwrap()
+            .remove(0)
+            .rows
+            .into_iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY decimal_value, id"),
+        [3, 2, 1, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY decimal_value DESC, id"),
+        [1, 4, 2, 3]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY time_value, id"),
+        [3, 1, 4, 2]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY enum_value, id"),
+        [3, 2, 4, 1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY set_value, id"),
+        [3, 4, 2, 1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY json_value, id"),
+        [3, 1, 2, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_types ORDER BY decimal_value, time_value DESC, id"),
+        [3, 2, 4, 1]
+    );
+}
+
+#[test]
+fn compound_sorting_covers_precision_collation_temporal_enum_set_json_and_all_paths() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    engine
+        .execute_sql(
+            "CREATE TABLE sort_edges (
+                id INT PRIMARY KEY,
+                group_id INT,
+                tie INT,
+                unsigned_value BIGINT UNSIGNED,
+                decimal_value DECIMAL(20,6),
+                float_value FLOAT,
+                text_value VARCHAR(32),
+                binary_value BINARY(3),
+                varbinary_value VARBINARY(3),
+                time_value TIME(6),
+                datetime_value DATETIME(6),
+                timestamp_value TIMESTAMP(6),
+                enum_value ENUM('low','Medium','HIGH'),
+                set_value SET('red','Green','blue'),
+                json_value JSON
+            )",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO sort_edges VALUES
+                (1, 1, 2, 9007199254740993, 1.000001, 16777217, 'Éclair', 'a', 'a', '838:59:59.999999', '2024-01-01 00:00:00.000001', '2024-01-01 00:00:00.000001', 'low', 'red', 'null'),
+                (2, 1, 1, 9007199254740992, 1.000000, 16777216, 'eclair ', 'a ', 'a ', '-838:59:59.999999', '2024-01-01 00:00:00.000002', '2024-01-01 00:00:00.000002', 'Medium', 'Green', '1'),
+                (3, 1, 1, 18446744073709551615, -0.000001, 16777217, '', 'ab', 'ab', '00:00:00.000000', '2024-01-01 00:00:00.000003', '2024-01-01 00:00:00.000003', 'HIGH', '', NULL),
+                (4, 2, 2, 2, 10.250000, 1.5, 'ECLAIR', 'b', 'b', '12:00:00', '2024-01-02 00:00:00', '2024-01-02 00:00:00', 'low', 'red,Green', '[1,2]'),
+                (5, 2, 1, 1, 10.249999, 1.5, 'z', 'aa', 'aa', '01:02:03.123456', '2023-12-31 23:59:59.999999', '2023-12-31 23:59:59.999999', 'Medium', 'blue', '{}')",
+        )
+        .unwrap();
+
+    let ids = |sql: &str| {
+        engine
+            .execute_sql(sql)
+            .unwrap()
+            .remove(0)
+            .rows
+            .into_iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY unsigned_value ASC, group_id DESC, tie DESC, id"),
+        [5, 4, 2, 1, 3]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY decimal_value ASC, text_value DESC, id"),
+        [3, 2, 1, 5, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY float_value ASC, id"),
+        [4, 5, 1, 2, 3]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY text_value ASC, id"),
+        [3, 1, 2, 4, 5]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY binary_value ASC, varbinary_value DESC, id"),
+        [1, 2, 5, 3, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY time_value ASC, datetime_value DESC, id"),
+        [2, 3, 5, 4, 1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY enum_value ASC, set_value ASC, id"),
+        [1, 4, 2, 5, 3]
+    );
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY json_value ASC, id"),
+        [3, 1, 2, 5, 4]
+    );
+    assert_eq!(
+        ids("SELECT id, decimal_value AS amount FROM sort_edges ORDER BY amount ASC, id"),
+        [3, 2, 1, 5, 4]
+    );
+    assert_eq!(
+        ids("SELECT id, decimal_value + 0 AS amount FROM sort_edges ORDER BY amount ASC, id"),
+        [3, 2, 1, 5, 4]
+    );
+
+    let window_ids = ids(
+        "SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY decimal_value ASC, unsigned_value DESC, id) AS row_order
+            FROM sort_edges
+        ) AS ordered_rows
+        ORDER BY row_order",
+    );
+    assert_eq!(window_ids, [3, 2, 1, 5, 4]);
+
+    let group_concat = engine
+        .execute_sql("SELECT GROUP_CONCAT(id ORDER BY unsigned_value ASC SEPARATOR ',') AS ids FROM sort_edges")
+        .unwrap()
+        .remove(0)
+        .rows
+        .remove(0);
+    assert_eq!(group_concat["ids"].as_str(), Some("5,4,2,1,3"));
+
+    assert_eq!(
+        ids(
+            "SELECT id FROM (SELECT id, decimal_value FROM sort_edges) AS d ORDER BY decimal_value, id"
+        ),
+        [3, 2, 1, 5, 4]
+    );
+    assert_eq!(
+        ids(
+            "SELECT id FROM sort_edges WHERE id <= 2 UNION ALL SELECT id FROM sort_edges WHERE id >= 4 ORDER BY id DESC"
+        ),
+        [5, 4, 2, 1]
+    );
+    assert_eq!(
+        ids(
+            "SELECT id, unsigned_value AS ordering FROM sort_edges WHERE id <= 2 UNION ALL SELECT id, unsigned_value FROM sort_edges WHERE id >= 4 ORDER BY ordering DESC, id"
+        ),
+        [1, 2, 4, 5]
+    );
+
+    engine
+        .execute_sql("DELETE FROM sort_edges ORDER BY unsigned_value DESC LIMIT 1")
+        .unwrap();
+    assert_eq!(
+        ids("SELECT id FROM sort_edges ORDER BY unsigned_value DESC, id"),
+        [1, 2, 4, 5]
+    );
+}
+
+#[test]
+fn query_events_report_lifecycle_timing_size_and_optional_results() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    let metadata_stream = engine.subscribe_query_events(QueryEventOptions::default());
+
+    let first_results = engine
+        .execute_sql("SELECT 1 AS value")
+        .expect("query should succeed");
+    let received = metadata_stream.recv().expect("received event");
+    let first_id = match received {
+        QueryEvent::Received(event) => {
+            assert_eq!(event.query, "SELECT 1 AS value");
+            event.query_id
+        }
+        QueryEvent::Completed(_) => panic!("received event should come first"),
+    };
+    let completed = metadata_stream.recv().expect("completed event");
+    match completed {
+        QueryEvent::Completed(event) => {
+            assert_eq!(event.query_id, first_id);
+            assert_eq!(event.result_set_count, 1);
+            assert_eq!(event.result_set_size, 1);
+            assert!(event.duration <= StdDuration::from_secs(1));
+            assert!(event.results.is_none());
+            assert!(event.error.is_none());
+        }
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    }
+    assert_eq!(first_results.len(), 1);
+
+    let payload_stream = engine.subscribe_query_events(QueryEventOptions::with_results());
+    let expected_results = engine
+        .execute_sql_with_params("SELECT ? AS value", &[json!(7)])
+        .expect("prepared query should succeed");
+    assert!(matches!(
+        payload_stream.recv().expect("prepared received event"),
+        QueryEvent::Received(event)
+            if event.query == "SELECT ? AS value" && event.query_id > first_id
+    ));
+    let payload_completed = payload_stream.recv().expect("prepared completed event");
+    match payload_completed {
+        QueryEvent::Completed(event) => {
+            assert_eq!(event.result_set_count, 1);
+            assert_eq!(event.result_set_size, 1);
+            let actual_results = event.results.expect("results should be included");
+            assert_eq!(actual_results.len(), expected_results.len());
+            assert_eq!(actual_results[0].rows, expected_results[0].rows);
+            assert!(event.error.is_none());
+        }
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    }
+
+    let failure_stream = engine.subscribe_query_events(QueryEventOptions::metadata_only());
+    assert!(
+        engine
+            .execute_sql("SELECT * FROM missing_query_event_table")
+            .is_err()
+    );
+    let failure_received = failure_stream.recv().expect("failed received event");
+    let failure_id = match failure_received {
+        QueryEvent::Received(event) => event.query_id,
+        QueryEvent::Completed(_) => panic!("received event should come first"),
+    };
+    match failure_stream.recv().expect("failed completed event") {
+        QueryEvent::Completed(event) => {
+            assert_eq!(event.query_id, failure_id);
+            assert_eq!(event.result_set_count, 0);
+            assert_eq!(event.result_set_size, 0);
+            assert!(event.results.is_none());
+            assert!(event.error.is_some());
+        }
+        QueryEvent::Received(_) => panic!("completed event should follow received event"),
+    }
 }

@@ -594,7 +594,8 @@ impl Engine {
                 candidates.push((k.clone(), row.clone(), view));
             }
         }
-        sort_delete_candidates(&mut candidates, &delete.order_by)?;
+        let schema = self.schemas.get(&table_name).map(|schema| schema.clone());
+        sort_delete_candidates(&mut candidates, &delete.order_by, schema.as_ref())?;
         if let Some(limit) = &delete.limit {
             candidates.truncate(expr_to_usize(limit)?);
         }
@@ -1517,6 +1518,7 @@ fn schema_unique_key(
 fn sort_delete_candidates(
     candidates: &mut [(String, StoredRow, Map<String, Value>)],
     order_by: &[OrderByExpr],
+    schema: Option<&TableSchemaHint>,
 ) -> Result<()> {
     for item in order_by {
         validate_order_expr(&item.expr)?;
@@ -1526,7 +1528,8 @@ fn sort_delete_candidates(
         for item in order_by {
             let left_value = expr_resolved_value(&item.expr, left).unwrap_or(Value::Null);
             let right_value = expr_resolved_value(&item.expr, right).unwrap_or(Value::Null);
-            let ordering = compare_json_values(&left_value, &right_value);
+            let hint = order_column_hint_from_schema(schema, &item.expr);
+            let ordering = compare_order_values(&left_value, &right_value, hint.as_ref());
             if ordering != Ordering::Equal {
                 return if item.asc.unwrap_or(true) {
                     ordering
@@ -1539,4 +1542,19 @@ fn sort_delete_candidates(
     });
 
     Ok(())
+}
+
+fn order_column_hint_from_schema(
+    schema: Option<&TableSchemaHint>,
+    expr: &Expr,
+) -> Option<ColumnHint> {
+    let column = match expr {
+        Expr::Identifier(identifier) => identifier.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+        _ => return None,
+    };
+    schema?
+        .columns
+        .iter()
+        .find_map(|(known, hint)| known.eq_ignore_ascii_case(column).then(|| hint.clone()))
 }

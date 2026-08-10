@@ -102,7 +102,14 @@ impl Engine {
             _ => return Err(anyhow!("only SELECT and UNION are supported")),
         };
 
-        apply_ordering(&mut rows, &order_by)?;
+        apply_ordering_with(&mut rows, &order_by, |expr, row| {
+            let hint = result_columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&projection_expr_column_name(expr)))
+                .and_then(|index| result_metadata.get(index))
+                .map(column_hint_from_metadata);
+            Ok((expr_resolved_value(expr, row)?, hint))
+        })?;
         apply_limit_offset(&mut rows, limit.as_ref(), offset.as_ref())?;
 
         Ok(QueryResult {
@@ -122,6 +129,11 @@ impl Engine {
         offset: Option<&Offset>,
     ) -> Result<QueryResult> {
         self.validate_select_column_references(&select, order_by)?;
+        let order_hints = order_by
+            .iter()
+            .map(|order| self.order_column_hint(&select, &order.expr))
+            .collect::<Vec<_>>();
+        let aggregate_hints = self.aggregate_column_hints(&select);
 
         if select.from.is_empty() {
             let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
@@ -134,6 +146,8 @@ impl Engine {
                 &select,
                 rows.clone(),
                 order_by,
+                &order_hints,
+                &aggregate_hints,
                 limit,
                 offset,
                 last_insert_id,
@@ -217,6 +231,8 @@ impl Engine {
                 &select,
                 joined.clone(),
                 order_by,
+                &order_hints,
+                &aggregate_hints,
                 limit,
                 offset,
                 last_insert_id,
@@ -242,6 +258,8 @@ impl Engine {
                 &select,
                 rows.clone(),
                 order_by,
+                &order_hints,
+                &aggregate_hints,
                 limit,
                 offset,
                 last_insert_id,
@@ -320,6 +338,8 @@ impl Engine {
             &select,
             rows.clone(),
             order_by,
+            &order_hints,
+            &aggregate_hints,
             limit,
             offset,
             last_insert_id,
@@ -341,7 +361,11 @@ impl Engine {
     ) -> Result<QueryResult> {
         self.materialize_window_values(select, &mut rows, last_insert_id)?;
         self.materialize_projection_values(&select.projection, &mut rows, last_insert_id)?;
-        apply_ordering(&mut rows, order_by)?;
+        apply_ordering_with(&mut rows, order_by, |expr, row| {
+            let value = self.eval_expr_ctx(expr, row, last_insert_id)?;
+            let hint = self.order_column_hint(select, expr);
+            Ok((value, hint))
+        })?;
         let mut rows = rows
             .into_iter()
             .map(|row| self.project_row_ctx(&select.projection, &row, last_insert_id))
@@ -391,6 +415,11 @@ impl Engine {
                 .map(|name| name.value.to_ascii_uppercase())
                 .unwrap_or_default();
             let arguments = window_function_arguments(function)?;
+            let order_hints = spec
+                .order_by
+                .iter()
+                .map(|order| self.order_column_hint(select, &order.expr))
+                .collect::<Vec<_>>();
 
             let mut partitions = BTreeMap::<String, Vec<usize>>::new();
             for (index, row) in snapshot.iter().enumerate() {
@@ -428,7 +457,11 @@ impl Engine {
                     for (position, order) in spec.order_by.iter().enumerate() {
                         let left_value = &key_by_index[left][position];
                         let right_value = &key_by_index[right][position];
-                        let ordering = compare_json_values(left_value, right_value);
+                        let ordering = compare_order_values(
+                            left_value,
+                            right_value,
+                            order_hints.get(position).and_then(Option::as_ref),
+                        );
                         if ordering != Ordering::Equal {
                             return if order.asc.unwrap_or(true) {
                                 ordering
@@ -444,8 +477,11 @@ impl Engine {
                 let mut dense_rank = 1_usize;
                 for position in 0..partition.len() {
                     if position > 0
-                        && key_by_index[&partition[position]]
-                            != key_by_index[&partition[position - 1]]
+                        && !same_order_key(
+                            &key_by_index[&partition[position]],
+                            &key_by_index[&partition[position - 1]],
+                            &order_hints,
+                        )
                     {
                         rank = position + 1;
                         dense_rank += 1;
@@ -453,15 +489,21 @@ impl Engine {
                     let row_index = partition[position];
                     let mut peer_start = position;
                     while peer_start > 0
-                        && key_by_index[&partition[peer_start - 1]]
-                            == key_by_index[&partition[position]]
+                        && same_order_key(
+                            &key_by_index[&partition[peer_start - 1]],
+                            &key_by_index[&partition[position]],
+                            &order_hints,
+                        )
                     {
                         peer_start -= 1;
                     }
                     let mut peer_end = position;
                     while peer_end + 1 < partition.len()
-                        && key_by_index[&partition[peer_end + 1]]
-                            == key_by_index[&partition[position]]
+                        && same_order_key(
+                            &key_by_index[&partition[peer_end + 1]],
+                            &key_by_index[&partition[position]],
+                            &order_hints,
+                        )
                     {
                         peer_end += 1;
                     }
@@ -951,6 +993,107 @@ impl Engine {
                     .find(|(known, _)| known.eq_ignore_ascii_case(column))
                 {
                     return Some((table_name, hint.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn order_column_hint(&self, select: &Select, expr: &Expr) -> Option<ColumnHint> {
+        if let Some((_, hint)) = self.resolve_expression_column(select, expr) {
+            return Some(hint);
+        }
+
+        let identifier = match expr {
+            Expr::Identifier(identifier) => identifier.value.as_str(),
+            Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+            _ => return None,
+        };
+        if let Some(item) = select.projection.iter().find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(identifier) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        }) {
+            if let Some((_, hint)) = self.resolve_expression_column(select, item) {
+                return Some(hint);
+            }
+        }
+        self.derived_order_column_hint(select, identifier)
+    }
+
+    fn aggregate_column_hints(&self, select: &Select) -> BTreeMap<String, ColumnHint> {
+        let mut hints = BTreeMap::new();
+        for table in &select.from {
+            self.collect_aggregate_column_hints(&table.relation, &mut hints);
+            for join in &table.joins {
+                self.collect_aggregate_column_hints(&join.relation, &mut hints);
+            }
+        }
+        hints
+    }
+
+    fn collect_aggregate_column_hints(
+        &self,
+        factor: &TableFactor,
+        hints: &mut BTreeMap<String, ColumnHint>,
+    ) {
+        let TableFactor::Table { name, alias, .. } = factor else {
+            return;
+        };
+        let Some(table_name) = name.0.last().map(|part| part.value.clone()) else {
+            return;
+        };
+        let Some(schema) = self.schemas.get(&table_name) else {
+            return;
+        };
+        for (column, hint) in &schema.columns {
+            hints.insert(column.clone(), hint.clone());
+            hints.insert(format!("{table_name}.{column}"), hint.clone());
+            if let Some(alias) = alias {
+                hints.insert(format!("{}.{}", alias.name.value, column), hint.clone());
+            }
+        }
+    }
+
+    fn derived_order_column_hint(&self, select: &Select, column: &str) -> Option<ColumnHint> {
+        for table in &select.from {
+            for factor in std::iter::once(&table.relation)
+                .chain(table.joins.iter().map(|join| &join.relation))
+            {
+                let TableFactor::Derived {
+                    subquery, alias, ..
+                } = factor
+                else {
+                    continue;
+                };
+                let Some(_alias) = alias.as_ref() else {
+                    continue;
+                };
+                let SetExpr::Select(inner) = &*subquery.body else {
+                    continue;
+                };
+                for item in &inner.projection {
+                    let expression = match item {
+                        SelectItem::ExprWithAlias { expr, alias }
+                            if alias.value.eq_ignore_ascii_case(column) =>
+                        {
+                            expr
+                        }
+                        SelectItem::UnnamedExpr(expr)
+                            if projection_output_column_name(expr).eq_ignore_ascii_case(column) =>
+                        {
+                            expr
+                        }
+                        _ => continue,
+                    };
+                    return self.order_column_hint(inner, expression).or_else(|| {
+                        let metadata =
+                            self.expression_metadata(inner, expression, column.to_string(), None);
+                        Some(column_hint_from_metadata(&metadata))
+                    });
                 }
             }
         }
@@ -2614,6 +2757,46 @@ impl Engine {
             }
         }
         Ok(QueryResult::default())
+    }
+}
+
+fn same_order_key(left: &[Value], right: &[Value], hints: &[Option<ColumnHint>]) -> bool {
+    left.iter()
+        .zip(right)
+        .enumerate()
+        .all(|(index, (left, right))| {
+            compare_order_values(left, right, hints.get(index).and_then(Option::as_ref))
+                == Ordering::Equal
+        })
+}
+
+fn column_hint_from_metadata(metadata: &ColumnMetadata) -> ColumnHint {
+    let sql_type = match metadata.column_type {
+        MysqlColumnType::Null => "NULL",
+        MysqlColumnType::TinyInt => "TINYINT",
+        MysqlColumnType::SmallInt => "SMALLINT",
+        MysqlColumnType::Integer => "INT",
+        MysqlColumnType::BigInt => "BIGINT",
+        MysqlColumnType::Float => "FLOAT",
+        MysqlColumnType::Double => "DOUBLE",
+        MysqlColumnType::Decimal => "DECIMAL",
+        MysqlColumnType::Date => "DATE",
+        MysqlColumnType::Time => "TIME",
+        MysqlColumnType::DateTime => "DATETIME",
+        MysqlColumnType::Timestamp => "TIMESTAMP",
+        MysqlColumnType::Year => "YEAR",
+        MysqlColumnType::Char => "CHAR",
+        MysqlColumnType::VarChar => "VARCHAR",
+        MysqlColumnType::Text => "TEXT",
+        MysqlColumnType::Binary => "BINARY",
+        MysqlColumnType::VarBinary => "VARBINARY",
+        MysqlColumnType::Blob => "BLOB",
+        MysqlColumnType::Json => "JSON",
+        MysqlColumnType::Bit => "BIT",
+    };
+    ColumnHint {
+        sql_type: Some(sql_type.to_string()),
+        ..ColumnHint::default()
     }
 }
 

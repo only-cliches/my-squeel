@@ -252,7 +252,10 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
     // LONGLONG instead of DOUBLE, which makes MySQL clients return it as a
     // string (bigNumberStrings) and breaks numeric consumers downstream.
     if sql_type.contains("double") || sql_type.contains("float") || sql_type.contains("real") {
-        return coerce_double(value.clone()).unwrap_or(value);
+        if sql_type.contains("double") || sql_type.contains("real") {
+            return coerce_double(value.clone()).unwrap_or(value);
+        }
+        return coerce_float(value.clone()).unwrap_or(value);
     }
 
     if sql_type.starts_with("date") && !sql_type.starts_with("datetime") {
@@ -274,9 +277,27 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         };
     }
 
+    if sql_type.starts_with("binary") {
+        let Some(length) = first_type_number(&sql_type) else {
+            return value;
+        };
+        return match value {
+            Value::String(mut value) => {
+                let byte_len = value.len();
+                if byte_len < length {
+                    value.extend(std::iter::repeat('\0').take(length - byte_len));
+                }
+                Value::String(value)
+            }
+            other => other,
+        };
+    }
+
     if sql_type.contains("json") {
         return match value {
-            Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+            Value::String(s) => serde_json::from_str::<Value>(&s)
+                .map(mark_json_nulls)
+                .unwrap_or(Value::String(s)),
             other => other,
         };
     }
@@ -473,6 +494,12 @@ pub(super) fn coerce_number(value: Value) -> Option<Value> {
             .ok()
             .or_else(|| {
                 value
+                    .parse::<u64>()
+                    .ok()
+                    .map(|value| Value::Number(Number::from(value)))
+            })
+            .or_else(|| {
+                value
                     .parse::<f64>()
                     .ok()
                     .and_then(Number::from_f64)
@@ -500,6 +527,23 @@ pub(super) fn coerce_double(value: Value) -> Option<Value> {
     }
 }
 
+pub(super) fn coerce_float(value: Value) -> Option<Value> {
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(|value| Number::from_f64(value as f32 as f64))
+            .map(Value::Number),
+        Value::Bool(value) => Number::from_f64(if value { 1.0 } else { 0.0 }).map(Value::Number),
+        Value::String(value) => value.parse::<f32>().ok().map(|value| {
+            Value::Number(
+                Number::from_f64(value as f64)
+                    .expect("finite f32 values always convert to JSON numbers"),
+            )
+        }),
+        other => Some(other),
+    }
+}
+
 pub(super) fn coerce_bool(value: Value) -> Option<Value> {
     match value {
         Value::Bool(_) => Some(value),
@@ -515,11 +559,14 @@ pub(super) fn coerce_bool(value: Value) -> Option<Value> {
 
 pub(super) fn json_scalar_to_string(value: &Value) -> String {
     match value {
+        Value::String(value) if is_json_null(value) => "null".to_string(),
         Value::String(value) => value.clone(),
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         Value::Null => "null".to_string(),
-        other => other.to_string(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string(&public_json_value(value)).unwrap_or_else(|_| value.to_string())
+        }
     }
 }
 
@@ -530,6 +577,8 @@ pub(super) fn sql_value_to_json(v: &SqlValue) -> Result<Value> {
         SqlValue::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 Ok(Value::Number(Number::from(i)))
+            } else if let Ok(u) = n.parse::<u64>() {
+                Ok(Value::Number(Number::from(u)))
             } else if let Ok(f) = n.parse::<f64>() {
                 Number::from_f64(f)
                     .map(Value::Number)

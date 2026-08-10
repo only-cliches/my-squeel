@@ -32,8 +32,12 @@ pub(super) fn eval_json_extract(
 }
 
 fn json_text_value(value: Value) -> Result<Value> {
+    if matches!(&value, Value::String(value) if is_json_null(value)) {
+        return Ok(json_null_value());
+    }
     Ok(Value::String(
-        serde_json::to_string(&value).map_err(|error| anyhow!("invalid json value: {error}"))?,
+        serde_json::to_string(&public_json_value(&value))
+            .map_err(|error| anyhow!("invalid json value: {error}"))?,
     ))
 }
 
@@ -48,6 +52,9 @@ pub(super) fn eval_json_unquote(
         .unwrap_or(Value::Null);
     if value == Value::Null {
         return Ok(Value::Null);
+    }
+    if matches!(&value, Value::String(value) if is_json_null(value)) {
+        return Ok(Value::String("null".to_string()));
     }
     match value {
         Value::String(value) => {
@@ -77,7 +84,14 @@ pub(super) fn eval_json_object(
         } else {
             Value::Null
         };
-        object.insert(json_scalar_to_string(&key), value);
+        object.insert(
+            json_scalar_to_string(&key),
+            if value == Value::Null {
+                json_null_value()
+            } else {
+                mark_json_nulls(value)
+            },
+        );
     }
     Ok(Value::Object(object))
 }
@@ -88,7 +102,15 @@ pub(super) fn eval_json_array(
     last_insert_id: u64,
 ) -> Result<Value> {
     args.iter()
-        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .map(|arg| {
+            eval_scalar_text(arg, data, last_insert_id).map(|value| {
+                if value == Value::Null {
+                    json_null_value()
+                } else {
+                    mark_json_nulls(value)
+                }
+            })
+        })
         .collect::<Result<Vec<_>>>()
         .map(Value::Array)
 }
@@ -160,6 +182,11 @@ pub(super) fn eval_json_mutation(
                 };
                 let path = eval_scalar_text(path_arg, data, last_insert_id)?;
                 let value = eval_scalar_text(value_arg, data, last_insert_id)?;
+                let value = if value == Value::Null {
+                    json_null_value()
+                } else {
+                    mark_json_nulls(value)
+                };
                 json_set_path(&mut document, &json_scalar_to_string(&path), value);
             }
         }
@@ -180,7 +207,9 @@ fn eval_json_document(arg: &str, data: &Map<String, Value>, last_insert_id: u64)
 
 pub(super) fn parse_json_document_value(value: Value) -> Value {
     match value {
-        Value::String(value) => serde_json::from_str(&value).unwrap_or(Value::String(value)),
+        Value::String(value) => serde_json::from_str::<Value>(&value)
+            .map(mark_json_nulls)
+            .unwrap_or(Value::String(value)),
         other => other,
     }
 }
@@ -230,7 +259,7 @@ fn json_set_path(document: &mut Value, path: &str, value: Value) -> bool {
                 }
                 let array = current.as_array_mut().expect("array just inserted");
                 while array.len() <= *index {
-                    array.push(Value::Null);
+                    array.push(json_null_value());
                 }
                 current = &mut array[*index];
             }
@@ -266,7 +295,7 @@ fn json_remove_path(document: &mut Value, path: &str) -> bool {
         return false;
     };
     if tokens.is_empty() {
-        *document = Value::Null;
+        *document = json_null_value();
         return true;
     }
     let mut current = document;

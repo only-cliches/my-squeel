@@ -13,6 +13,42 @@ use scalar::*;
 const HIDDEN_HISTORICAL_COLUMN_PREFIX: &str = "\0my_sqweel_historical:";
 const SQL_DEFAULT_VALUE_SENTINEL: &str = "\0my_sqweel_sql_default";
 
+pub(super) fn is_json_null(value: &str) -> bool {
+    value == super::JSON_NULL_SENTINEL
+}
+
+pub(super) fn json_null_value() -> Value {
+    Value::String(super::JSON_NULL_SENTINEL.to_string())
+}
+
+pub(super) fn mark_json_nulls(value: Value) -> Value {
+    match value {
+        Value::Null => json_null_value(),
+        Value::Array(values) => Value::Array(values.into_iter().map(mark_json_nulls).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, mark_json_nulls(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+pub(super) fn public_json_value(value: &Value) -> Value {
+    match value {
+        Value::String(value) if is_json_null(value) => Value::Null,
+        Value::Array(values) => Value::Array(values.iter().map(public_json_value).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), public_json_value(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub(super) fn sql_default_value() -> Value {
     Value::String(SQL_DEFAULT_VALUE_SENTINEL.to_string())
 }
@@ -190,6 +226,8 @@ pub(super) fn aggregate_select_result(
     select: &Select,
     rows: Vec<Map<String, Value>>,
     order_by: &[OrderByExpr],
+    order_hints: &[Option<ColumnHint>],
+    column_hints: &BTreeMap<String, ColumnHint>,
     limit: Option<&Expr>,
     offset: Option<&Offset>,
     last_insert_id: u64,
@@ -200,25 +238,53 @@ pub(super) fn aggregate_select_result(
     }
 
     let grouped = group_rows(rows, &group_by, last_insert_id)?;
+    let mut order_hint_map = column_hints.clone();
+    order_hint_map.extend(
+        order_by
+            .iter()
+            .zip(order_hints)
+            .filter_map(|(order, hint)| hint.clone().map(|hint| (order.expr.to_string(), hint))),
+    );
     let mut output = Vec::new();
     for group in grouped {
         let base = group.first().cloned().unwrap_or_default();
         let mut row = Map::new();
 
         for item in &select.projection {
-            project_aggregate_item(item, &group, &base, last_insert_id, &mut row)?;
+            project_aggregate_item(
+                item,
+                &group,
+                &base,
+                last_insert_id,
+                &order_hint_map,
+                &mut row,
+            )?;
         }
         if let Some(having) = &select.having {
             let mut context = base.clone();
             context.extend(row.clone());
-            materialize_aggregate_exprs(having, &group, &base, last_insert_id, &mut context)?;
+            materialize_aggregate_exprs(
+                having,
+                &group,
+                &base,
+                last_insert_id,
+                &order_hint_map,
+                &mut context,
+            )?;
             let having_value = eval_expr(having, &context, last_insert_id)?;
             if !matches!(sql_truth(&having_value), SqlTruth::True) {
                 continue;
             }
         }
         for order in order_by {
-            materialize_aggregate_exprs(&order.expr, &group, &base, last_insert_id, &mut row)?;
+            materialize_aggregate_exprs(
+                &order.expr,
+                &group,
+                &base,
+                last_insert_id,
+                &order_hint_map,
+                &mut row,
+            )?;
         }
         output.push(row);
     }
@@ -226,7 +292,15 @@ pub(super) fn aggregate_select_result(
     if select.distinct.is_some() {
         deduplicate_rows(&mut output);
     }
-    apply_ordering(&mut output, order_by)?;
+    apply_ordering_with(&mut output, order_by, |expr, row| {
+        let hint = order_by
+            .iter()
+            .position(|item| item.expr == *expr)
+            .and_then(|index| order_hints.get(index))
+            .cloned()
+            .flatten();
+        Ok((expr_resolved_value(expr, row)?, hint))
+    })?;
     apply_limit_offset(&mut output, limit, offset)?;
 
     Ok(Some(QueryResult {
@@ -370,6 +444,7 @@ pub(super) fn project_aggregate_item(
     group: &[Map<String, Value>],
     base: &Map<String, Value>,
     last_insert_id: u64,
+    order_hints: &BTreeMap<String, ColumnHint>,
     out: &mut Map<String, Value>,
 ) -> Result<()> {
     match item {
@@ -384,11 +459,11 @@ pub(super) fn project_aggregate_item(
         }
         SelectItem::UnnamedExpr(expr) => {
             let column = projection_output_column_name(expr);
-            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id)?;
+            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints)?;
             out.insert(column, value);
         }
         SelectItem::ExprWithAlias { expr, alias } => {
-            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id)?;
+            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints)?;
             if aggregate_call(expr).is_some() {
                 out.insert(projection_expr_column_name(expr), value.clone());
             }
@@ -404,9 +479,10 @@ pub(super) fn aggregate_or_eval_expr(
     group: &[Map<String, Value>],
     base: &Map<String, Value>,
     last_insert_id: u64,
+    order_hints: &BTreeMap<String, ColumnHint>,
 ) -> Result<Value> {
     let mut context = base.clone();
-    materialize_aggregate_exprs(expr, group, base, last_insert_id, &mut context)?;
+    materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, &mut context)?;
     eval_expr(expr, &context, last_insert_id)
 }
 
@@ -415,20 +491,21 @@ pub(super) fn materialize_aggregate_exprs(
     group: &[Map<String, Value>],
     base: &Map<String, Value>,
     last_insert_id: u64,
+    order_hints: &BTreeMap<String, ColumnHint>,
     out: &mut Map<String, Value>,
 ) -> Result<()> {
     if let Some(call) = aggregate_call(expr) {
         out.insert(
             projection_expr_column_name(expr),
-            eval_aggregate_call(&call, group, last_insert_id)?,
+            eval_aggregate_call(&call, group, last_insert_id, order_hints)?,
         );
         return Ok(());
     }
 
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            materialize_aggregate_exprs(left, group, base, last_insert_id, out)?;
-            materialize_aggregate_exprs(right, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(left, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(right, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -444,37 +521,37 @@ pub(super) fn materialize_aggregate_exprs(
         | Expr::Ceil { expr, .. }
         | Expr::Floor { expr, .. }
         | Expr::Cast { expr, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::Convert { expr, styles, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             for style in styles {
-                materialize_aggregate_exprs(style, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(style, group, base, last_insert_id, order_hints, out)?;
             }
         }
         Expr::InList { expr, list, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             for item in list {
-                materialize_aggregate_exprs(item, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(item, group, base, last_insert_id, order_hints, out)?;
             }
         }
         Expr::InSubquery { expr, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::Like { expr, pattern, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
-            materialize_aggregate_exprs(pattern, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(pattern, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
-            materialize_aggregate_exprs(low, group, base, last_insert_id, out)?;
-            materialize_aggregate_exprs(high, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(low, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(high, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::Position { expr, r#in } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
-            materialize_aggregate_exprs(r#in, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(r#in, group, base, last_insert_id, order_hints, out)?;
         }
         Expr::Substring {
             expr,
@@ -482,12 +559,12 @@ pub(super) fn materialize_aggregate_exprs(
             substring_for,
             ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             if let Some(expr) = substring_from {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
             if let Some(expr) = substring_for {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
         }
         Expr::Trim {
@@ -496,13 +573,20 @@ pub(super) fn materialize_aggregate_exprs(
             trim_characters,
             ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             if let Some(expr) = trim_what {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
             if let Some(items) = trim_characters {
                 for expr in items {
-                    materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                    materialize_aggregate_exprs(
+                        expr,
+                        group,
+                        base,
+                        last_insert_id,
+                        order_hints,
+                        out,
+                    )?;
                 }
             }
         }
@@ -513,13 +597,13 @@ pub(super) fn materialize_aggregate_exprs(
             else_result,
         } => {
             if let Some(expr) = operand {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
             for expr in conditions.iter().chain(results) {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
             if let Some(expr) = else_result {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
             }
         }
         Expr::Function(function) => {
@@ -531,7 +615,14 @@ pub(super) fn materialize_aggregate_exprs(
                         | FunctionArg::Unnamed(arg) => arg,
                     };
                     if let FunctionArgExpr::Expr(expr) = argument {
-                        materialize_aggregate_exprs(expr, group, base, last_insert_id, out)?;
+                        materialize_aggregate_exprs(
+                            expr,
+                            group,
+                            base,
+                            last_insert_id,
+                            order_hints,
+                            out,
+                        )?;
                     }
                 }
             }
@@ -673,6 +764,7 @@ fn eval_aggregate_call(
     call: &AggregateCall,
     group: &[Map<String, Value>],
     last_insert_id: u64,
+    order_hints: &BTreeMap<String, ColumnHint>,
 ) -> Result<Value> {
     let mut values = Vec::new();
     let mut ordered_group = group.iter().collect::<Vec<_>>();
@@ -683,7 +775,16 @@ fn eval_aggregate_call(
                     eval_scalar_text(&order.expr, left, last_insert_id).unwrap_or(Value::Null);
                 let right_value =
                     eval_scalar_text(&order.expr, right, last_insert_id).unwrap_or(Value::Null);
-                let ordering = compare_json_values(&left_value, &right_value);
+                let ordering = compare_order_values(
+                    &left_value,
+                    &right_value,
+                    order_hints.get(&order.expr).or_else(|| {
+                        order_hints
+                            .iter()
+                            .find(|(expr, _)| expr.eq_ignore_ascii_case(&order.expr))
+                            .map(|(_, hint)| hint)
+                    }),
+                );
                 if ordering != Ordering::Equal {
                     return if order.asc {
                         ordering
@@ -816,19 +917,23 @@ pub(super) fn projection_expr_column_name(expr: &Expr) -> String {
     }
 }
 
-pub(super) fn apply_ordering(
+pub(super) fn apply_ordering_with<F>(
     rows: &mut [Map<String, Value>],
     order_by: &[OrderByExpr],
-) -> Result<()> {
+    resolve: F,
+) -> Result<()>
+where
+    F: Fn(&Expr, &Map<String, Value>) -> Result<(Value, Option<ColumnHint>)>,
+{
     for item in order_by {
         validate_order_expr(&item.expr)?;
     }
 
     rows.sort_by(|a, b| {
         for item in order_by {
-            let left = expr_resolved_value(&item.expr, a).unwrap_or(Value::Null);
-            let right = expr_resolved_value(&item.expr, b).unwrap_or(Value::Null);
-            let ordering = compare_json_values(&left, &right);
+            let (left, hint) = resolve(&item.expr, a).unwrap_or((Value::Null, None));
+            let (right, _) = resolve(&item.expr, b).unwrap_or((Value::Null, None));
+            let ordering = compare_order_values(&left, &right, hint.as_ref());
             if ordering != Ordering::Equal {
                 return if item.asc.unwrap_or(true) {
                     ordering
@@ -904,6 +1009,313 @@ pub(super) fn compare_json_values(left: &Value, right: &Value) -> Ordering {
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
         _ => mysql_cmp_non_null(left, right),
+    }
+}
+
+/// Compare values using the declared MySQL column type when one is available.
+///
+/// Rows are stored as JSON values, which intentionally omits the SQL type. That
+/// is sufficient for expressions, but it is not sufficient for ORDER BY: a
+/// DECIMAL containing `10` and a VARCHAR containing `10` have different sort
+/// semantics. Keep the old value-only comparator as the fallback and add the
+/// type-aware cases here for real table columns.
+pub(super) fn compare_order_values(
+    left: &Value,
+    right: &Value,
+    hint: Option<&ColumnHint>,
+) -> Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => return Ordering::Equal,
+        (Value::Null, _) => return Ordering::Less,
+        (_, Value::Null) => return Ordering::Greater,
+        _ => {}
+    }
+
+    let Some(declared) = hint.and_then(|hint| hint.sql_type.as_deref()) else {
+        return mysql_cmp_non_null(left, right);
+    };
+    let declared_upper = declared.trim().to_ascii_uppercase();
+
+    if declared_upper.starts_with("DECIMAL") || declared_upper.starts_with("NUMERIC") {
+        return compare_decimal_values(left, right);
+    }
+    if declared_upper.contains("FLOAT")
+        || declared_upper.contains("DOUBLE")
+        || declared_upper.starts_with("REAL")
+    {
+        return compare_f64_values(left, right);
+    }
+    if declared_upper.contains("INT")
+        || declared_upper == "SERIAL"
+        || declared_upper.starts_with("YEAR")
+        || declared_upper.starts_with("BIT")
+    {
+        return compare_integer_values(left, right);
+    }
+    if declared_upper.starts_with("DATE") && !declared_upper.starts_with("DATETIME") {
+        return compare_temporal_values(left, right, |value| {
+            parse_mysql_datetime_value(value).map(|value| value.date().and_hms_opt(0, 0, 0))?
+        });
+    }
+    if declared_upper.starts_with("DATETIME") || declared_upper.starts_with("TIMESTAMP") {
+        return compare_temporal_values(left, right, parse_mysql_datetime_value);
+    }
+    if declared_upper.starts_with("TIME") {
+        let left = parse_mysql_time_duration(left);
+        let right = parse_mysql_time_duration(right);
+        if let (Some(left), Some(right)) = (left, right) {
+            return left.cmp(&right);
+        }
+    }
+    if declared_upper.starts_with("BINARY")
+        || declared_upper.starts_with("VARBINARY")
+        || declared_upper.ends_with("BLOB")
+        || declared_upper == "BLOB"
+    {
+        return json_scalar_to_string(left)
+            .as_bytes()
+            .cmp(json_scalar_to_string(right).as_bytes());
+    }
+    if declared_upper.starts_with("ENUM") {
+        return compare_enum_values(left, right, declared);
+    }
+    if declared_upper.starts_with("SET") {
+        return compare_set_values(left, right, declared);
+    }
+    if declared_upper.starts_with("JSON") {
+        return compare_json_order_values(left, right);
+    }
+
+    // Character columns use the table's case-insensitive utf8mb4_general_ci
+    // default in MySqweel. Preserve that behavior, including trailing-space
+    // insensitivity, while leaving binary columns on the bytewise path above.
+    compare_mysql_text_values(left, right)
+}
+
+fn compare_integer_values(left: &Value, right: &Value) -> Ordering {
+    match (json_to_i128_exact(left), json_to_i128_exact(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => compare_f64_values(left, right),
+    }
+}
+
+fn compare_f64_values(left: &Value, right: &Value) -> Ordering {
+    json_to_f64_lossy(left)
+        .unwrap_or(0.0)
+        .partial_cmp(&json_to_f64_lossy(right).unwrap_or(0.0))
+        .unwrap_or(Ordering::Equal)
+}
+
+fn compare_temporal_values<F>(left: &Value, right: &Value, parse: F) -> Ordering
+where
+    F: Fn(&Value) -> Option<NaiveDateTime>,
+{
+    match (parse(left), parse(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => compare_mysql_text_values(left, right),
+    }
+}
+
+fn compare_mysql_text_values(left: &Value, right: &Value) -> Ordering {
+    mysql_text_sort_key(left).cmp(&mysql_text_sort_key(right))
+}
+
+/// The default MySQL character comparison used by the engine is the
+/// case-insensitive, accent-insensitive `utf8mb4_general_ci` family.  Keep
+/// the key deliberately small and deterministic: SQL strings are not binary
+/// values, trailing spaces are insignificant, and common Latin accents fold
+/// to their base letters.
+fn mysql_text_sort_key(value: &Value) -> String {
+    json_scalar_to_string(value)
+        .trim_end_matches(' ')
+        .to_lowercase()
+        .chars()
+        .flat_map(|character| match character {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => "a".chars().collect::<Vec<_>>(),
+            'æ' => "ae".chars().collect(),
+            'ç' => "c".chars().collect(),
+            'è' | 'é' | 'ê' | 'ë' => "e".chars().collect(),
+            'ì' | 'í' | 'î' | 'ï' => "i".chars().collect(),
+            'ñ' => "n".chars().collect(),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => "o".chars().collect(),
+            'ù' | 'ú' | 'û' | 'ü' => "u".chars().collect(),
+            'ý' | 'ÿ' => "y".chars().collect(),
+            'ß' => "ss".chars().collect(),
+            'ð' => "d".chars().collect(),
+            'þ' => "th".chars().collect(),
+            'ł' => "l".chars().collect(),
+            'œ' => "oe".chars().collect(),
+            other => vec![other],
+        })
+        .collect()
+}
+
+fn compare_decimal_values(left: &Value, right: &Value) -> Ordering {
+    let left_parts = decimal_parts(left);
+    let right_parts = decimal_parts(right);
+    match (left_parts, right_parts) {
+        (Some(left), Some(right)) => {
+            let sign_order = left.sign.cmp(&right.sign);
+            if sign_order != Ordering::Equal {
+                return sign_order;
+            }
+            let magnitude = left
+                .integer
+                .len()
+                .cmp(&right.integer.len())
+                .then_with(|| left.integer.cmp(&right.integer))
+                .then_with(|| {
+                    let length = left.fraction.len().max(right.fraction.len());
+                    (0..length)
+                        .map(|index| {
+                            left.fraction
+                                .as_bytes()
+                                .get(index)
+                                .copied()
+                                .unwrap_or(b'0')
+                                .cmp(
+                                    &right
+                                        .fraction
+                                        .as_bytes()
+                                        .get(index)
+                                        .copied()
+                                        .unwrap_or(b'0'),
+                                )
+                        })
+                        .find(|ordering| *ordering != Ordering::Equal)
+                        .unwrap_or(Ordering::Equal)
+                });
+            if left.is_negative() {
+                magnitude.reverse()
+            } else {
+                magnitude
+            }
+        }
+        _ => compare_f64_values(left, right),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecimalParts {
+    sign: i8,
+    integer: String,
+    fraction: String,
+}
+
+impl DecimalParts {
+    fn is_negative(&self) -> bool {
+        self.sign < 0
+    }
+}
+
+fn decimal_parts(value: &Value) -> Option<DecimalParts> {
+    let mut raw = json_scalar_to_string(value).trim().to_string();
+    let sign = if raw.starts_with('-') {
+        raw.remove(0);
+        -1
+    } else {
+        if raw.starts_with('+') {
+            raw.remove(0);
+        }
+        1
+    };
+    let (integer, fraction) = raw.split_once('.').unwrap_or((&raw, ""));
+    if integer.is_empty() && fraction.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = fraction.trim_end_matches('0');
+    let is_zero = integer == "0" && fraction.is_empty();
+    Some(DecimalParts {
+        sign: if is_zero { 1 } else { sign },
+        integer: integer.to_string(),
+        fraction: fraction.to_string(),
+    })
+}
+
+fn compare_enum_values(left: &Value, right: &Value, declared: &str) -> Ordering {
+    let options = declared_type_options(declared);
+    enum_value_index(left, &options).cmp(&enum_value_index(right, &options))
+}
+
+fn enum_value_index(value: &Value, options: &[String]) -> usize {
+    let value = json_scalar_to_string(value);
+    options
+        .iter()
+        .position(|option| option == &value)
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn compare_set_values(left: &Value, right: &Value, declared: &str) -> Ordering {
+    let options = declared_type_options(declared);
+    set_value_mask(left, &options).cmp(&set_value_mask(right, &options))
+}
+
+fn set_value_mask(value: &Value, options: &[String]) -> u64 {
+    json_scalar_to_string(value)
+        .split(',')
+        .map(str::trim)
+        .filter_map(|part| options.iter().position(|option| option == part))
+        .fold(0_u64, |mask, index| {
+            mask | 1_u64.checked_shl(index as u32).unwrap_or(0)
+        })
+}
+
+fn declared_type_options(declared: &str) -> Vec<String> {
+    let Some((_, body)) = declared.split_once('(') else {
+        return Vec::new();
+    };
+    let body = body.trim_end_matches(')');
+    split_sql_args(body)
+        .into_iter()
+        .filter_map(|value| unquote_sql_string(&value))
+        .collect()
+}
+
+fn compare_json_order_values(left: &Value, right: &Value) -> Ordering {
+    fn rank(value: &Value) -> u8 {
+        match value {
+            Value::Null => 0,
+            Value::String(value) if is_json_null(value) => 0,
+            Value::Number(_) => 1,
+            Value::String(_) => 2,
+            Value::Object(_) => 3,
+            Value::Array(_) => 4,
+            Value::Bool(_) => 5,
+        }
+    }
+    let ranks = rank(left).cmp(&rank(right));
+    if ranks != Ordering::Equal {
+        return ranks;
+    }
+    match (left, right) {
+        (Value::String(left), Value::String(right))
+            if is_json_null(left) || is_json_null(right) =>
+        {
+            Ordering::Equal
+        }
+        (Value::Number(_), Value::Number(_)) => compare_f64_values(left, right),
+        (Value::String(left), Value::String(right)) => left.as_bytes().cmp(right.as_bytes()),
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (Value::Array(left), Value::Array(right)) => left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| compare_json_order_values(left, right))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len())),
+        (Value::Object(left), Value::Object(right)) => {
+            let left = serde_json::to_string(&public_json_value(&Value::Object(left.clone())))
+                .unwrap_or_default();
+            let right = serde_json::to_string(&public_json_value(&Value::Object(right.clone())))
+                .unwrap_or_default();
+            left.cmp(&right)
+        }
+        _ => Ordering::Equal,
     }
 }
 

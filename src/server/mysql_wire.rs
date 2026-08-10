@@ -144,7 +144,8 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         let out = if is_last_insert_id_query(&statement_sql) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
-            self.engine.execute_sql_with_params(&statement_sql, &params)
+            self.engine
+                .execute_sql_with_params_for_wire(&statement_sql, &params)
         };
         write_query_items(out, results, &mut self.last_insert_id, Some(&statement_sql))
     }
@@ -166,7 +167,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         } else if is_last_insert_id_query(query) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
-            self.engine.execute_sql(query)
+            self.engine.execute_sql_for_wire(query)
         };
         write_query_items(out, results, &mut self.last_insert_id, Some(query))
     }
@@ -619,6 +620,12 @@ fn write_row<W: io::Read + io::Write>(
                     rw.write_col(number.to_string())?;
                 }
             }
+            Value::String(value)
+                if definition.coltype == ColumnType::MYSQL_TYPE_JSON
+                    && value == crate::sql::engine::JSON_NULL_SENTINEL =>
+            {
+                rw.write_col("null")?;
+            }
             Value::String(value) => write_string_column(rw, &value, definition)?,
             other => rw.write_col(other.to_string())?,
         }
@@ -928,7 +935,7 @@ fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> 
 
     // Zero is accepted by LIMIT/OFFSET placeholders and generally produces an
     // empty SELECT while still allowing the engine to derive schema metadata.
-    if let Ok(mut results) = engine.execute_sql_with_params(
+    if let Ok(mut results) = engine.execute_sql_with_params_without_events(
         query,
         &vec![Value::Number(serde_json::Number::from(0)); param_count],
     ) && let Some(result) = results.pop()

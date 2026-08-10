@@ -167,6 +167,153 @@ fn assert_prepared_exec_parity<P: Into<mysql::Params> + Clone>(
 }
 
 #[test]
+fn sorting_and_compound_sorting_match_mysql_for_all_primitives() {
+    let _guard = common::test_lock();
+    let mysql_target = mysql_compare_target();
+    let whatever_url = start_whatever_server();
+    let whatever_pool = Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL"))
+        .expect("connect to my-sqweel");
+    let mysql_pool = mysql_target.as_ref().map(|target| {
+        Pool::new(Opts::from_url(target.url()).expect("valid MySQL URL")).expect("connect to mysql")
+    });
+    let mut mysql_conn = mysql_pool
+        .as_ref()
+        .map(|pool| pool.get_conn().expect("mysql conn"));
+    let mut whatever_conn = whatever_pool.get_conn().expect("whatever conn");
+
+    let table = format!("wdb_sort_primitives_{}", std::process::id());
+    if let Some(mysql) = mysql_conn.as_mut() {
+        let _ = mysql.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+    }
+    let _ = whatever_conn.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+
+    let create = format!(
+        "CREATE TABLE {table} (
+            id BIGINT PRIMARY KEY,
+            tiny_value TINYINT,
+            small_value SMALLINT,
+            medium_value MEDIUMINT,
+            int_value INT,
+            big_value BIGINT,
+            unsigned_value BIGINT UNSIGNED,
+            decimal_value DECIMAL(20,6),
+            float_value FLOAT,
+            double_value DOUBLE,
+            bool_value BOOLEAN,
+            bit_value BIT(8),
+            year_value YEAR,
+            date_value DATE,
+            time_value TIME(6),
+            datetime_value DATETIME(6),
+            timestamp_value TIMESTAMP(6),
+            char_value CHAR(8),
+            varchar_value VARCHAR(8),
+            text_value TEXT,
+            binary_value BINARY(3),
+            varbinary_value VARBINARY(3),
+            blob_value BLOB,
+            json_value JSON,
+            enum_value ENUM('low','Medium','HIGH'),
+            set_value SET('red','Green','blue')
+        )"
+    );
+    if let Some(mysql) = mysql_conn.as_mut() {
+        assert_exec_succeeds(mysql, &mut whatever_conn, &create);
+    } else {
+        whatever_conn
+            .query_drop(&create)
+            .expect("create sort fixture");
+    }
+
+    let insert = format!(
+        "INSERT INTO {table} VALUES
+        (1, -1, 2, 30, -4, 100, 1000, 10.250, -2.5, 8.5, TRUE, 1, 2020,
+         '2024-01-02', '02:03:04.000001', '2024-01-02 02:03:04.000001', '2024-01-02 02:03:04.000001',
+         'a', '10', 'Alpha', 'a01', 'a01', 'a01', '10', 'HIGH', 'red,blue'),
+        (2, 1, -2, -30, 4, -100, 2, 2.500, 10.5, -8.5, FALSE, 2, 1999,
+         '2023-12-31', '-02:03:04.000001', '2023-12-31 23:59:59.999999', '2023-12-31 23:59:59.999999',
+         'B', '2', 'beta', 'b00', 'b00', 'b00', '\"text\"', 'low', 'Green'),
+        (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+        (4, 1, 1, 1, 1, 1, 1, 10.250, 2.5, 8.5, TRUE, 1, 2020,
+         '2024-01-02', '10:00:00', '2024-01-02 10:00:00', '2024-01-02 10:00:00',
+         'A', '02', 'ALPHA', 'a02', 'a02', 'a02', 'true', 'Medium', 'red'),
+        (5, -128, -32768, -8388608, -2147483648, -9223372036854775808, 9007199254740992, 1.000001, 16777216, -0.0, FALSE, 0, 2000,
+         '1000-01-01', '838:59:59.999999', '1000-01-01 00:00:00.000001', '1970-01-01 00:00:00.000001',
+         'é', 'é ', 'é ', 'a', 'a ', 'a', 'null', 'low', ''),
+        (6, 127, 32767, 8388607, 2147483647, 9223372036854775807, 9007199254740993, 1.000002, 16777217, 0.0, TRUE, 255, 2001,
+         '9999-12-31', '-838:59:59.999999', '9999-12-31 23:59:59.999999', '2038-01-19 03:14:07.999999',
+         'E', 'E', 'E', 'b', 'b', 'b', '1', 'HIGH', 'red,blue')"
+    );
+    if let Some(mysql) = mysql_conn.as_mut() {
+        assert_exec_succeeds(mysql, &mut whatever_conn, &insert);
+    } else {
+        whatever_conn
+            .query_drop(&insert)
+            .expect("insert sort fixture");
+    }
+
+    let columns = [
+        "tiny_value",
+        "small_value",
+        "medium_value",
+        "int_value",
+        "big_value",
+        "unsigned_value",
+        "decimal_value",
+        "float_value",
+        "double_value",
+        "bool_value",
+        "bit_value",
+        "year_value",
+        "date_value",
+        "time_value",
+        "datetime_value",
+        "timestamp_value",
+        "char_value",
+        "varchar_value",
+        "text_value",
+        "binary_value",
+        "varbinary_value",
+        "blob_value",
+        "json_value",
+        "enum_value",
+        "set_value",
+    ];
+    for column in columns {
+        for direction in ["ASC", "DESC"] {
+            let sql = format!("SELECT id FROM {table} ORDER BY {column} {direction}, id ASC");
+            if let Some(mysql) = mysql_conn.as_mut() {
+                assert_query_parity(mysql, &mut whatever_conn, &sql);
+            } else {
+                fetch_rows(&mut whatever_conn, &sql).expect("sort query");
+            }
+        }
+    }
+
+    for order in [
+        "decimal_value ASC, text_value DESC, time_value ASC, id ASC",
+        "text_value ASC, decimal_value DESC, date_value DESC, id ASC",
+        "enum_value ASC, set_value DESC, unsigned_value ASC, id ASC",
+        "json_value ASC, varchar_value DESC, bool_value ASC, id ASC",
+        "time_value DESC, datetime_value ASC, decimal_value DESC, id ASC",
+        "binary_value ASC, varbinary_value DESC, blob_value ASC, id ASC",
+    ] {
+        let sql = format!("SELECT id FROM {table} ORDER BY {order}");
+        if let Some(mysql) = mysql_conn.as_mut() {
+            assert_query_parity(mysql, &mut whatever_conn, &sql);
+        } else {
+            fetch_rows(&mut whatever_conn, &sql).expect("compound sort query");
+        }
+    }
+
+    if let Some(mysql) = mysql_conn.as_mut() {
+        let _ = mysql.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+    }
+    let _ = whatever_conn.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+}
+
+#[test]
 fn parity_with_mysql_for_supported_semantics() {
     let _guard = common::test_lock();
     let Some(mysql_target) = mysql_compare_target() else {
