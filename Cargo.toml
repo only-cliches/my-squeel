@@ -12,6 +12,7 @@ include = [
     "/CHANGELOG.md",
     "/LICENSE",
     "/README.md",
+    "/benches/**",
     "/logo.png",
     "/src/**",
     "/tests/**",
@@ -65,3 +66,7 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [dev-dependencies]
 mysql = "26.0"
+
+[[bench]]
+name = "engine_performance"
+harness = false

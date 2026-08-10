@@ -15,6 +15,7 @@ All notable changes to MySqweel will be documented in this file.
 - Expanded DDL and metadata coverage for case-insensitive schemas, foreign-key indexes, index comments, `SHOW FULL COLUMNS`, `SHOW TABLE STATUS`, `information_schema` engines, process lists, variables, indexes, constraints, and richer table/index introspection.
 - Added MySQL date/time and scalar compatibility for `TIME_FORMAT`, `STR_TO_DATE`, `GET_FORMAT`, `FROM_UNIXTIME`, `INTERVAL`, `SOUNDEX`, `MD5`, `SHA`, `SHA2`, `CRC32`, `BIT_LENGTH`, and expanded aggregate support including variance, standard deviation, and bitwise aggregates.
 - Verified the supported MySQL 8.0.43 MTR surface at 19/19 tests passing (100%) against both the MySQL baseline and MySqweel.
+- Performance improvements.
 
 ## 0.3.2 July 24, 2026
 

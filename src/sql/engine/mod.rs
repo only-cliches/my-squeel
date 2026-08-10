@@ -493,6 +493,10 @@ impl Engine {
         QueryEventStream { receiver }
     }
 
+    fn query_events_enabled(&self) -> bool {
+        !self.query_event_subscribers.lock().is_empty()
+    }
+
     pub(super) fn mysql_strict(&self) -> bool {
         self.cfg.compatibility_profile == CompatibilityProfile::MysqlStrict
     }
@@ -548,9 +552,9 @@ impl Engine {
         normalize_json_nulls: bool,
         emit_events: bool,
     ) -> Result<Vec<QueryResult>> {
-        let query_id =
-            emit_events.then(|| self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed));
-        let started = Instant::now();
+        let query_id = (emit_events && self.query_events_enabled())
+            .then(|| self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed));
+        let started = query_id.map(|_| Instant::now());
         if let Some(query_id) = query_id {
             self.publish_query_event(QueryEvent::Received(QueryReceivedEvent {
                 query_id,
@@ -734,11 +738,16 @@ impl Engine {
         if let Some(query_id) = query_id {
             match &outcome {
                 Ok(results) => {
-                    self.publish_query_completed(query_id, started.elapsed(), Some(results), None)
+                    self.publish_query_completed(
+                        query_id,
+                        started.expect("query event start time").elapsed(),
+                        Some(results),
+                        None,
+                    )
                 }
                 Err(error) => self.publish_query_completed(
                     query_id,
-                    started.elapsed(),
+                    started.expect("query event start time").elapsed(),
                     None,
                     Some(error.to_string()),
                 ),
@@ -864,6 +873,9 @@ impl Engine {
         query: &str,
         error: anyhow::Error,
     ) -> Result<Vec<QueryResult>> {
+        if !self.query_events_enabled() {
+            return Err(error);
+        }
         let query_id = self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed);
         let started = Instant::now();
         self.publish_query_event(QueryEvent::Received(QueryReceivedEvent {
@@ -934,6 +946,9 @@ impl Engine {
 
     pub fn execute_statement(&self, stmt: Statement) -> Result<QueryResult> {
         let query = stmt.to_string();
+        if !self.query_events_enabled() {
+            return self.execute_statement_unobserved(stmt);
+        }
         let query_id = self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed);
         let started = Instant::now();
         self.publish_query_event(QueryEvent::Received(QueryReceivedEvent { query_id, query }));

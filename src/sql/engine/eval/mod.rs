@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 mod common;
 mod datetime;
@@ -229,7 +230,7 @@ pub(super) fn virtual_select_result(
 
 pub(super) fn aggregate_select_result(
     select: &Select,
-    rows: Vec<Map<String, Value>>,
+    rows: &mut Vec<Map<String, Value>>,
     order_by: &[OrderByExpr],
     order_hints: &[Option<ColumnHint>],
     column_hints: &BTreeMap<String, ColumnHint>,
@@ -242,7 +243,7 @@ pub(super) fn aggregate_select_result(
         return Ok(None);
     }
 
-    let mut rows = rows;
+    let mut rows = std::mem::take(rows);
     for item in &select.projection {
         let SelectItem::ExprWithAlias { expr, alias } = item else {
             continue;
@@ -312,14 +313,8 @@ pub(super) fn aggregate_select_result(
     if select.distinct.is_some() {
         deduplicate_rows(&mut output);
     }
-    apply_ordering_with(&mut output, order_by, |expr, row| {
-        let hint = order_by
-            .iter()
-            .position(|item| item.expr == *expr)
-            .and_then(|index| order_hints.get(index))
-            .cloned()
-            .flatten();
-        Ok((expr_resolved_value(expr, row)?, hint))
+    apply_ordering_with(&mut output, order_by, order_hints, |expr, row| {
+        expr_resolved_value(expr, row)
     })?;
     apply_limit_offset(&mut output, limit, offset)?;
 
@@ -334,7 +329,7 @@ pub(super) fn aggregate_select_result(
 }
 
 pub(super) fn deduplicate_rows(rows: &mut Vec<Map<String, Value>>) {
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     rows.retain(|row| seen.insert(encode_json_row(row)));
 }
 
@@ -895,7 +890,7 @@ fn eval_aggregate_call(
     }
 
     if call.distinct {
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
         values.retain(|value| seen.insert(encode_json_value(value)));
     }
 
@@ -1013,22 +1008,45 @@ pub(super) fn projection_expr_column_name(expr: &Expr) -> String {
 }
 
 pub(super) fn apply_ordering_with<F>(
-    rows: &mut [Map<String, Value>],
+    rows: &mut Vec<Map<String, Value>>,
     order_by: &[OrderByExpr],
+    order_hints: &[Option<ColumnHint>],
     resolve: F,
 ) -> Result<()>
 where
-    F: Fn(&Expr, &Map<String, Value>) -> Result<(Value, Option<ColumnHint>)>,
+    F: Fn(&Expr, &Map<String, Value>) -> Result<Value>,
 {
     for item in order_by {
         validate_order_expr(&item.expr)?;
     }
+    if order_by.is_empty() || rows.len() < 2 {
+        return Ok(());
+    }
 
-    rows.sort_by(|a, b| {
-        for item in order_by {
-            let (left, hint) = resolve(&item.expr, a).unwrap_or((Value::Null, None));
-            let (right, _) = resolve(&item.expr, b).unwrap_or((Value::Null, None));
-            let ordering = compare_order_values(&left, &right, hint.as_ref());
+    // Resolve each ORDER BY expression once per row. The previous comparator
+    // evaluated expressions for every comparison, which made sorting
+    // O(n log n) expression evaluations and repeatedly allocated collation
+    // keys for text values.
+    let mut keyed = rows
+        .drain(..)
+        .map(|row| {
+            let keys = order_by
+                .iter()
+                .map(|item| resolve(&item.expr, &row).unwrap_or(Value::Null))
+                .collect::<Vec<_>>();
+            (row, keys)
+        })
+        .collect::<Vec<_>>();
+
+    keyed.sort_by(|(_, left_keys), (_, right_keys)| {
+        for (index, item) in order_by.iter().enumerate() {
+            let left = &left_keys[index];
+            let right = &right_keys[index];
+            let ordering = compare_order_values(
+                left,
+                right,
+                order_hints.get(index).and_then(Option::as_ref),
+            );
             if ordering != Ordering::Equal {
                 return if item.asc.unwrap_or(true) {
                     ordering
@@ -1040,6 +1058,7 @@ where
         Ordering::Equal
     });
 
+    *rows = keyed.into_iter().map(|(row, _)| row).collect();
     Ok(())
 }
 
@@ -1053,16 +1072,20 @@ pub(super) fn apply_limit_offset(
     limit: Option<&Expr>,
     offset: Option<&Offset>,
 ) -> Result<()> {
+    if limit.is_none() && offset.is_none() {
+        return Ok(());
+    }
     let start = offset.map(offset_to_usize).transpose()?.unwrap_or(0);
     let take = limit.map(expr_to_usize).transpose()?;
 
-    let sliced = rows
-        .iter()
-        .skip(start)
-        .take(take.unwrap_or(usize::MAX))
-        .cloned()
-        .collect();
-    *rows = sliced;
+    let end = take
+        .map(|take| start.saturating_add(take).min(rows.len()))
+        .unwrap_or(rows.len());
+    if start >= end {
+        rows.clear();
+    } else {
+        *rows = rows.drain(start..end).collect();
+    }
     Ok(())
 }
 

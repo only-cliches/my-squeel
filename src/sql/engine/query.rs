@@ -1,4 +1,6 @@
 use super::*;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::Visitor;
@@ -77,7 +79,7 @@ impl Engine {
                     sqlparser::ast::SetOperator::Union => {
                         let should_dedup = *set_quantifier != sqlparser::ast::SetQuantifier::All;
                         if should_dedup {
-                            let mut seen = BTreeSet::new();
+                            let mut seen = HashSet::new();
                             left_result
                                 .rows
                                 .retain(|row| seen.insert(encode_json_row(row)));
@@ -105,13 +107,20 @@ impl Engine {
             _ => return Err(anyhow!("only SELECT and UNION are supported")),
         };
 
-        apply_ordering_with(&mut rows, &order_by, |expr, row| {
-            let hint = result_columns
-                .iter()
-                .position(|column| column.eq_ignore_ascii_case(&projection_expr_column_name(expr)))
-                .and_then(|index| result_metadata.get(index))
-                .map(column_hint_from_metadata);
-            Ok((expr_resolved_value(expr, row)?, hint))
+        let order_hints = order_by
+            .iter()
+            .map(|order| {
+                result_columns
+                    .iter()
+                    .position(|column| {
+                        column.eq_ignore_ascii_case(&projection_expr_column_name(&order.expr))
+                    })
+                    .and_then(|index| result_metadata.get(index))
+                    .map(column_hint_from_metadata)
+            })
+            .collect::<Vec<_>>();
+        apply_ordering_with(&mut rows, &order_by, &order_hints, |expr, row| {
+            expr_resolved_value(expr, row)
         })?;
         apply_limit_offset(&mut rows, limit.as_ref(), offset.as_ref())?;
 
@@ -133,11 +142,24 @@ impl Engine {
         offset: Option<&Offset>,
     ) -> Result<QueryResult> {
         self.validate_select_column_references(&select, order_by)?;
-        let order_hints = order_by
-            .iter()
-            .map(|order| self.order_column_hint(&select, &order.expr))
-            .collect::<Vec<_>>();
-        let aggregate_hints = self.aggregate_column_hints(&select);
+        let needs_aggregation = !matches!(
+            &select.group_by,
+            GroupByExpr::Expressions(exprs, _) if exprs.is_empty()
+        ) && !matches!(&select.group_by, GroupByExpr::All(_))
+            || projection_has_aggregate(&select.projection);
+        let order_hints = if needs_aggregation {
+            order_by
+                .iter()
+                .map(|order| self.order_column_hint(&select, &order.expr))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let aggregate_hints = if needs_aggregation {
+            self.aggregate_column_hints(&select)
+        } else {
+            BTreeMap::new()
+        };
 
         if select.from.is_empty() {
             let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
@@ -148,7 +170,7 @@ impl Engine {
             }
             if let Some(result) = aggregate_select_result(
                 &select,
-                rows.clone(),
+                &mut rows,
                 order_by,
                 &order_hints,
                 &aggregate_hints,
@@ -213,7 +235,8 @@ impl Engine {
                     }
                 });
                 let right_by_equality = equality_columns.as_ref().map(|(_, right_column)| {
-                    let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+                    let mut buckets: HashMap<String, Vec<usize>> =
+                        HashMap::with_capacity(table_rows.len());
                     for (index, row) in table_rows.iter().enumerate() {
                         if let Some(value) = row.get(right_column)
                             && *value != Value::Null
@@ -272,7 +295,7 @@ impl Engine {
             let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
             if let Some(result) = aggregate_select_result(
                 &select,
-                joined.clone(),
+                &mut joined,
                 order_by,
                 &order_hints,
                 &aggregate_hints,
@@ -295,11 +318,11 @@ impl Engine {
 
         let root = &select.from[0];
         if matches!(root.relation, TableFactor::Derived { .. }) {
-            let rows = self.select_derived_rows(&select, root)?;
+            let mut rows = self.select_derived_rows(&select, root)?;
             let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
             if let Some(result) = aggregate_select_result(
                 &select,
-                rows.clone(),
+                &mut rows,
                 order_by,
                 &order_hints,
                 &aggregate_hints,
@@ -387,7 +410,7 @@ impl Engine {
         let rows = if root.joins.is_empty()
             && !matches!(root.relation, TableFactor::NestedJoin { .. })
         {
-            self.select_single_table(&select, root)?
+            self.select_single_table(&select, root, order_by)?
         } else {
             self.select_with_joins(&select, root)?
         };
@@ -397,7 +420,7 @@ impl Engine {
         let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
         if let Some(result) = aggregate_select_result(
             &select,
-            rows.clone(),
+            &mut rows,
             order_by,
             &order_hints,
             &aggregate_hints,
@@ -412,6 +435,9 @@ impl Engine {
     }
 
     fn inject_user_variables(&self, rows: &mut [Map<String, Value>]) {
+        if self.user_variables.is_empty() {
+            return;
+        }
         let variables = self
             .user_variables
             .iter()
@@ -434,11 +460,15 @@ impl Engine {
         last_insert_id: u64,
     ) -> Result<QueryResult> {
         self.materialize_window_values(select, &mut rows, last_insert_id)?;
-        self.materialize_projection_values(&select.projection, &mut rows, last_insert_id)?;
-        apply_ordering_with(&mut rows, order_by, |expr, row| {
-            let value = self.eval_expr_ctx(expr, row, last_insert_id)?;
-            let hint = self.order_column_hint(select, expr);
-            Ok((value, hint))
+        if order_by_references_projection_alias(select, order_by) {
+            self.materialize_projection_values(&select.projection, &mut rows, last_insert_id)?;
+        }
+        let order_hints = order_by
+            .iter()
+            .map(|order| self.order_column_hint(select, &order.expr))
+            .collect::<Vec<_>>();
+        apply_ordering_with(&mut rows, order_by, &order_hints, |expr, row| {
+            self.eval_expr_ctx(expr, row, last_insert_id)
         })?;
         let mut rows = rows
             .into_iter()
@@ -467,7 +497,14 @@ impl Engine {
         rows: &mut [Map<String, Value>],
         last_insert_id: u64,
     ) -> Result<()> {
-        if rows.is_empty() {
+        let has_window = select.projection.iter().any(|item| {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => return false,
+            };
+            matches!(expr, Expr::Function(function) if function.over.is_some())
+        });
+        if rows.is_empty() || !has_window {
             return Ok(());
         }
         let snapshot = rows.to_vec();
@@ -496,7 +533,7 @@ impl Engine {
                 .map(|order| self.order_column_hint(select, &order.expr))
                 .collect::<Vec<_>>();
 
-            let mut partitions = BTreeMap::<String, Vec<usize>>::new();
+            let mut partitions = HashMap::<String, Vec<usize>>::new();
             for (index, row) in snapshot.iter().enumerate() {
                 let key = spec
                     .partition_by
@@ -527,7 +564,7 @@ impl Engine {
                     .iter()
                     .copied()
                     .zip(order_keys)
-                    .collect::<BTreeMap<_, _>>();
+                    .collect::<HashMap<_, _>>();
                 partition.sort_by(|left, right| {
                     for (position, order) in spec.order_by.iter().enumerate() {
                         let left_value = &key_by_index[left][position];
@@ -1366,11 +1403,13 @@ impl Engine {
         &self,
         select: &Select,
         root: &TableWithJoins,
+        order_by: &[OrderByExpr],
     ) -> Result<Vec<Map<String, Value>>> {
         let (table, alias) = table_factor_name_and_alias(&root.relation)?;
         if !self.schemas.contains_key(&table) {
             return Err(anyhow!("unknown table: {table}"));
         }
+        let needs_qualified_columns = select_needs_qualified_columns(select, order_by, &table, alias.as_deref());
         let filter = select.selection.as_ref();
         let mut rows = Vec::new();
 
@@ -1388,11 +1427,13 @@ impl Engine {
         {
             for key in keys {
                 if let Some(row) = table_rows.get(key) {
-                    let data = self.current_schema_row(&table, &row.data);
-                    let mut view = data.clone();
-                    add_qualified_columns(&mut view, &table, &data);
-                    if let Some(alias) = &alias {
-                        add_qualified_columns(&mut view, alias, &data);
+                    let mut view = self.current_schema_row(&table, &row.data);
+                    if needs_qualified_columns {
+                        let data = view.clone();
+                        add_qualified_columns(&mut view, &table, &data);
+                        if let Some(alias) = &alias {
+                            add_qualified_columns(&mut view, alias, &data);
+                        }
                     }
                     if self.matches_selection_ctx(filter, &view, 0)? {
                         rows.push(view);
@@ -1412,11 +1453,13 @@ impl Engine {
                 stored_rows.sort_by_key(|row| row.created_at);
             }
             for row in stored_rows {
-                let data = self.current_schema_row(&table, &row.data);
-                let mut view = data.clone();
-                add_qualified_columns(&mut view, &table, &data);
-                if let Some(alias) = &alias {
-                    add_qualified_columns(&mut view, alias, &data);
+                let mut view = self.current_schema_row(&table, &row.data);
+                if needs_qualified_columns {
+                    let data = view.clone();
+                    add_qualified_columns(&mut view, &table, &data);
+                    if let Some(alias) = &alias {
+                        add_qualified_columns(&mut view, alias, &data);
+                    }
                 }
                 if !self.matches_selection_ctx(filter, &view, 0)? {
                     continue;
@@ -1632,48 +1675,68 @@ impl Engine {
         table: &str,
         data: &Map<String, Value>,
     ) -> Map<String, Value> {
-        let Some(schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
+        let Some(schema) = self.schemas.get(table) else {
             return data.clone();
         };
         if schema.columns.is_empty() {
             return data.clone();
         }
 
+        let columns = if schema.column_order.len() == schema.columns.len()
+            && schema
+                .column_order
+                .iter()
+                .all(|column| schema.columns.contains_key(column))
+        {
+            Cow::Borrowed(schema.column_order.as_slice())
+        } else {
+            Cow::Owned(ordered_schema_columns(&schema))
+        };
         let mut out = Map::new();
-        for column in ordered_schema_columns(&schema) {
-            let Some(hint) = schema.columns.get(&column) else {
+        for column in columns.iter() {
+            let Some(hint) = schema.columns.get(column) else {
                 continue;
             };
             let value = data
-                .get(&column)
+                .get(column)
                 .cloned()
                 .or_else(|| read_default_value(hint))
                 .or_else(|| Self::implicit_not_null_value(hint))
                 .unwrap_or(Value::Null);
-            out.insert(column, coerce_value_for_column(value, hint));
+            out.insert(column.clone(), coerce_value_for_column(value, hint));
         }
-        for column in ordered_schema_columns(&schema) {
-            let Some(expression) = schema
-                .columns
-                .get(&column)
-                .and_then(|hint| hint.generated.as_deref())
-            else {
-                continue;
-            };
-            if let Some(expression) = parse_scalar_expr(expression)
+        let generated_columns = columns
+            .iter()
+            .filter_map(|column| {
+                schema
+                    .columns
+                    .get(column)
+                    .and_then(|hint| hint.generated.as_deref())
+                    .map(|expression| (column.clone(), expression.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let historical_columns = data
+            .keys()
+            .filter(|column| {
+                !schema.columns.contains_key(*column)
+                    && !schema
+                        .columns
+                        .keys()
+                        .any(|known| known.eq_ignore_ascii_case(column))
+            })
+            .map(|column| historical_column_marker(column))
+            .collect::<Vec<_>>();
+        drop(schema);
+
+        for (column, expression) in generated_columns {
+            if let Some(expression) = parse_scalar_expr(&expression)
                 && let Ok(value) = self.eval_expr_ctx(&expression, &out, 0)
             {
                 out.insert(column, value);
             }
         }
-        for column in data.keys() {
-            if !schema
-                .columns
-                .keys()
-                .any(|known| known.eq_ignore_ascii_case(column))
-            {
-                out.insert(historical_column_marker(column), Value::Null);
-            }
+        for column in historical_columns {
+            out.insert(column, Value::Null);
         }
         out
     }
@@ -1777,6 +1840,26 @@ impl Engine {
         data: &Map<String, Value>,
         last_insert_id: u64,
     ) -> Result<Value> {
+        match expr {
+            Expr::Identifier(identifier) if !identifier.value.starts_with('@') => {
+                if let Some(value) = data.get(&identifier.value) {
+                    return Ok(value.clone());
+                }
+            }
+            Expr::CompoundIdentifier(parts)
+                if !parts.is_empty() && !parts[0].value.starts_with('@') =>
+            {
+                let name = parts
+                    .iter()
+                    .map(|part| part.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(value) = data.get(&name) {
+                    return Ok(value.clone());
+                }
+            }
+            _ => {}
+        }
         let expression_text = expr.to_string();
         if expression_text.starts_with('@') && !expression_text.starts_with("@@") {
             return Ok(self.user_variable(expression_text.trim_start_matches('@')));
@@ -3745,6 +3828,83 @@ fn predicate_columns_available(expr: &Expr, row: &Map<String, Value>) -> bool {
     sqlparser::ast::Visit::visit(expr, &mut ColumnVisitor { row }).is_continue()
 }
 
+fn select_needs_qualified_columns(
+    select: &Select,
+    order_by: &[OrderByExpr],
+    table: &str,
+    alias: Option<&str>,
+) -> bool {
+    if select.projection.iter().any(|item| {
+        matches!(item, SelectItem::QualifiedWildcard(..))
+    }) {
+        return true;
+    }
+
+    let qualifiers = [Some(table), alias]
+        .into_iter()
+        .flatten()
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    let uses_qualifier = |expr: &Expr| {
+        struct QualifierVisitor<'a> {
+            qualifiers: &'a BTreeSet<String>,
+        }
+
+        impl Visitor for QualifierVisitor<'_> {
+            type Break = ();
+
+            fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+                if let Expr::CompoundIdentifier(parts) = expr
+                    && parts.len() > 1
+                {
+                    let qualifier = parts[..parts.len() - 1]
+                        .iter()
+                        .map(|part| part.value.to_ascii_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if self.qualifiers.contains(&qualifier) {
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+
+        sqlparser::ast::Visit::visit(
+            expr,
+            &mut QualifierVisitor {
+                qualifiers: &qualifiers,
+            },
+        )
+        .is_break()
+    };
+
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            uses_qualifier(expr)
+        }
+        _ => false,
+    }) || select.selection.as_ref().is_some_and(uses_qualifier)
+        || select.having.as_ref().is_some_and(uses_qualifier)
+        || group_by_exprs(select).iter().any(uses_qualifier)
+        || order_by.iter().any(|order| uses_qualifier(&order.expr))
+}
+
+fn order_by_references_projection_alias(select: &Select, order_by: &[OrderByExpr]) -> bool {
+    order_by.iter().any(|order| {
+        let Expr::Identifier(identifier) = &order.expr else {
+            return false;
+        };
+        select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::ExprWithAlias { alias, .. }
+                    if alias.value.eq_ignore_ascii_case(&identifier.value)
+            )
+        })
+    })
+}
+
 fn user_variable_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Identifier(identifier) if identifier.value.starts_with('@') => {
@@ -4163,11 +4323,11 @@ fn set_intersection(
     right: Vec<Map<String, Value>>,
     all: bool,
 ) -> Vec<Map<String, Value>> {
-    let mut right_counts = BTreeMap::<String, usize>::new();
+    let mut right_counts = HashMap::<String, usize>::new();
     for row in right {
         *right_counts.entry(encode_json_row(&row)).or_default() += 1;
     }
-    let mut emitted = BTreeSet::new();
+    let mut emitted = HashSet::new();
     let mut output = Vec::new();
     for row in left {
         let key = encode_json_row(&row);
@@ -4189,11 +4349,11 @@ fn set_difference(
     right: Vec<Map<String, Value>>,
     all: bool,
 ) -> Vec<Map<String, Value>> {
-    let mut right_counts = BTreeMap::<String, usize>::new();
+    let mut right_counts = HashMap::<String, usize>::new();
     for row in right {
         *right_counts.entry(encode_json_row(&row)).or_default() += 1;
     }
-    let mut emitted = BTreeSet::new();
+    let mut emitted = HashSet::new();
     let mut output = Vec::new();
     for row in left {
         let key = encode_json_row(&row);
