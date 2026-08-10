@@ -16,7 +16,7 @@ pub struct InitWriter<'a, W: Read + Write> {
 impl<'a, W: Read + Write + 'a> InitWriter<'a, W> {
     /// Tell client that database context has been changed
     pub fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.writer, 0, 0, StatusFlags::empty())
+        writers::write_ok_packet(self.writer, 0, 0, StatusFlags::empty(), 0)
     }
 
     /// Tell client that there was a problem changing the database context.
@@ -78,8 +78,12 @@ impl<'a, W: Read + Write + 'a> StatementMetaWriter<'a, W> {
 }
 
 enum Finalizer {
-    Ok { rows: u64, last_insert_id: u64 },
-    Eof,
+    Ok {
+        rows: u64,
+        last_insert_id: u64,
+        warnings: u16,
+    },
+    Eof { warnings: u16 },
 }
 
 /// Convenience type for providing query results to clients.
@@ -126,8 +130,11 @@ impl<'a, W: Read + Write> QueryResultWriter<'a, W> {
             Some(Finalizer::Ok {
                 rows,
                 last_insert_id,
-            }) => writers::write_ok_packet(self.writer, rows, last_insert_id, status),
-            Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status),
+                warnings,
+            }) => writers::write_ok_packet(self.writer, rows, last_insert_id, status, warnings),
+            Some(Finalizer::Eof { warnings }) => {
+                writers::write_eof_packet(self.writer, status, warnings)
+            }
         }
     }
 
@@ -136,19 +143,40 @@ impl<'a, W: Read + Write> QueryResultWriter<'a, W> {
     /// Note that if no columns are emitted, any written rows are ignored.
     ///
     /// See [`RowWriter`](struct.RowWriter.html).
-    pub fn start(mut self, columns: &'a [Column]) -> io::Result<RowWriter<'a, W>> {
+    pub fn start(self, columns: &'a [Column]) -> io::Result<RowWriter<'a, W>> {
+        self.start_with_warnings(columns, 0)
+    }
+
+    /// Start a resultset and carry the statement warning count in its final
+    /// protocol packet.
+    pub fn start_with_warnings(
+        mut self,
+        columns: &'a [Column],
+        warnings: u16,
+    ) -> io::Result<RowWriter<'a, W>> {
         self.finalize(true)?;
-        RowWriter::new(self, columns)
+        RowWriter::new(self, columns, warnings)
     }
 
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query in this resultset. `last_insert_id` may be given to communiate an identifier for
     /// a client's most recent insertion.
-    pub fn complete_one(mut self, rows: u64, last_insert_id: u64) -> io::Result<Self> {
+    pub fn complete_one(self, rows: u64, last_insert_id: u64) -> io::Result<Self> {
+        self.complete_one_with_warnings(rows, last_insert_id, 0)
+    }
+
+    /// Send an empty resultset and include a warning count in its terminator.
+    pub fn complete_one_with_warnings(
+        mut self,
+        rows: u64,
+        last_insert_id: u64,
+        warnings: u16,
+    ) -> io::Result<Self> {
         self.finalize(true)?;
         self.last_end = Some(Finalizer::Ok {
             rows,
             last_insert_id,
+            warnings,
         });
         Ok(self)
     }
@@ -157,7 +185,19 @@ impl<'a, W: Read + Write> QueryResultWriter<'a, W> {
     /// the query. `last_insert_id` may be given to communiate an identifier for a client's most
     /// recent insertion.
     pub fn completed(self, rows: u64, last_insert_id: u64) -> io::Result<()> {
-        self.complete_one(rows, last_insert_id)?.no_more_results()
+        self.completed_with_warnings(rows, last_insert_id, 0)
+    }
+
+    /// Send the final empty resultset and include a warning count in its
+    /// terminator packet.
+    pub fn completed_with_warnings(
+        self,
+        rows: u64,
+        last_insert_id: u64,
+        warnings: u16,
+    ) -> io::Result<()> {
+        self.complete_one_with_warnings(rows, last_insert_id, warnings)?
+            .no_more_results()
     }
 
     /// Reply to the client's query with an error.
@@ -200,6 +240,7 @@ pub struct RowWriter<'a, W: Read + Write> {
     bitmap_len: usize,
     data: Vec<u8>,
     columns: &'a [Column],
+    warnings: u16,
 
     // next column to write for the current row
     // NOTE: (ab)used to track number of *rows* for a zero-column resultset
@@ -215,11 +256,13 @@ where
     fn new(
         result: QueryResultWriter<'a, W>,
         columns: &'a [Column],
+        warnings: u16,
     ) -> io::Result<RowWriter<'a, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
         let mut rw = RowWriter {
             result: Some(result),
             columns,
+            warnings,
             bitmap_len,
             data: Vec::new(),
 
@@ -361,10 +404,13 @@ impl<'a, W: Read + Write + 'a> RowWriter<'a, W> {
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok {
                     rows: self.col as u64,
                     last_insert_id: 0,
+                    warnings: self.warnings,
                 });
             } else {
                 // we wrote out at least one row
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof {
+                    warnings: self.warnings,
+                });
             }
         }
 

@@ -59,7 +59,9 @@ impl Visitor for SupportValidator {
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
         match factor {
-            TableFactor::Table { .. } | TableFactor::Derived { .. } => ControlFlow::Continue(()),
+            TableFactor::Table { .. }
+            | TableFactor::Derived { .. }
+            | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
             _ => unsupported(format!("table factor `{factor}`")),
         }
     }
@@ -162,6 +164,8 @@ impl Visitor for SupportValidator {
             | Expr::Trim { .. }
             | Expr::Nested(_)
             | Expr::Value(_)
+            | Expr::TypedString { .. }
+            | Expr::IntroducedString { .. }
             | Expr::Function(_)
             | Expr::Case { .. }
             | Expr::Exists { .. }

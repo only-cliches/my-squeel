@@ -1,0 +1,21 @@
+# Pinned MySQL 8.0.43 main-suite tests for the documented SQL surface.
+# Keep this list explicit: the denominator is part of the compatibility claim.
+alter_table
+date_formats
+delete
+func_comparison
+func_date_add
+func_group
+func_if
+func_str
+group_by
+insert
+insert_select
+join
+limit
+metadata
+order_by_all
+select_all
+select_count
+subquery_exists
+update

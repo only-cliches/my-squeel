@@ -14,6 +14,7 @@ use crate::vendor::lux;
 
 /// Minimal Redis command surface MySqweel uses for durable table storage.
 pub trait RedisStore: Send + Sync {
+    fn is_persistent(&self) -> bool;
     fn hset(&self, key: &str, field: &str, value: &str) -> Result<()>;
     fn hdel(&self, key: &str, field: &str) -> Result<()>;
     fn hgetall(&self, key: &str) -> Result<BTreeMap<String, String>>;
@@ -85,6 +86,10 @@ impl LuxRedisStore {
 }
 
 impl RedisStore for LuxRedisStore {
+    fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
     fn hset(&self, key: &str, field: &str, value: &str) -> Result<()> {
         let client = self.client.clone();
         let key = key.to_string();

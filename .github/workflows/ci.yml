@@ -10,7 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     services:
       mysql:
         image: mysql:8.0.43
@@ -31,5 +31,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install MySQL MTR build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            libaio-dev \
+            libcurl4-openssl-dev \
+            libedit-dev \
+            libicu-dev \
+            liblz4-dev \
+            libncurses5-dev \
+            libnuma-dev \
+            libprotobuf-dev \
+            libssl-dev \
+            libtirpc-dev \
+            libzstd-dev \
+            protobuf-compiler \
+            zlib1g-dev
+      - name: Test compatibility report tooling
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Test all targets against real MySQL
         run: cargo test --all-targets --locked
+      - name: Prepare pinned MySQL upstream MTR suite
+        run: |
+          eval "$(tools/prepare_mysql_mtr.sh "$RUNNER_TEMP/mysql-server" --print-env)"
+          {
+            echo "MYSQL_MTR_ROOT=$MYSQL_MTR_ROOT"
+            echo "MYSQLTEST_BIN=$MYSQLTEST_BIN"
+            echo "MYSQL_CLIENT_BINDIR=$MYSQL_CLIENT_BINDIR"
+          } >> "$GITHUB_ENV"
+      - name: Build MySqweel binary for MTR
+        run: cargo build --locked --bin sqwl
+      - name: Run supported MySQL upstream MTR surface
+        run: |
+          python3 tools/mysql_mtr_compat.py \
+            --suite-root "$MYSQL_MTR_ROOT" \
+            --allowlist tests/mysql-mtr-allowlist.txt \
+            --mysql-url "$MYSQL_COMPARE_URL" \
+            --mysqltest-bin "$MYSQLTEST_BIN" \
+            --client-bindir "$MYSQL_CLIENT_BINDIR" \
+            --mysqweel-bin target/debug/sqwl \
+            --report-dir artifacts/mysql-mtr \
+            --mysql-version 8.0.43 \
+            --source-revision 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7 \
+            --minimum-percent 90
+      - name: Upload MySQL MTR compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-mtr-compatibility-report
+          path: artifacts/mysql-mtr
+          if-no-files-found: warn

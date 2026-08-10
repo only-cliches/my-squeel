@@ -401,7 +401,7 @@ impl<B: MysqlShim<RW>, RW: Read + Write> MysqlIntermediary<B, RW> {
             }
         }
 
-        writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty())?;
+        writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty(), 0)?;
         self.rw.flush()?;
 
         Ok(())
@@ -435,7 +435,14 @@ impl<B: MysqlShim<RW>, RW: Read + Write> MysqlIntermediary<B, RW> {
                                 w.finish()?;
                             }
                             _ => {
-                                w.completed(0, 0)?;
+                                drop(w);
+                                let w = QueryResultWriter::new(&mut self.rw, false);
+                                self.shim.on_query(
+                                    ::std::str::from_utf8(q).map_err(|e| {
+                                        io::Error::new(io::ErrorKind::InvalidData, e)
+                                    })?,
+                                    w,
+                                )?;
                             }
                         }
                     } else if q.starts_with(b"USE ") || q.starts_with(b"use ") {
@@ -504,10 +511,10 @@ impl<B: MysqlShim<RW>, RW: Read + Write> MysqlIntermediary<B, RW> {
                     if let Some(state) = stmts.get_mut(&stmt) {
                         state.long_data.clear();
                     }
-                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty())?;
+                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty(), 0)?;
                 }
                 Command::SetOption | Command::ResetConnection | Command::ChangeUser => {
-                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty())?;
+                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty(), 0)?;
                 }
                 Command::ListFields(_) => {
                     let cols = &[Column {
@@ -529,7 +536,7 @@ impl<B: MysqlShim<RW>, RW: Read + Write> MysqlIntermediary<B, RW> {
                     )?;
                 }
                 Command::Ping => {
-                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty())?;
+                    writers::write_ok_packet(&mut self.rw, 0, 0, StatusFlags::empty(), 0)?;
                 }
                 Command::Quit => {
                     break;

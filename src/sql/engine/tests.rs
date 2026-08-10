@@ -4,6 +4,21 @@ use serde_json::json;
 use std::time::Duration as StdDuration;
 
 #[test]
+fn supports_mysql_user_variables_and_server_prepared_statements() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    let result = engine
+        .execute_sql(
+            "SET @a=7; SELECT @a, @a+1; \
+             SET @sql='SELECT ? + 1'; PREPARE p FROM @sql; \
+             SET @b=4; EXECUTE p USING @b; DEALLOCATE PREPARE p;",
+        )
+        .expect("user variables and prepared statements should execute");
+    assert_eq!(result[1].rows[0]["@a"], 7);
+    assert_eq!(result[1].rows[0]["@a + 1"], 8);
+    assert_eq!(result[5].rows[0].values().next(), Some(&json!(5)));
+}
+
+#[test]
 fn create_insert_select_alter_roundtrip() {
     let engine = Engine::default();
 
@@ -25,6 +40,24 @@ fn create_insert_select_alter_roundtrip() {
     engine
         .execute_sql("ALTER TABLE users ADD COLUMN display_name TEXT;")
         .unwrap();
+}
+
+#[test]
+fn exposes_mtr_metadata_and_ignores_mtr_suppression_calls() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+
+    let variables = engine
+        .execute_sql("SHOW GLOBAL VARIABLES")
+        .unwrap()
+        .remove(0);
+    assert_eq!(variables.rows[0]["Variable_name"], "version");
+    assert_eq!(variables.rows[0]["Value"], "8.0.0-my-sqweel");
+
+    assert!(
+        engine
+            .execute_sql("CALL mtr.add_suppression('expected warning')")
+            .is_ok()
+    );
 }
 
 #[test]

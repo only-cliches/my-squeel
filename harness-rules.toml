@@ -136,5 +136,10 @@ allowlist = [
     "domain=http-intake.logs.us5.datadoghq.com",
     "domain=index.crates.io",
     "domain=static.crates.io",
+    "domain=archives.boost.io",
+    "domain=dev.mysql.com",
+    "domain=cdn.mysql.com",
+    "domain=deb.debian.org",
+    "domain=downloads.mysql.com",
 ]
 denylist = ["domain=sdmntprsouthcentralus.oaiusercontent.com"]

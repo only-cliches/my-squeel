@@ -1,4 +1,7 @@
 use super::*;
+use md5::{Digest, Md5};
+use sha1_smol::Sha1;
+use sha2::Sha256;
 
 pub(super) fn eval_arg(
     arg: Option<&String>,
@@ -308,6 +311,27 @@ pub(super) fn eval_substring_values(
     Ok(Value::String(chars[start..end].iter().collect()))
 }
 
+pub(super) fn eval_substring_index_values(value: Value, delimiter: Value, count: Value) -> Value {
+    if value == Value::Null || delimiter == Value::Null || count == Value::Null {
+        return Value::Null;
+    }
+    let value = json_scalar_to_string(&value);
+    let delimiter = json_scalar_to_string(&delimiter);
+    let count = value_to_i64(&count).unwrap_or(0);
+    if count == 0 || delimiter.is_empty() {
+        return Value::String(String::new());
+    }
+    let parts = value.split(&delimiter).collect::<Vec<_>>();
+    let result = if count > 0 {
+        let end = (count as usize).min(parts.len());
+        parts[..end].join(&delimiter)
+    } else {
+        let start = parts.len().saturating_sub((-count) as usize);
+        parts[start..].join(&delimiter)
+    };
+    Value::String(result)
+}
+
 pub(super) fn eval_repeat(
     string_arg: Option<&String>,
     count_arg: Option<&String>,
@@ -326,4 +350,114 @@ pub(super) fn eval_repeat(
     Ok(Value::String(
         json_scalar_to_string(&value).repeat(count as usize),
     ))
+}
+
+pub(super) fn eval_space(
+    count_arg: Option<&String>,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let count = eval_arg(count_arg, data, last_insert_id)?;
+    if count == Value::Null {
+        return Ok(Value::Null);
+    }
+    let count = value_to_i64(&count).unwrap_or(0);
+    if count <= 0 {
+        return Ok(Value::String(String::new()));
+    }
+    Ok(Value::String(" ".repeat(count as usize)))
+}
+
+pub(super) fn eval_insert_string(
+    args: &[String],
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let values = args
+        .iter()
+        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .collect::<Result<Vec<_>>>()?;
+    if values.iter().any(Value::is_null) || values.len() < 4 {
+        return Ok(Value::Null);
+    }
+    let input = json_scalar_to_string(&values[0]);
+    let position = json_to_i128_exact(&values[1]).unwrap_or(0);
+    let length = json_to_i128_exact(&values[2]).unwrap_or(0);
+    let replacement = json_scalar_to_string(&values[3]);
+    if position <= 0 || position as usize > input.chars().count() {
+        return Ok(Value::String(input));
+    }
+    let start = position as usize - 1;
+    let end = start.saturating_add(length.max(0) as usize);
+    let mut output = input.chars().take(start).collect::<String>();
+    output.push_str(&replacement);
+    output.extend(input.chars().skip(end));
+    Ok(Value::String(output))
+}
+
+pub(crate) fn mysql_soundex(value: &str) -> String {
+    let mut letters = value.chars().filter(|character| character.is_ascii_alphabetic());
+    let Some(first) = letters.next() else {
+        return String::new();
+    };
+    let mut output = first.to_ascii_uppercase().to_string();
+    let mut previous = soundex_code(first);
+    for character in letters {
+        let code = soundex_code(character);
+        if code != '0' && code != previous {
+            output.push(code);
+        }
+        previous = code;
+    }
+    output
+}
+
+pub(super) fn eval_digest(
+    arg: Option<&String>,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+    algorithm: &str,
+) -> Result<Value> {
+    let value = eval_arg(arg, data, last_insert_id)?;
+    if value == Value::Null {
+        return Ok(Value::Null);
+    }
+    let bytes = json_scalar_to_string(&value);
+    let hex = match algorithm {
+        "MD5" => format_digest(&Md5::digest(bytes.as_bytes())),
+        "SHA" | "SHA1" => Sha1::from(bytes).digest().to_string(),
+        "SHA256" => format_digest(&Sha256::digest(bytes.as_bytes())),
+        _ => return Err(anyhow!("unsupported digest: {algorithm}")),
+    };
+    Ok(Value::String(hex))
+}
+
+fn format_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(super) fn eval_crc32(
+    arg: Option<&String>,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let value = eval_arg(arg, data, last_insert_id)?;
+    if value == Value::Null {
+        return Ok(Value::Null);
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(json_scalar_to_string(&value).as_bytes());
+    Ok(Value::Number(Number::from(hasher.finalize())))
+}
+
+fn soundex_code(character: char) -> char {
+    match character.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => '1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+        'D' | 'T' => '3',
+        'L' => '4',
+        'M' | 'N' => '5',
+        'R' => '6',
+        _ => '0',
+    }
 }

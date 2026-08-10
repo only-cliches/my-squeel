@@ -1,6 +1,54 @@
 use super::*;
 
 impl Engine {
+    pub(super) fn create_table_as_select(
+        &self,
+        name: ObjectName,
+        columns: Vec<sqlparser::ast::ColumnDef>,
+        constraints: Vec<TableConstraint>,
+        if_not_exists: bool,
+        temporary: bool,
+        query: sqlparser::ast::Query,
+    ) -> Result<QueryResult> {
+        let result = self.select_query(query)?;
+        let table = object_name(&name)?;
+        if self.mysql_strict() && self.schemas.contains_key(&table) {
+            if if_not_exists {
+                return Ok(QueryResult::default());
+            }
+            return Err(anyhow!("table '{table}' already exists"));
+        }
+        let mut schema = table_schema_from_create(&table, columns, constraints);
+        for (index, column) in result.columns.iter().enumerate() {
+            let value = result.rows.first().and_then(|row| row.get(column));
+            schema.column_order.push(column.clone());
+            schema.columns.insert(
+                column.clone(),
+                ColumnHint {
+                    sql_type: Some(inferred_sql_type(value)),
+                    nullable: Some(value.is_none_or(Value::is_null)),
+                    ..ColumnHint::default()
+                },
+            );
+            let _ = index;
+        }
+        schema.temporary = temporary;
+        schema.updated_at = Some(Utc::now());
+        self.schemas.insert(table.clone(), schema);
+        let mut table_rows = BTreeMap::new();
+        for (index, row) in result.rows.into_iter().enumerate() {
+            let id = Value::Number(Number::from((index + 1) as u64));
+            let key = (index + 1).to_string();
+            let stored = StoredRow::new(table.clone(), id, row);
+            self.persist_row(&table, &key, &stored)?;
+            table_rows.insert(key, stored);
+        }
+        self.rows.insert(table.clone(), table_rows);
+        self.rebuild_indexes(&table);
+        self.persist_schema(&table)?;
+        Ok(QueryResult::default())
+    }
+
     pub(super) fn create_table(
         &self,
         name: ObjectName,
@@ -352,7 +400,11 @@ impl Engine {
             .chain(schema.unique.iter().flatten())
             .chain(schema.indexes.iter().flat_map(|index| index.columns.iter()))
         {
-            if !schema.columns.contains_key(column) {
+            if !schema
+                .columns
+                .keys()
+                .any(|known| known.eq_ignore_ascii_case(column))
+            {
                 return Err(anyhow!("unknown column: {column}"));
             }
         }
@@ -366,7 +418,11 @@ impl Engine {
                 ));
             }
             for column in &foreign_key.columns {
-                if !schema.columns.contains_key(column) {
+                if !schema
+                    .columns
+                    .keys()
+                    .any(|known| known.eq_ignore_ascii_case(column))
+                {
                     return Err(anyhow!("unknown column: {column}"));
                 }
             }
@@ -382,7 +438,11 @@ impl Engine {
                     .ok_or_else(|| anyhow!("unknown table: {}", foreign_key.referenced_table))?
             };
             for column in &foreign_key.referenced_columns {
-                if !parent.columns.contains_key(column) {
+                if !parent
+                    .columns
+                    .keys()
+                    .any(|known| known.eq_ignore_ascii_case(column))
+                {
                     return Err(anyhow!("unknown column: {column}"));
                 }
             }
@@ -424,6 +484,7 @@ impl Engine {
         if schema.indexes.len() + schema.unique.len() != before {
             schema.updated_at = Some(Utc::now());
             self.schemas.insert(table.to_string(), schema);
+            self.index_comments.remove(&format!("{table}:{index_name}"));
             self.rebuild_indexes(table);
             self.persist_schema(table)?;
         }
@@ -450,6 +511,16 @@ impl Engine {
         }
         self.persist_auto_inc()?;
         Ok(QueryResult::default())
+    }
+}
+
+fn inferred_sql_type(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Bool(_)) => "BOOLEAN".to_string(),
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => "BIGINT".to_string(),
+        Some(Value::Number(_)) => "DOUBLE".to_string(),
+        Some(Value::Null) | None => "TEXT".to_string(),
+        _ => "VARCHAR(255)".to_string(),
     }
 }
 
@@ -481,14 +552,25 @@ fn alter_row_action(op: &sqlparser::ast::AlterTableOperation) -> Option<AlterRow
             new: tokens.get(3)?.clone(),
         });
     }
+    if tokens.first()?.eq_ignore_ascii_case("CHANGE") {
+        return Some(AlterRowAction::Rename {
+            old: tokens.get(1)?.clone(),
+            new: tokens.get(2)?.clone(),
+        });
+    }
     None
 }
 
 pub(super) fn object_name(name: &ObjectName) -> Result<String> {
-    name.0
-        .last()
-        .map(|i| i.value.clone())
-        .ok_or_else(|| anyhow!("invalid object name"))
+    if name.0.is_empty() {
+        return Err(anyhow!("invalid object name"));
+    }
+    Ok(name
+        .0
+        .iter()
+        .map(|identifier| identifier.value.clone())
+        .collect::<Vec<_>>()
+        .join("."))
 }
 
 pub(super) fn column_hint_from_def(col: &sqlparser::ast::ColumnDef) -> ColumnHint {
@@ -669,9 +751,38 @@ pub(super) fn table_schema_from_create(
             TableConstraint::PrimaryKey { columns, .. } => {
                 hint.primary_key = columns.into_iter().map(|c| c.value).collect();
             }
+            TableConstraint::Index { name, columns, .. } => {
+                hint.indexes.push(IndexHint {
+                    name: name
+                        .map(|name| name.value)
+                        .unwrap_or_else(|| format!("{}_idx", hint.table)),
+                    columns: columns.into_iter().map(|column| column.value).collect(),
+                    unique: false,
+                    prefix_lengths: Vec::new(),
+                });
+            }
             _ => {}
         }
         if let Some(foreign_key) = parse_foreign_key_hint(&hint.table, &constraint_text) {
+            if !foreign_key.columns.is_empty()
+                && !hint.indexes.iter().any(|index| {
+                    index.columns == foreign_key.columns
+                        || index
+                            .columns
+                            .first()
+                            .is_some_and(|column| Some(column) == foreign_key.columns.first())
+                })
+            {
+                add_index_metadata(
+                    &mut hint,
+                    IndexHint {
+                        name: foreign_key.columns[0].clone(),
+                        columns: foreign_key.columns.clone(),
+                        unique: false,
+                        prefix_lengths: vec![],
+                    },
+                );
+            }
             add_foreign_key_metadata(&mut hint, foreign_key);
         }
     }

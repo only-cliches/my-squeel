@@ -261,6 +261,9 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
     if sql_type.starts_with("date") && !sql_type.starts_with("datetime") {
         return match value {
             Value::String(value) if value.len() >= 10 => Value::String(value[..10].to_string()),
+            Value::Number(value) => compact_mysql_date(&value.to_string())
+                .map(Value::String)
+                .unwrap_or_else(|| Value::String(value.to_string())),
             other => other,
         };
     }
@@ -272,7 +275,20 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         || sql_type.contains("decimal")
     {
         return match value {
+            Value::String(value)
+                if (sql_type.starts_with("datetime") || sql_type.starts_with("timestamp"))
+                    && value.len() == 10 =>
+            {
+                Value::String(format!("{value} 00:00:00"))
+            }
             Value::String(_) => value,
+            Value::Number(value)
+                if sql_type.contains("datetime") || sql_type.contains("timestamp") =>
+            {
+                compact_mysql_datetime(&value.to_string())
+                    .map(Value::String)
+                    .unwrap_or_else(|| Value::String(value.to_string()))
+            }
             other => Value::String(json_scalar_to_string(&other)),
         };
     }
@@ -400,10 +416,16 @@ pub(super) fn validate_mysql_column_value(
     if declared.starts_with("DATE") && !declared.starts_with("DATETIME") {
         let text = value
             .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
             .ok_or_else(|| anyhow!("incorrect date value for column '{column}'"))?;
-        let valid = NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
-            || NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").is_ok()
-            || NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").is_ok();
+        if text == "0000-00-00" {
+            return Ok(());
+        }
+        let valid = NaiveDate::parse_from_str(&text, "%Y-%m-%d").is_ok()
+            || NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S").is_ok()
+            || NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f").is_ok()
+            || compact_mysql_date(&text).is_some();
         if !valid {
             return Err(anyhow!("incorrect date value for column '{column}'"));
         }
@@ -411,10 +433,16 @@ pub(super) fn validate_mysql_column_value(
     if declared.starts_with("DATETIME") || declared.starts_with("TIMESTAMP") {
         let text = value
             .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
             .ok_or_else(|| anyhow!("incorrect datetime value for column '{column}'"))?;
-        let valid = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-            .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
-            .is_ok();
+        if text == "0000-00-00 00:00:00" {
+            return Ok(());
+        }
+        let valid = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f"))
+            .is_ok()
+            || compact_mysql_datetime(&text).is_some();
         if !valid {
             return Err(anyhow!("incorrect datetime value for column '{column}'"));
         }
@@ -434,6 +462,18 @@ pub(super) fn validate_mysql_column_value(
         return Err(anyhow!("invalid JSON text for column '{column}'"));
     }
     Ok(())
+}
+
+fn compact_mysql_date(value: &str) -> Option<String> {
+    NaiveDate::parse_from_str(value, "%Y%m%d")
+        .ok()
+        .map(|value| value.format("%Y-%m-%d").to_string())
+}
+
+fn compact_mysql_datetime(value: &str) -> Option<String> {
+    NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M%S")
+        .ok()
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 fn is_valid_mysql_time(value: &str) -> bool {
@@ -589,6 +629,14 @@ pub(super) fn sql_value_to_json(v: &SqlValue) -> Result<Value> {
         }
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
             Ok(Value::String(s.clone()))
+        }
+        SqlValue::HexStringLiteral(value) => {
+            let digits = value.trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(number) = u64::from_str_radix(digits, 16) {
+                Ok(Value::Number(Number::from(number)))
+            } else {
+                Ok(Value::String(value.clone()))
+            }
         }
         _ => Ok(Value::String(v.to_string())),
     }

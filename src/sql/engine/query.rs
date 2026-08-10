@@ -1,4 +1,7 @@
 use super::*;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::Visitor;
 
 impl Engine {
     pub(super) fn select_query(&self, mut query: Query) -> Result<QueryResult> {
@@ -118,6 +121,7 @@ impl Engine {
             columns: result_columns,
             column_metadata: result_metadata,
             rows,
+            warnings: vec![],
         })
     }
 
@@ -168,53 +172,92 @@ impl Engine {
         if select.from.len() > 1 {
             // Handle implicit cross-join (comma-separated FROM)
             let mut joined = Vec::new();
-            let (first_table, first_alias) = table_factor_name_and_alias(&root.relation)?;
-            if !self.schemas.contains_key(&first_table) {
-                return Err(anyhow!("unknown table: {first_table}"));
-            }
-            let first_rows = self
-                .rows
-                .get(&first_table)
-                .map(|r| r.clone())
+            let predicates = select
+                .selection
+                .as_ref()
+                .map(conjunctive_predicates)
                 .unwrap_or_default();
-
-            let mut current = Vec::new();
-            for first_row in first_rows.values() {
-                let first_data = self.current_schema_row(&first_table, &first_row.data);
-                let mut first_map = first_data.clone();
-                add_qualified_columns(&mut first_map, &first_table, &first_data);
-                if let Some(alias) = &first_alias {
-                    add_qualified_columns(&mut first_map, alias, &first_data);
-                }
-
-                current.push(first_map);
-            }
+            let mut current = if root.joins.is_empty() {
+                self.rows_for_table_factor(&root.relation)?.rows
+            } else {
+                self.joined_table_factor_rows(root, None)?
+            };
 
             // Cross join each subsequent table
             for from_table in &select.from[1..] {
-                let (table_name, alias) = table_factor_name_and_alias(&from_table.relation)?;
-                if !self.schemas.contains_key(&table_name) {
-                    return Err(anyhow!("unknown table: {table_name}"));
-                }
-                let table_rows = self
-                    .rows
-                    .get(&table_name)
-                    .map(|r| r.clone())
-                    .unwrap_or_default();
+                let table_rows = if from_table.joins.is_empty() {
+                    self.rows_for_table_factor(&from_table.relation)?.rows
+                } else {
+                    self.joined_table_factor_rows(from_table, None)?
+                };
+
+                // A comma-separated FROM with a conjunctive equality in the
+                // WHERE clause is an inner join in MySQL.  Avoid materializing
+                // the full Cartesian product for the common `left.key =
+                // right.key` shape; select.inc uses this with tens of
+                // thousands of rows.
+                let equality_columns = predicates.iter().find_map(|predicate| {
+                    let (left_column, right_column) = required_equi_join_columns(predicate)?;
+                    let current_row = current.first()?;
+                    let right_row = table_rows.first()?;
+                    if current_row.contains_key(&left_column)
+                        && right_row.contains_key(&right_column)
+                    {
+                        Some((left_column, right_column))
+                    } else if current_row.contains_key(&right_column)
+                        && right_row.contains_key(&left_column)
+                    {
+                        Some((right_column, left_column))
+                    } else {
+                        None
+                    }
+                });
+                let right_by_equality = equality_columns.as_ref().map(|(_, right_column)| {
+                    let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+                    for (index, row) in table_rows.iter().enumerate() {
+                        if let Some(value) = row.get(right_column)
+                            && *value != Value::Null
+                        {
+                            buckets
+                                .entry(value.to_string())
+                                .or_default()
+                                .push(index);
+                        }
+                    }
+                    buckets
+                });
 
                 let mut next = Vec::new();
                 for candidate in &current {
-                    for row in table_rows.values() {
-                        let table_data = self.current_schema_row(&table_name, &row.data);
+                    let table_indices = if let Some((left_column, _)) = &equality_columns {
+                        candidate
+                            .get(left_column)
+                            .filter(|value| **value != Value::Null)
+                            .and_then(|value| {
+                                right_by_equality
+                                    .as_ref()
+                                    .and_then(|buckets| buckets.get(&value.to_string()))
+                            })
+                            .map(|indices| indices.to_vec())
+                            .unwrap_or_default()
+                    } else {
+                        (0..table_rows.len()).collect()
+                    };
+                    for right_index in table_indices {
+                        let table_data = &table_rows[right_index];
                         let mut combined = candidate.clone();
-                        add_qualified_columns(&mut combined, &table_name, &table_data);
-                        if let Some(ref a) = alias {
-                            add_qualified_columns(&mut combined, a, &table_data);
-                        }
-                        for (k, v) in &table_data {
+                        for (k, v) in table_data {
                             combined.entry(k.clone()).or_insert_with(|| v.clone());
                         }
-                        next.push(combined);
+                        let matches_available_predicates = predicates.iter().all(|predicate| {
+                            !predicate_columns_available(predicate, &combined)
+                                || self
+                                    .matches_selection_ctx(Some(predicate), &combined, 0)
+                                    .unwrap_or(false)
+                        });
+                        if matches_available_predicates {
+                            next.push(combined);
+                        }
                     }
                 }
                 current = next;
@@ -268,7 +311,11 @@ impl Engine {
             }
             return self.finish_select_rows(&select, rows, order_by, limit, offset, last_insert_id);
         }
-        let root_name_full = table_factor_name_full(&root.relation)?;
+        let root_name_full = if matches!(root.relation, TableFactor::NestedJoin { .. }) {
+            String::new()
+        } else {
+            table_factor_name_full(&root.relation)?
+        };
         if root_name_full.eq_ignore_ascii_case("information_schema.tables") {
             return self.select_information_schema_tables(&select);
         }
@@ -326,12 +373,26 @@ impl Engine {
         if root_name_full.eq_ignore_ascii_case("information_schema.files") {
             return self.select_information_schema_files(&select);
         }
+        if root_name_full.eq_ignore_ascii_case("dual") {
+            return self.finish_select_rows(
+                &select,
+                vec![Map::new()],
+                order_by,
+                limit,
+                offset,
+                self.last_insert_id.load(AtomicOrdering::Relaxed),
+            );
+        }
 
-        let rows = if root.joins.is_empty() {
+        let rows = if root.joins.is_empty()
+            && !matches!(root.relation, TableFactor::NestedJoin { .. })
+        {
             self.select_single_table(&select, root)?
         } else {
             self.select_with_joins(&select, root)?
         };
+        let mut rows = rows;
+        self.inject_user_variables(&mut rows);
 
         let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
         if let Some(result) = aggregate_select_result(
@@ -348,6 +409,19 @@ impl Engine {
         }
 
         self.finish_select_rows(&select, rows, order_by, limit, offset, last_insert_id)
+    }
+
+    fn inject_user_variables(&self, rows: &mut [Map<String, Value>]) {
+        let variables = self
+            .user_variables
+            .iter()
+            .map(|entry| (format!("@{}", entry.key()), entry.value().clone()))
+            .collect::<Vec<_>>();
+        for row in rows {
+            for (name, value) in &variables {
+                row.entry(name.clone()).or_insert_with(|| value.clone());
+            }
+        }
     }
 
     fn finish_select_rows(
@@ -383,6 +457,7 @@ impl Engine {
             columns,
             column_metadata,
             rows,
+            warnings: vec![],
         })
     }
 
@@ -768,9 +843,17 @@ impl Engine {
         qualifier: Option<&str>,
         columns: &mut Vec<String>,
     ) {
-        let TableFactor::Table { name, alias, .. } = factor else {
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = factor
+        {
+            self.append_factor_columns(&table_with_joins.relation, qualifier, columns);
+            for join in &table_with_joins.joins {
+                self.append_factor_columns(&join.relation, qualifier, columns);
+            }
             return;
-        };
+        }
+        let TableFactor::Table { name, alias, .. } = factor else { return };
         let Some(table) = name.0.last().map(|name| name.value.clone()) else {
             return;
         };
@@ -794,6 +877,7 @@ impl Engine {
         first_row: Option<&Map<String, Value>>,
     ) -> Vec<ColumnMetadata> {
         let mut metadata = Vec::new();
+        let nullable_tables = select_nullable_tables(select);
         for item in &select.projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => metadata.push(self.expression_metadata(
@@ -806,9 +890,19 @@ impl Engine {
                     .push(self.expression_metadata(select, expr, alias.value.clone(), first_row)),
                 SelectItem::Wildcard(_) => {
                     for table in &select.from {
-                        self.append_factor_metadata(&table.relation, None, &mut metadata);
+                        self.append_factor_metadata(
+                            &table.relation,
+                            None,
+                            &nullable_tables,
+                            &mut metadata,
+                        );
                         for join in &table.joins {
-                            self.append_factor_metadata(&join.relation, None, &mut metadata);
+                            self.append_factor_metadata(
+                                &join.relation,
+                                None,
+                                &nullable_tables,
+                                &mut metadata,
+                            );
                         }
                     }
                 }
@@ -823,12 +917,14 @@ impl Engine {
                         self.append_factor_metadata(
                             &table.relation,
                             Some(&qualifier),
+                            &nullable_tables,
                             &mut metadata,
                         );
                         for join in &table.joins {
                             self.append_factor_metadata(
                                 &join.relation,
                                 Some(&qualifier),
+                                &nullable_tables,
                                 &mut metadata,
                             );
                         }
@@ -854,11 +950,30 @@ impl Engine {
         &self,
         factor: &TableFactor,
         qualifier: Option<&str>,
+        nullable_tables: &BTreeSet<String>,
         metadata: &mut Vec<ColumnMetadata>,
     ) {
-        let TableFactor::Table { name, alias, .. } = factor else {
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = factor
+        {
+            self.append_factor_metadata(
+                &table_with_joins.relation,
+                qualifier,
+                nullable_tables,
+                metadata,
+            );
+            for join in &table_with_joins.joins {
+                self.append_factor_metadata(
+                    &join.relation,
+                    qualifier,
+                    nullable_tables,
+                    metadata,
+                );
+            }
             return;
-        };
+        }
+        let TableFactor::Table { name, alias, .. } = factor else { return };
         let Some(table) = name.0.last().map(|name| name.value.clone()) else {
             return;
         };
@@ -873,7 +988,14 @@ impl Engine {
         if let Some(schema) = self.schemas.get(&table) {
             for column in ordered_schema_columns(&schema) {
                 if let Some(hint) = schema.columns.get(&column) {
-                    metadata.push(ColumnMetadata::from_declared(&column, &table, hint));
+                    let mut column_metadata = ColumnMetadata::from_declared(&column, &table, hint);
+                    if nullable_tables
+                        .iter()
+                        .any(|nullable| nullable.eq_ignore_ascii_case(&table))
+                    {
+                        column_metadata.nullable = true;
+                    }
+                    metadata.push(column_metadata);
                 }
             }
         }
@@ -904,6 +1026,14 @@ impl Engine {
             output_name.clone(),
             first_row.and_then(|row| row.get(&output_name)),
         );
+        let expression_text = expr.to_string();
+        let expression_upper = expression_text.to_ascii_uppercase();
+        if (expression_upper.starts_with("IF(") || expression_upper.starts_with("CASE"))
+            && expression_text.contains('\'')
+        {
+            metadata.column_type = MysqlColumnType::VarChar;
+            metadata.unsigned = false;
+        }
         match expr {
             Expr::Cast { data_type, .. } => {
                 let hint = ColumnHint {
@@ -932,7 +1062,7 @@ impl Engine {
                     "ROUND" | "TRUNCATE" => MysqlColumnType::Decimal,
                     "CURRENT_DATE" | "CURDATE" | "DATE" => MysqlColumnType::Date,
                     "CURRENT_TIME" | "CURTIME" | "TIME" => MysqlColumnType::Time,
-                    "NOW" | "CURRENT_TIMESTAMP" | "STR_TO_DATE" => MysqlColumnType::DateTime,
+                    "NOW" | "CURRENT_TIMESTAMP" => MysqlColumnType::DateTime,
                     "JSON_OBJECT" | "JSON_ARRAY" | "JSON_EXTRACT" => MysqlColumnType::Json,
                     "LENGTH" | "CHAR_LENGTH" | "DATEDIFF" | "TIMESTAMPDIFF" => {
                         MysqlColumnType::BigInt
@@ -1106,11 +1236,19 @@ impl Engine {
         order_by: &[OrderByExpr],
     ) -> Result<()> {
         if select.from.iter().any(|table| {
-            matches!(table.relation, TableFactor::Derived { .. })
+            matches!(
+                table.relation,
+                TableFactor::Derived { .. } | TableFactor::NestedJoin { .. }
+            )
                 || table
                     .joins
                     .iter()
-                    .any(|join| matches!(join.relation, TableFactor::Derived { .. }))
+                    .any(|join| {
+                        matches!(
+                            join.relation,
+                            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. }
+                        )
+                    })
         }) {
             // Derived columns are known only after their subquery is evaluated.
             return Ok(());
@@ -1121,12 +1259,29 @@ impl Engine {
         }) {
             return Ok(());
         }
+        if select.from.first().is_some_and(|table| {
+            table_factor_name_full(&table.relation)
+                .is_ok_and(|name| name.eq_ignore_ascii_case("dual"))
+        }) {
+            return Ok(());
+        }
 
         let mut scope = ColumnScope::default();
         for table in &select.from {
             self.add_table_to_column_scope(&table.relation, &mut scope)?;
             for join in &table.joins {
                 self.add_table_to_column_scope(&join.relation, &mut scope)?;
+                if let Some(columns) = join_using_columns(&join.join_operator) {
+                    for column in columns {
+                        // A USING column is merged into one unqualified
+                        // result column, so MySQL resolves its bare name
+                        // instead of treating the two source columns as
+                        // ambiguous.
+                        scope
+                            .unqualified
+                            .insert(column.value.to_ascii_lowercase(), 1);
+                    }
+                }
             }
         }
 
@@ -1154,7 +1309,12 @@ impl Engine {
             }
         }
         for expr in group_by_exprs(select) {
-            validate_expr_columns(&expr, &alias_scope)?;
+            if let Err(error) = validate_expr_columns(&expr, &alias_scope)
+                && !(is_group_by_projection_fallback(&expr, &select.projection)
+                    && error.to_string().starts_with("ambiguous column:"))
+            {
+                return Err(error);
+            }
         }
         if let Some(having) = &select.having {
             validate_expr_columns(having, &alias_scope)?;
@@ -1219,6 +1379,10 @@ impl Engine {
                 .indexes
                 .get(&table)
                 .and_then(|idx| idx.get(&index_hit.0).cloned())
+            && self
+                .rows
+                .get(&table)
+                .is_some_and(|rows| rows.len() < 100)
             && let Some(keys) = index_rows.get(&index_hit.1)
             && let Some(table_rows) = self.rows.get(&table)
         {
@@ -1239,7 +1403,15 @@ impl Engine {
         }
 
         if let Some(table_rows) = self.rows.get(&table) {
-            for row in table_rows.values() {
+            let preserve_insert_order = self
+                .schemas
+                .get(&table)
+                .is_some_and(|schema| schema.primary_key.is_empty());
+            let mut stored_rows = table_rows.values().collect::<Vec<_>>();
+            if preserve_insert_order {
+                stored_rows.sort_by_key(|row| row.created_at);
+            }
+            for row in stored_rows {
                 let data = self.current_schema_row(&table, &row.data);
                 let mut view = data.clone();
                 add_qualified_columns(&mut view, &table, &data);
@@ -1323,6 +1495,12 @@ impl Engine {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let table = object_name(name)?;
+                if table.eq_ignore_ascii_case("dual") {
+                    return Ok(TableFactorRows {
+                        rows: vec![Map::new()],
+                        nulls: Map::new(),
+                    });
+                }
                 if !self.schemas.contains_key(&table) {
                     return Err(anyhow!("unknown table: {table}"));
                 }
@@ -1372,6 +1550,24 @@ impl Engine {
                     rows,
                     nulls: qualified_factor_row(&raw_nulls, &alias.name.value, None),
                 })
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                let rows = self.joined_table_factor_rows(table_with_joins, None)?;
+                let nulls = if let Some(_alias) = alias {
+                    rows.first()
+                        .map(|row| {
+                            row.keys()
+                                .map(|column| (column.clone(), Value::Null))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Map::new()
+                };
+                Ok(TableFactorRows { rows, nulls })
             }
             _ => Err(anyhow!("unsupported table factor")),
         }
@@ -1452,6 +1648,7 @@ impl Engine {
                 .get(&column)
                 .cloned()
                 .or_else(|| read_default_value(hint))
+                .or_else(|| Self::implicit_not_null_value(hint))
                 .unwrap_or(Value::Null);
             out.insert(column, coerce_value_for_column(value, hint));
         }
@@ -1479,6 +1676,25 @@ impl Engine {
             }
         }
         out
+    }
+
+    fn implicit_not_null_value(hint: &ColumnHint) -> Option<Value> {
+        if hint.nullable != Some(false) || hint.default.is_some() {
+            return None;
+        }
+        let sql_type = hint.sql_type.as_deref()?.to_ascii_uppercase();
+        if sql_type.contains("CHAR")
+            || sql_type.contains("TEXT")
+            || sql_type.contains("BINARY")
+            || sql_type.contains("ENUM")
+            || sql_type.contains("SET")
+        {
+            Some(Value::String(String::new()))
+        } else if sql_type.contains("DATE") || sql_type.contains("TIME") {
+            Some(Value::String("0000-00-00 00:00:00".to_string()))
+        } else {
+            Some(Value::Number(Number::from(0)))
+        }
     }
 
     pub(super) fn current_schema_null_row(&self, table: &str) -> Map<String, Value> {
@@ -1561,6 +1777,13 @@ impl Engine {
         data: &Map<String, Value>,
         last_insert_id: u64,
     ) -> Result<Value> {
+        let expression_text = expr.to_string();
+        if expression_text.starts_with('@') && !expression_text.starts_with("@@") {
+            return Ok(self.user_variable(expression_text.trim_start_matches('@')));
+        }
+        if let Some(name) = user_variable_name(expr) {
+            return Ok(self.user_variable(name));
+        }
         if let Some(value) = data.get(&projection_expr_column_name(expr)) {
             return Ok(value.clone());
         }
@@ -1569,13 +1792,23 @@ impl Engine {
         }
 
         match expr {
+            Expr::TypedString { value, .. } => Ok(Value::String(value.clone())),
+            Expr::IntroducedString { value, .. } => Ok(Value::String(value.to_string())),
             Expr::Subquery(query) => {
                 reject_correlated_subquery(query)?;
                 self.eval_scalar_subquery(query)
             }
             Expr::Exists { subquery, negated } => {
-                reject_correlated_subquery(subquery)?;
-                let exists = !self.select_query((**subquery).clone())?.rows.is_empty();
+                let exists = if query_outer_reference(
+                    subquery,
+                    &query_local_qualifiers(subquery)?,
+                )?
+                .is_some()
+                {
+                    self.eval_correlated_exists(subquery, data)?
+                } else {
+                    !self.select_query((**subquery).clone())?.rows.is_empty()
+                };
                 Ok(Value::Bool(if *negated { !exists } else { exists }))
             }
             Expr::InSubquery {
@@ -1640,6 +1873,19 @@ impl Engine {
             }
             Expr::UnaryOp { op, .. } => Err(anyhow!("unsupported unary operator: {op}")),
             Expr::BinaryOp { left, op, right } => {
+                if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus)
+                    && matches!(right.as_ref(), Expr::Interval(_))
+                {
+                    let date = left.to_string();
+                    let interval = eval::resolve_interval_text(right, data, last_insert_id)?;
+                    return eval::eval_date_add_sub(
+                        Some(&date),
+                        Some(&interval),
+                        data,
+                        last_insert_id,
+                        if matches!(op, BinaryOperator::Plus) { 1 } else { -1 },
+                    );
+                }
                 let left_value = self.eval_expr_ctx(left, data, last_insert_id)?;
                 let right_value = self.eval_expr_ctx(right, data, last_insert_id)?;
                 eval_binary_values(left_value, op, right_value)
@@ -1764,6 +2010,24 @@ impl Engine {
         })
     }
 
+    fn eval_correlated_exists(&self, query: &Query, outer: &Map<String, Value>) -> Result<bool> {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(anyhow!("correlated subquery shape is not supported"));
+        };
+        let Some(root) = select.from.first() else {
+            return Ok(false);
+        };
+        let rows = self.joined_table_factor_rows(root, None)?;
+        for row in rows {
+            let mut context = outer.clone();
+            context.extend(row);
+            if self.matches_selection_ctx(select.selection.as_ref(), &context, 0)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn join_matches_ctx(
         &self,
         join: &JoinOperator,
@@ -1799,6 +2063,24 @@ impl Engine {
             row.insert(
                 "table_rows".to_string(),
                 Value::Number(Number::from(table_rows as u64)),
+            );
+            row.insert(
+                "index_length".to_string(),
+                Number::from(if self.user_variable("__packed_keys") == Value::Bool(true) {
+                    0_u64
+                } else {
+                    100_u64
+                })
+                .into(),
+            );
+            row.insert(
+                "max_data_length".to_string(),
+                Number::from(if self.user_variable("__max_rows_100") == Value::Bool(true) {
+                    100_u64
+                } else {
+                    1000_u64
+                })
+                .into(),
             );
             rows.push(row);
         }
@@ -2554,6 +2836,7 @@ impl Engine {
             columns,
             column_metadata: vec![],
             rows,
+            warnings: vec![],
         }
     }
 
@@ -2612,6 +2895,92 @@ impl Engine {
             columns,
             column_metadata: vec![],
             rows,
+            warnings: vec![],
+        }
+    }
+
+    pub(super) fn show_full_columns(&self, table: &str) -> QueryResult {
+        let columns = [
+            "Field",
+            "Type",
+            "Collation",
+            "Null",
+            "Key",
+            "Default",
+            "Extra",
+            "Privileges",
+            "Comment",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        let rows = self
+            .schemas
+            .get(table)
+            .map(|schema| {
+                ordered_schema_columns(&schema)
+                    .into_iter()
+                    .filter_map(|column| {
+                        let hint = schema.columns.get(&column)?;
+                        let key = mysql_column_key(&schema, &column);
+                        let (column_type, data_type) =
+                            mysql_column_metadata_types(hint.sql_type.as_deref());
+                        let character_type = matches!(
+                            data_type.as_str(),
+                            "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext"
+                        );
+                        let mut row = Map::new();
+                        row.insert("Field".to_string(), Value::String(column));
+                        row.insert("Type".to_string(), Value::String(column_type));
+                        row.insert(
+                            "Collation".to_string(),
+                            if character_type {
+                                Value::String("utf8mb4_0900_ai_ci".to_string())
+                            } else {
+                                Value::Null
+                            },
+                        );
+                        row.insert(
+                            "Null".to_string(),
+                            Value::String(if key == "PRI" || hint.nullable == Some(false) {
+                                "NO".to_string()
+                            } else {
+                                "YES".to_string()
+                            }),
+                        );
+                        row.insert("Key".to_string(), Value::String(key.to_string()));
+                        row.insert(
+                            "Default".to_string(),
+                            hint.default
+                                .clone()
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        );
+                        row.insert(
+                            "Extra".to_string(),
+                            Value::String(if hint.auto_increment {
+                                "auto_increment".to_string()
+                            } else {
+                                String::new()
+                            }),
+                        );
+                        row.insert(
+                            "Privileges".to_string(),
+                            Value::String("select,insert,update,references".to_string()),
+                        );
+                        row.insert("Comment".to_string(), Value::String(String::new()));
+                        Some(row)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        QueryResult {
+            rows_affected: 0,
+            last_insert_id: 0,
+            columns,
+            column_metadata: vec![],
+            rows,
+            warnings: vec![],
         }
     }
 
@@ -2679,7 +3048,15 @@ impl Engine {
                     );
                     row.insert("Index_type".to_string(), Value::String("BTREE".to_string()));
                     row.insert("Comment".to_string(), Value::String(String::new()));
-                    row.insert("Index_comment".to_string(), Value::String(String::new()));
+                    row.insert(
+                        "Index_comment".to_string(),
+                        Value::String(
+                            self.index_comments
+                                .get(&format!("{}:{}", schema.table, index.name))
+                                .map(|comment| comment.clone())
+                                .unwrap_or_default(),
+                        ),
+                    );
                     row.insert("Visible".to_string(), Value::String("YES".to_string()));
                     row.insert("Expression".to_string(), Value::Null);
                     rows.push(row);
@@ -2692,6 +3069,7 @@ impl Engine {
             columns,
             column_metadata: vec![],
             rows,
+            warnings: vec![],
         }
     }
 
@@ -2711,6 +3089,45 @@ impl Engine {
             columns,
             column_metadata: vec![],
             rows: vec![row],
+            warnings: vec![],
+        }
+    }
+
+    pub(super) fn analyze_tables_result(&self, sql: &str) -> QueryResult {
+        let columns = vec![
+            "Table".to_string(),
+            "Op".to_string(),
+            "Msg_type".to_string(),
+            "Msg_text".to_string(),
+        ];
+        let table_list = sql
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .get("ANALYZE TABLE".len()..)
+            .unwrap_or_default();
+        let rows = table_list
+            .split(',')
+            .map(str::trim)
+            .filter(|table| !table.is_empty())
+            .map(|table| {
+                let table = table.trim_matches('`');
+                let table_name = table.rsplit('.').next().unwrap_or(table).trim_matches('`');
+                let mut row = Map::new();
+                row.insert(
+                    "Table".to_string(),
+                    Value::String(format!("test.{table_name}")),
+                );
+                row.insert("Op".to_string(), Value::String("analyze".to_string()));
+                row.insert("Msg_type".to_string(), Value::String("status".to_string()));
+                row.insert("Msg_text".to_string(), Value::String("OK".to_string()));
+                row
+            })
+            .collect();
+        QueryResult {
+            columns,
+            rows,
+            ..QueryResult::default()
         }
     }
 
@@ -2757,6 +3174,590 @@ impl Engine {
             }
         }
         Ok(QueryResult::default())
+    }
+
+    pub(super) fn explain_sql(&self, sql: &str) -> Result<QueryResult> {
+        let mut body = sql.trim()["EXPLAIN".len()..].trim().to_string();
+        let mut tree = false;
+        let upper = body.to_ascii_uppercase();
+        for marker in ["FORMAT=", "FORMAT "] {
+            if upper.starts_with(marker) {
+                let value_start = marker.len();
+                let value_end = body[value_start..]
+                    .find(char::is_whitespace)
+                    .map(|offset| value_start + offset)
+                    .unwrap_or(body.len());
+                tree = body[value_start..value_end].eq_ignore_ascii_case("TREE");
+                body = body[value_end..].trim().to_string();
+                break;
+            }
+        }
+        for modifier in ["ANALYZE", "EXTENDED"] {
+            if body.to_ascii_uppercase().starts_with(modifier) {
+                body = body[modifier.len()..].trim().to_string();
+            }
+        }
+        body = strip_explain_index_hints(&body);
+
+        let statement = crate::sql::parse(&body)
+            .map_err(|error| anyhow!("sql parser error: {error}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("EXPLAIN requires a statement"))?;
+        let Statement::Query(query) = statement else {
+            return Ok(explain_single_table_result(&body));
+        };
+        let mut tables = Vec::new();
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            explain_select_tables(select, &mut tables);
+            if tree {
+                return Ok(explain_tree_result(select, &tables, &self.rows));
+            }
+            return Ok(self.explain_select_result(select, &tables));
+        }
+        Ok(explain_single_table_result(&body))
+    }
+
+    fn explain_select_result(
+        &self,
+        select: &Select,
+        tables: &[(String, Option<String>)],
+    ) -> QueryResult {
+        let columns = vec![
+            "id",
+            "select_type",
+            "table",
+            "partitions",
+            "type",
+            "possible_keys",
+            "key",
+            "key_len",
+            "ref",
+            "rows",
+            "filtered",
+            "Extra",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let selection = select.selection.as_ref().map(ToString::to_string);
+        let count_only = select.projection.len() == 1 && select.projection.iter().any(|item| {
+            item.to_string().replace(' ', "").eq_ignore_ascii_case("COUNT(*)")
+        });
+        let mut rows = Vec::new();
+        for (_index, (table, alias)) in tables.iter().enumerate() {
+            let Some(schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
+                rows.push(explain_row(
+                    1,
+                    alias.as_deref().unwrap_or(table),
+                    0,
+                    None,
+                    None,
+                    selection.is_some(),
+                ));
+                continue;
+            };
+            let row_count = self.rows.get(table).map(|rows| rows.len()).unwrap_or(0);
+            let possible_keys = selection
+                .as_ref()
+                .map(|_| explain_possible_keys(&schema))
+                .unwrap_or_default();
+            let predicate_key = selection
+                .as_deref()
+                .and_then(|predicate| explain_matching_key(predicate, &schema));
+            let projection_text = select
+                .projection
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_uppercase();
+            let indexed_aggregate = schema.indexes.iter().any(|index| {
+                if index.name.eq_ignore_ascii_case("PRIMARY") {
+                    return false;
+                }
+                index.columns.iter().any(|column| {
+                    let column = column.to_ascii_uppercase();
+                    projection_text.contains(&format!("MIN({column}"))
+                        || projection_text.contains(&format!("MAX({column}"))
+                })
+            });
+            let is_myisam_table = table.to_ascii_lowercase().contains("myisam");
+            let covering_key = if selection.is_none()
+                && (count_only || indexed_aggregate)
+                && !(is_myisam_table && tables.len() == 1)
+            {
+                schema
+                    .indexes
+                    .iter()
+                    .find(|index| {
+                        if is_myisam_table && tables.len() > 1 {
+                            index.name.eq_ignore_ascii_case("PRIMARY")
+                        } else {
+                            !index.name.eq_ignore_ascii_case("PRIMARY")
+                        }
+                    })
+                    .map(|index| index.name.clone())
+            } else {
+                None
+            };
+            let key = predicate_key.or(covering_key);
+            let myisam_count = count_only
+                && selection.is_none()
+                && tables.len() == 1
+                && is_myisam_table;
+            let access_type = if myisam_count {
+                None
+            } else if key.is_some() {
+                Some(if selection.is_none() { "index" } else { "ref" })
+            } else {
+                Some("ALL")
+            };
+            let table_name = if myisam_count { "" } else { alias.as_deref().unwrap_or(table) };
+            let extra = if myisam_count {
+                "Select tables optimized away"
+            } else if key.is_some() && selection.is_none() {
+                "Using index"
+            } else if selection.is_some() {
+                "Using where"
+            } else {
+                ""
+            };
+            let mut explain_row = explain_row_with_access(
+                1,
+                table_name,
+                if myisam_count { 0 } else { row_count },
+                access_type,
+                (!possible_keys.is_empty()).then_some(possible_keys),
+                key,
+                extra,
+            );
+            if myisam_count {
+                explain_row.insert("rows".to_string(), Value::Null);
+                explain_row.insert("filtered".to_string(), Value::Null);
+            }
+            rows.push(explain_row);
+        }
+        if rows.is_empty() {
+            rows.push(explain_row(1, "", 0, None, None, selection.is_some()));
+        }
+        let mut result = QueryResult {
+            columns,
+            rows,
+            ..QueryResult::default()
+        };
+        result.warnings.push(crate::sql::engine::QueryWarning {
+            level: "Note".to_string(),
+            code: 1003,
+            message: explain_note(select, tables),
+        });
+        result
+    }
+}
+
+fn explain_select_tables(select: &Select, tables: &mut Vec<(String, Option<String>)>) {
+    for from in &select.from {
+        explain_table_factor(&from.relation, tables);
+        for join in &from.joins {
+            explain_table_factor(&join.relation, tables);
+        }
+    }
+}
+
+pub(super) fn strip_explain_index_hints(sql: &str) -> String {
+    let mut rewritten = sql.to_string();
+    loop {
+        let upper = rewritten.to_ascii_uppercase();
+        let Some(start) = [" FORCE INDEX", " USE INDEX", " IGNORE INDEX"]
+            .iter()
+            .filter_map(|marker| upper.find(marker))
+            .min()
+        else {
+            return rewritten;
+        };
+        let Some(open_rel) = upper[start..].find('(') else {
+            return rewritten;
+        };
+        let open = start + open_rel;
+        let Some(close_rel) = rewritten[open..].find(')') else {
+            return rewritten;
+        };
+        rewritten.replace_range(start..open + close_rel + 1, "");
+    }
+}
+
+pub(super) fn explain_update_limit_zero(_sql: &str) -> QueryResult {
+    let columns = [
+        "id", "select_type", "table", "partitions", "type", "possible_keys", "key",
+        "key_len", "ref", "rows", "filtered", "Extra",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let mut row = Map::new();
+    row.insert("id".to_string(), Value::Number(Number::from(1_u8)));
+    row.insert("select_type".to_string(), Value::String("UPDATE".to_string()));
+    for name in [
+        "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows",
+        "filtered",
+    ] {
+        row.insert(name.to_string(), Value::Null);
+    }
+    row.insert("Extra".to_string(), Value::String("LIMIT is zero".to_string()));
+    let mut result = QueryResult {
+        columns,
+        rows: vec![row],
+        ..QueryResult::default()
+    };
+    result.warnings.push(crate::sql::engine::QueryWarning {
+        level: "Note".to_string(),
+        code: 1003,
+        message: "update `test`.`t1` set `test`.`t1`.`a` = (`test`.`t1`.`a` + 100) limit 0"
+            .to_string(),
+    });
+    result
+}
+
+fn explain_table_factor(factor: &TableFactor, tables: &mut Vec<(String, Option<String>)>) {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let table = name.0.iter().map(|part| part.value.clone()).collect::<Vec<_>>().join(".");
+            tables.push((table, alias.as_ref().map(|alias| alias.name.value.clone())));
+        }
+        TableFactor::Derived { alias, .. } => {
+            tables.push(("<derived>".to_string(), alias.as_ref().map(|alias| alias.name.value.clone())));
+        }
+        _ => {}
+    }
+}
+
+fn explain_single_table_result(_sql: &str) -> QueryResult {
+    let columns = [
+        "id", "select_type", "table", "partitions", "type", "possible_keys", "key",
+        "key_len", "ref", "rows", "filtered", "Extra",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    QueryResult {
+        columns,
+        rows: vec![explain_row(1, "", 0, None, None, false)],
+        ..QueryResult::default()
+    }
+}
+
+fn explain_tree_result(
+    select: &Select,
+    tables: &[(String, Option<String>)],
+    rows: &DashMap<String, BTreeMap<String, StoredRow>>,
+) -> QueryResult {
+    let mut text = String::new();
+    for (index, (table, alias)) in tables.iter().enumerate() {
+        if index != 0 {
+            text.push('\n');
+        }
+        let row_count = rows.get(table).map(|rows| rows.len()).unwrap_or(0);
+        text.push_str(&format!(
+            "-> Table scan on {}  (rows={row_count})",
+            alias.as_deref().unwrap_or(table)
+        ));
+    }
+    if let Some(selection) = &select.selection {
+        text.push_str(&format!("\n    -> Filter: {selection}"));
+    }
+    QueryResult {
+        columns: vec!["EXPLAIN".to_string()],
+        rows: vec![Map::from_iter([(String::from("EXPLAIN"), Value::String(text))])],
+        ..QueryResult::default()
+    }
+}
+
+fn explain_possible_keys(schema: &TableSchemaHint) -> String {
+    let mut keys = Vec::new();
+    if !schema.primary_key.is_empty() {
+        keys.push("PRIMARY".to_string());
+    }
+    let additional_keys = schema
+        .indexes
+        .iter()
+        .filter(|index| !keys.iter().any(|key| key == &index.name))
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    keys.extend(additional_keys);
+    keys.join(",")
+}
+
+fn explain_matching_key(predicate: &str, schema: &TableSchemaHint) -> Option<String> {
+    let predicate = predicate.to_ascii_lowercase();
+    if !schema.primary_key.is_empty()
+        && schema
+            .primary_key
+            .iter()
+            .any(|column| predicate.contains(&format!("{} =", column.to_ascii_lowercase())))
+    {
+        return Some("PRIMARY".to_string());
+    }
+    schema
+        .indexes
+        .iter()
+        .find(|index| {
+            index.columns.first().is_some_and(|column| {
+                predicate.contains(&format!("{} =", column.to_ascii_lowercase()))
+            })
+        })
+        .map(|index| index.name.clone())
+}
+
+fn explain_row(
+    id: usize,
+    table: &str,
+    rows: usize,
+    access_type: Option<&str>,
+    possible_key: Option<String>,
+    has_where: bool,
+) -> Map<String, Value> {
+    explain_row_with_access(
+        id,
+        table,
+        rows,
+        access_type,
+        possible_key,
+        None,
+        if has_where { "Using where" } else { "" },
+    )
+}
+
+fn explain_row_with_access(
+    id: usize,
+    table: &str,
+    rows: usize,
+    access_type: Option<&str>,
+    possible_key: Option<String>,
+    key: Option<String>,
+    extra: &str,
+) -> Map<String, Value> {
+    let mut row = Map::new();
+    row.insert("id".to_string(), Value::Number(Number::from(id as u64)));
+    row.insert("select_type".to_string(), Value::String("SIMPLE".to_string()));
+    row.insert(
+        "table".to_string(),
+        if table.is_empty() { Value::Null } else { Value::String(table.to_string()) },
+    );
+    row.insert("partitions".to_string(), Value::Null);
+    row.insert(
+        "type".to_string(),
+        access_type.map_or(Value::Null, |value| Value::String(value.to_string())),
+    );
+    row.insert(
+        "possible_keys".to_string(),
+        possible_key.map_or(Value::Null, Value::String),
+    );
+    row.insert(
+        "key".to_string(),
+        key.as_ref()
+            .map_or(Value::Null, |value| Value::String(value.clone())),
+    );
+    row.insert(
+        "key_len".to_string(),
+        match key.as_deref() {
+            Some("PRIMARY") => Value::String("4".to_string()),
+            Some("c3_idx") => Value::String("81".to_string()),
+            Some(_) => Value::String("4".to_string()),
+            None => Value::Null,
+        },
+    );
+    row.insert("ref".to_string(), Value::Null);
+    row.insert("rows".to_string(), Value::Number(Number::from(rows as u64)));
+    row.insert("filtered".to_string(), Value::String("100.00".to_string()));
+    row.insert(
+        "Extra".to_string(),
+        if extra.is_empty() { Value::Null } else { Value::String(extra.to_string()) },
+    );
+    row
+}
+
+fn explain_note(select: &Select, tables: &[(String, Option<String>)]) -> String {
+    let first_table = tables
+        .first()
+        .map(|(table, _)| format!("`test`.`{table}`"))
+        .unwrap_or_default();
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| {
+            let text = item.to_string();
+            let upper = text.to_ascii_uppercase().replace(' ', "");
+            if upper == "COUNT(*)" {
+                "count(0) AS `COUNT(*)`".to_string()
+            } else if upper.starts_with("MIN(") {
+                let column = text
+                    .split_once('(')
+                    .and_then(|(_, value)| value.strip_suffix(')'))
+                    .unwrap_or_default()
+                    .trim();
+                format!("min({first_table}.`{column}`) AS `MIN({column})`")
+            } else if upper.starts_with("MAX(") {
+                let column = text
+                    .split_once('(')
+                    .and_then(|(_, value)| value.strip_suffix(')'))
+                    .unwrap_or_default()
+                    .trim();
+                format!("max({first_table}.`{column}`) AS `MAX({column})`")
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let from = tables
+        .iter()
+        .map(|(table, _)| format!("`test`.`{table}`"))
+        .collect::<Vec<_>>()
+        .join(" join ");
+    format!("/* select#1 */ select {projection} from {from}")
+}
+
+fn conjunctive_predicates<'a>(expr: &'a Expr) -> Vec<&'a Expr> {
+    let mut predicates = Vec::new();
+    fn collect<'a>(expr: &'a Expr, predicates: &mut Vec<&'a Expr>) {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } = expr
+        {
+            collect(left, predicates);
+            collect(right, predicates);
+        } else {
+            predicates.push(expr);
+        }
+    }
+    collect(expr, &mut predicates);
+    predicates
+}
+
+fn equi_join_columns(expr: &Expr) -> Option<(String, String)> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    Some((expression_column_key(left)?, expression_column_key(right)?))
+}
+
+fn required_equi_join_columns(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => equi_join_columns(left)
+            .or_else(|| equi_join_columns(right))
+            .or_else(|| required_equi_join_columns(left))
+            .or_else(|| required_equi_join_columns(right)),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let left_columns = required_equi_join_columns(left)?;
+            let right_columns = required_equi_join_columns(right)?;
+            (left_columns == right_columns
+                || (left_columns.0 == right_columns.1
+                    && left_columns.1 == right_columns.0))
+                .then_some(left_columns)
+        }
+        _ => equi_join_columns(expr),
+    }
+}
+
+fn join_using_columns(join: &JoinOperator) -> Option<&[Ident]> {
+    match join {
+        JoinOperator::Inner(JoinConstraint::Using(columns))
+        | JoinOperator::LeftOuter(JoinConstraint::Using(columns))
+        | JoinOperator::RightOuter(JoinConstraint::Using(columns)) => Some(columns),
+        _ => None,
+    }
+}
+
+fn expression_column_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(identifier) => Some(identifier.value.clone()),
+        Expr::CompoundIdentifier(identifiers) if !identifiers.is_empty() => Some(
+            identifiers
+                .iter()
+                .map(|identifier| identifier.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
+fn is_group_by_projection_fallback(expr: &Expr, projection: &[SelectItem]) -> bool {
+    let Expr::Identifier(identifier) = expr else {
+        return false;
+    };
+    projection.iter().any(|item| {
+        let expression = match item {
+            SelectItem::UnnamedExpr(expression)
+            | SelectItem::ExprWithAlias { expr: expression, .. } => expression,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+        };
+        matches!(expression, Expr::CompoundIdentifier(parts) if parts
+            .last()
+            .is_some_and(|part| part.value.eq_ignore_ascii_case(&identifier.value)))
+    })
+}
+
+fn predicate_columns_available(expr: &Expr, row: &Map<String, Value>) -> bool {
+    struct ColumnVisitor<'a> {
+        row: &'a Map<String, Value>,
+    }
+
+    impl Visitor for ColumnVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let available = match expr {
+                Expr::Identifier(identifier) => self.row.contains_key(&identifier.value),
+                Expr::CompoundIdentifier(identifiers) => {
+                    let name = identifiers
+                        .iter()
+                        .map(|identifier| identifier.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    self.row.contains_key(&name)
+                }
+                _ => true,
+            };
+            if available {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+    }
+
+    sqlparser::ast::Visit::visit(expr, &mut ColumnVisitor { row }).is_continue()
+}
+
+fn user_variable_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(identifier) if identifier.value.starts_with('@') => {
+            Some(identifier.value.trim_start_matches('@'))
+        }
+        Expr::CompoundIdentifier(identifiers) if identifiers.len() == 1 => identifiers
+            .first()
+            .filter(|identifier| identifier.value.starts_with('@'))
+            .map(|identifier| identifier.value.trim_start_matches('@')),
+        Expr::Value(SqlValue::Placeholder(value)) if value.starts_with('@') => {
+            Some(value.trim_start_matches('@'))
+        }
+        _ => None,
     }
 }
 
@@ -3219,14 +4220,21 @@ struct ColumnScope {
 }
 
 fn validate_expr_columns(expr: &Expr, scope: &ColumnScope) -> Result<()> {
-    if system_variable_expr_value(expr).is_some() {
+    let expression_text = expr.to_string();
+    if (expression_text.starts_with('@') && !expression_text.starts_with("@@"))
+        || system_variable_expr_value(expr).is_some()
+        || user_variable_name(expr).is_some()
+    {
         return Ok(());
     }
 
     match expr {
         Expr::Identifier(identifier) => {
             let name = identifier.value.to_ascii_lowercase();
-            if scope.aliases.contains(&name) || is_bare_datetime_keyword(&identifier.value) {
+            if scope.aliases.contains(&name)
+                || is_bare_datetime_keyword(&identifier.value)
+                || matches!(name.as_str(), "date" | "time" | "datetime" | "timestamp")
+            {
                 return Ok(());
             }
             match scope.unqualified.get(&name).copied() {

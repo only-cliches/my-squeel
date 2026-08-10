@@ -116,6 +116,24 @@ pub(super) fn parse_show_columns_table(sql: &str) -> Option<String> {
         .and_then(|idx| tokens.get(idx + 1).cloned())
 }
 
+pub(super) fn parse_show_full_columns_table(sql: &str) -> Option<String> {
+    let tokens = normalized_sql_tokens(sql);
+    let upper = tokens
+        .iter()
+        .map(|token| token.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    if upper.first()? != "SHOW"
+        || upper.get(1)? != "FULL"
+        || !matches!(upper.get(2).map(String::as_str), Some("COLUMNS" | "FIELDS"))
+    {
+        return None;
+    }
+    upper
+        .iter()
+        .position(|token| token == "FROM" || token == "IN")
+        .and_then(|idx| tokens.get(idx + 1).cloned())
+}
+
 pub(super) fn parse_describe_table(sql: &str) -> Option<String> {
     let tokens = normalized_sql_tokens(sql);
     let first = tokens.first()?.to_ascii_uppercase();
@@ -184,12 +202,102 @@ pub(super) fn show_databases_result() -> QueryResult {
         columns: vec![column],
         column_metadata: vec![],
         rows,
+        warnings: vec![],
+    }
+}
+
+pub(super) fn show_global_variables_result() -> QueryResult {
+    let columns = vec!["Variable_name".to_string(), "Value".to_string()];
+    let variables = [
+        "version",
+        "version_comment",
+        "autocommit",
+        "sql_mode",
+        "time_zone",
+        "transaction_isolation",
+        "tx_isolation",
+        "character_set_client",
+        "character_set_connection",
+        "character_set_results",
+        "collation_connection",
+        "max_allowed_packet",
+        "have_innodb",
+        "have_ssl",
+        "performance_schema",
+    ];
+    let rows = variables
+        .into_iter()
+        .map(|name| {
+            let mut row = Map::new();
+            row.insert("Variable_name".to_string(), Value::String(name.to_string()));
+            row.insert("Value".to_string(), session_variable_default(name));
+            row
+        })
+        .collect();
+    QueryResult {
+        rows_affected: 0,
+        last_insert_id: 0,
+        columns,
+        column_metadata: vec![],
+        rows,
+        warnings: vec![],
+    }
+}
+
+pub(super) fn show_status_result(sql: &str) -> QueryResult {
+    let columns = vec!["Variable_name".to_string(), "Value".to_string()];
+    let mut rows = Vec::new();
+    if sql.to_ascii_uppercase().contains("THREADS_CONNECTED") {
+        let mut row = Map::new();
+        row.insert(
+            "Variable_name".to_string(),
+            Value::String("Threads_connected".to_string()),
+        );
+        row.insert("Value".to_string(), Value::String("1".to_string()));
+        rows.push(row);
+    }
+    QueryResult {
+        rows_affected: 0,
+        last_insert_id: 0,
+        columns,
+        column_metadata: vec![],
+        rows,
+        warnings: vec![],
     }
 }
 
 pub(super) fn select_system_variables(sql: &str) -> Option<QueryResult> {
-    let Ok(statements) = crate::sql::parse(sql) else {
+    if !sql.contains("@@") {
         return None;
+    }
+    let expression = sql
+        .trim()
+        .strip_prefix("SELECT")
+        .or_else(|| sql.trim().strip_prefix("select"))?
+        .trim();
+    if !expression.contains(',') {
+        let mut row = Map::new();
+        row.insert(expression.to_string(), system_variable_fallback(expression));
+        return Some(QueryResult {
+            rows_affected: 0,
+            last_insert_id: 0,
+            columns: vec![expression.to_string()],
+            column_metadata: vec![],
+            rows: vec![row],
+            warnings: vec![],
+        });
+    }
+    let Ok(statements) = crate::sql::parse(sql) else {
+        let mut row = Map::new();
+        row.insert(expression.to_string(), system_variable_fallback(expression));
+        return Some(QueryResult {
+            rows_affected: 0,
+            last_insert_id: 0,
+            columns: vec![expression.to_string()],
+            column_metadata: vec![],
+            rows: vec![row],
+            warnings: vec![],
+        });
     };
     let Some(Statement::Query(query)) = statements.into_iter().next() else {
         return None;
@@ -209,7 +317,7 @@ pub(super) fn select_system_variables(sql: &str) -> Option<QueryResult> {
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value)),
             _ => return None,
         };
-        let value = system_variable_expr_value(&expr)?;
+        let value = eval::eval_expr(&expr, &Map::new(), 0).unwrap_or(Value::Bool(false));
         let column = alias.unwrap_or_else(|| expr.to_string());
         columns.push(column.clone());
         row.insert(column, value);
@@ -220,7 +328,24 @@ pub(super) fn select_system_variables(sql: &str) -> Option<QueryResult> {
         columns,
         column_metadata: vec![],
         rows: vec![row],
+        warnings: vec![],
     })
+}
+
+fn system_variable_fallback(expression: &str) -> Value {
+    let normalized = expression
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != '`')
+        .collect::<String>();
+    if normalized.starts_with("@@")
+        && !normalized
+            .chars()
+            .any(|character| matches!(character, '=' | '&' | '|'))
+    {
+        session_variable_default(normalized.trim_start_matches("@@"))
+    } else {
+        Value::Bool(false)
+    }
 }
 
 pub(super) fn system_variable_expr_value(expr: &Expr) -> Option<Value> {
@@ -254,6 +379,10 @@ pub(super) fn session_variable_default(name: &str) -> Value {
         }
         "collation_connection" => Value::String("utf8mb4_general_ci".to_string()),
         "max_allowed_packet" => Value::Number(Number::from(67108864)),
+        "log_bin" => Value::Number(Number::from(0)),
+        "binlog_format" => Value::String("ROW".to_string()),
+        "sql_require_primary_key" => Value::Number(Number::from(0)),
+        "log_bin_trust_function_creators" => Value::Number(Number::from(1)),
         _ => Value::String(String::new()),
     }
 }

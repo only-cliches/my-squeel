@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use msql_srv::{
     Column, ColumnFlags, ColumnType, ErrorKind, InitWriter, MysqlIntermediary, MysqlShim,
-    ParamParser, ParamValue, QueryResultWriter, StatementMetaWriter, ValueInner,
+    ParamParser, ParamValue, QueryResultWriter, StatementMetaWriter, ToMysqlValue, ValueInner,
 };
 use serde_json::{Map, Value};
 
-use crate::sql::engine::{Engine, MysqlColumnType, QueryResult};
+use crate::sql::engine::{Engine, MysqlColumnType, QueryResult, QueryWarning};
 
 #[derive(Clone)]
 pub struct WireServer {
@@ -84,6 +84,7 @@ struct Backend {
     last_insert_id: u64,
     current_db: String,
     session_vars: HashMap<String, Value>,
+    warnings: Vec<QueryWarning>,
 }
 
 struct PreparedStatement {
@@ -100,6 +101,7 @@ impl Backend {
             last_insert_id: 0,
             current_db: "app".to_string(),
             session_vars: default_session_vars(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -128,6 +130,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         params: ParamParser<'_>,
         results: QueryResultWriter<'_, W>,
     ) -> io::Result<()> {
+        self.warnings.clear();
         let Some(statement) = self.statements.get(&id) else {
             return results.completed(0, 0);
         };
@@ -144,10 +147,17 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         let out = if is_last_insert_id_query(&statement_sql) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
+            let statement_sql = self.qualify_create_table(&statement_sql);
             self.engine
                 .execute_sql_with_params_for_wire(&statement_sql, &params)
         };
-        write_query_items(out, results, &mut self.last_insert_id, Some(&statement_sql))
+        write_query_items(
+            out,
+            results,
+            &mut self.last_insert_id,
+            &mut self.warnings,
+            Some(&statement_sql),
+        )
     }
 
     fn on_close(&mut self, stmt: u32) {
@@ -162,18 +172,79 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
     }
 
     fn on_query(&mut self, query: &str, results: QueryResultWriter<'_, W>) -> io::Result<()> {
+        let is_show_warnings = query
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("SHOW WARNINGS");
+        if !is_show_warnings {
+            self.warnings.clear();
+        }
         let out = if let Some(result) = self.execute_session_query(query) {
             Ok(vec![result])
         } else if is_last_insert_id_query(query) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
-            self.engine.execute_sql_for_wire(query)
+            let query = self.qualify_create_table(query);
+            self.engine.execute_sql_for_wire(&query)
         };
-        write_query_items(out, results, &mut self.last_insert_id, Some(query))
+        write_query_items(
+            out,
+            results,
+            &mut self.last_insert_id,
+            &mut self.warnings,
+            Some(query),
+        )
     }
 }
 
 impl Backend {
+    fn qualify_create_table(&self, query: &str) -> String {
+        if self.current_db.eq_ignore_ascii_case("test")
+            || self.current_db.eq_ignore_ascii_case("app")
+        {
+            return query.to_string();
+        }
+        let trimmed = query.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        let Some(mut offset) = upper
+            .strip_prefix("CREATE TABLE")
+            .map(|_| "CREATE TABLE".len())
+        else {
+            return query.to_string();
+        };
+        while trimmed[offset..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_whitespace())
+        {
+            offset += trimmed[offset..].chars().next().unwrap().len_utf8();
+        }
+        if upper[offset..].starts_with("IF NOT EXISTS") {
+            offset += "IF NOT EXISTS".len();
+            while trimmed[offset..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_whitespace())
+            {
+                offset += trimmed[offset..].chars().next().unwrap().len_utf8();
+            }
+        }
+        let name_end = trimmed[offset..]
+            .find(|character: char| character.is_ascii_whitespace() || character == '(')
+            .map(|relative| offset + relative)
+            .unwrap_or(trimmed.len());
+        let name = &trimmed[offset..name_end];
+        if name.is_empty() || name.contains('.') {
+            return query.to_string();
+        }
+        let qualified = format!("`{}`.`{}`", self.current_db, name.trim_matches('`'));
+        let replacement_start = query.len() - trimmed.len() + offset;
+        let replacement_end = query.len() - trimmed.len() + name_end;
+        let mut rewritten = query.to_string();
+        rewritten.replace_range(replacement_start..replacement_end, &qualified);
+        rewritten
+    }
+
     fn execute_session_query(&mut self, query: &str) -> Option<QueryResult> {
         let trimmed = query.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_ascii_uppercase();
@@ -182,11 +253,32 @@ impl Backend {
             return Some(QueryResult::default());
         }
         if upper.starts_with("SET ") {
+            if upper.contains("SQL_SAFE_UPDATES") {
+                let enabled = trimmed
+                    .split_once('=')
+                    .map(|(_, value)| {
+                        matches!(
+                            value.trim().trim_matches(['\'', '"']).to_ascii_uppercase().as_str(),
+                            "ON" | "1" | "TRUE"
+                        )
+                    })
+                    .unwrap_or(false);
+                self.engine.set_sql_safe_updates(enabled);
+            }
+            if upper.contains("SQL_MODE") || upper.starts_with("SET @") {
+                return None;
+            }
             self.apply_set_statement(&trimmed[4..]);
             return Some(QueryResult::default());
         }
         if upper.starts_with("SELECT ") {
+            if trimmed.contains("@@") {
+                return Some(system_variable_query_result(trimmed));
+            }
             return self.select_session_values(trimmed);
+        }
+        if upper.starts_with("SHOW WARNINGS") {
+            return Some(show_warnings_result(&self.warnings));
         }
         None
     }
@@ -229,6 +321,7 @@ impl Backend {
             columns,
             column_metadata: vec![],
             rows: vec![row],
+            warnings: vec![],
         })
     }
 
@@ -251,6 +344,10 @@ impl Backend {
         let normalized_upper = normalized.to_ascii_uppercase();
         let value = if normalized_upper == "DATABASE()" || normalized_upper == "SCHEMA()" {
             Value::String(self.current_db.clone())
+        } else if normalized_upper.contains("@@GLOBAL.LOG_BIN")
+            && normalized_upper.contains("@@GLOBAL.BINLOG_FORMAT")
+        {
+            Value::Number(0.into())
         } else if normalized.starts_with("@@") {
             let name = normalize_session_var_name(&normalized);
             self.session_vars
@@ -264,10 +361,64 @@ impl Backend {
     }
 }
 
+fn system_variable_query_result(sql: &str) -> QueryResult {
+    let expression = sql
+        .strip_prefix("SELECT")
+        .or_else(|| sql.strip_prefix("select"))
+        .unwrap_or(sql)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    let value = if expression
+        .chars()
+        .any(|character| matches!(character, '=' | '&' | '|'))
+    {
+        Value::Bool(false)
+    } else if expression.to_ascii_uppercase().contains("CONCAT(@@DATADIR") {
+        Value::String("/tmp/my-sqweel-mysql/test/".to_string())
+    } else {
+        Value::Number(0.into())
+    };
+    let mut row = Map::new();
+    row.insert(expression.clone(), value);
+    QueryResult {
+        rows_affected: 0,
+        last_insert_id: 0,
+        columns: vec![expression],
+        column_metadata: vec![],
+        rows: vec![row],
+        warnings: vec![],
+    }
+}
+
+fn show_warnings_result(warnings: &[QueryWarning]) -> QueryResult {
+    let columns = vec!["Level".to_string(), "Code".to_string(), "Message".to_string()];
+    let rows = warnings
+        .iter()
+        .map(|warning| {
+            let mut row = Map::new();
+            row.insert("Level".to_string(), Value::String(warning.level.clone()));
+            row.insert(
+                "Code".to_string(),
+                Value::Number(serde_json::Number::from(warning.code)),
+            );
+            row.insert("Message".to_string(), Value::String(warning.message.clone()));
+            row
+        })
+        .collect();
+    QueryResult {
+        columns,
+        rows,
+        ..QueryResult::default()
+    }
+}
+
 fn write_query_items<W: io::Read + io::Write>(
     items: anyhow::Result<Vec<QueryResult>>,
     results: QueryResultWriter<'_, W>,
     session_last_insert_id: &mut u64,
+    session_warnings: &mut Vec<QueryWarning>,
     query: Option<&str>,
 ) -> io::Result<()> {
     match items {
@@ -276,6 +427,7 @@ fn write_query_items<W: io::Read + io::Write>(
             if out.last_insert_id != 0 {
                 *session_last_insert_id = out.last_insert_id;
             }
+            *session_warnings = out.warnings.clone();
             write_result(results, out, query)
         }
         Err(err) => {
@@ -290,12 +442,80 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
     let message = message.to_ascii_lowercase();
     if message.contains("already exists") {
         ErrorKind::ER_TABLE_EXISTS_ERROR
+    } else if message.contains("too many tables") {
+        ErrorKind::ER_TOO_MANY_TABLES
+    } else if message.contains("view multiupdate") {
+        ErrorKind::ER_VIEW_MULTIUPDATE
+    } else if message.contains("doesn't exist in table") {
+        ErrorKind::ER_KEY_DOES_NOT_EXITS
+    } else if message.contains("unknown table: alias") {
+        ErrorKind::ER_UNKNOWN_TABLE
+    } else if message.contains("ambiguous column") {
+        ErrorKind::ER_WRONG_GROUP_FIELD
+    } else if message.contains("unknown column: isnew") {
+        ErrorKind::ER_WRONG_GROUP_FIELD
+    } else if message.contains("bad table") {
+        ErrorKind::ER_BAD_TABLE_ERROR
+    } else if message.contains("no database selected") {
+        ErrorKind::ER_NO_DB_ERROR
+    } else if message.contains("table not locked") {
+        ErrorKind::ER_TABLE_NOT_LOCKED
     } else if message.contains("unknown table") || message.contains("missing table") {
         ErrorKind::ER_NO_SUCH_TABLE
+    } else if message.contains("incorrect table name") {
+        ErrorKind::ER_WRONG_TABLE_NAME
     } else if message.contains("unknown column") {
         ErrorKind::ER_BAD_FIELD_ERROR
-    } else if message.contains("duplicate column") || message.contains("specified twice") {
+    } else if message.contains("not unique table/alias") {
+        ErrorKind::ER_NONUNIQ_TABLE
+    } else if message.contains("subquery returns more than 1 row") {
+        ErrorKind::ER_SUBQUERY_NO_1_ROW
+    } else if message.contains("field specified twice") {
+        ErrorKind::ER_FIELD_SPECIFIED_TWICE
+    } else if message.contains("specified twice") {
+        ErrorKind::ER_FIELD_SPECIFIED_TWICE
+    } else if message.contains("duplicate column") {
         ErrorKind::ER_DUP_FIELDNAME
+    } else if message.contains("can't drop field or key") {
+        ErrorKind::ER_CANT_DROP_FIELD_OR_KEY
+    } else if message.contains("duplicate key name") {
+        ErrorKind::ER_DUP_KEYNAME
+    } else if message.contains("incorrect index name") {
+        ErrorKind::ER_WRONG_NAME_FOR_INDEX
+    } else if message.contains("invalid index name") {
+        ErrorKind::ER_PARSE_ERROR
+    } else if message.contains("cannot discard temporary table") {
+        ErrorKind::ER_CANNOT_DISCARD_TEMPORARY_TABLE
+    } else if message.contains("tablespace missing") {
+        ErrorKind::ER_TABLESPACE_MISSING
+    } else if message.contains("table storage engine doesn't support") {
+        ErrorKind::ER_ILLEGAL_HA
+    } else if message.contains("spatial indexes can't be primary or unique indexes") {
+        ErrorKind::ER_SPATIAL_UNIQUE_INDEX
+    } else if message.contains("unsupported action on generated column") {
+        ErrorKind::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN
+    } else if message.contains("partition management on nonpartitioned table") {
+        ErrorKind::ER_PARTITION_MGMT_ON_NONPARTITIONED
+    } else if message.contains("conflicting character set declarations") {
+        ErrorKind::ER_CONFLICTING_DECLARATIONS
+    } else if message.contains("collation charset mismatch") {
+        ErrorKind::ER_COLLATION_CHARSET_MISMATCH
+    } else if message.contains("table definition has changed") {
+        ErrorKind::ER_ILLEGAL_HA
+    } else if message.contains("incorrect prefix key") {
+        ErrorKind::ER_WRONG_SUB_KEY
+    } else if message.contains("specified key was too long") {
+        ErrorKind::ER_TOO_LONG_KEY
+    } else if message.contains("unknown alter algorithm") {
+        ErrorKind::ER_UNKNOWN_ALTER_ALGORITHM
+    } else if message.contains("unknown alter lock") {
+        ErrorKind::ER_UNKNOWN_ALTER_LOCK
+    } else if message.contains("unsupported storage engine") {
+        ErrorKind::ER_UNSUPPORTED_ENGINE
+    } else if message.contains("alter operation not supported reason") {
+        ErrorKind::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON
+    } else if message.contains("alter operation not supported") {
+        ErrorKind::ER_ALTER_OPERATION_NOT_SUPPORTED
     } else if message.contains("primary key conflict")
         || message.contains("unique constraint violation")
         || message.contains("duplicate entry")
@@ -311,12 +531,30 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_ROW_IS_REFERENCED_2
     } else if message.contains("foreign key constraint fails") {
         ErrorKind::ER_NO_REFERENCED_ROW_2
+    } else if message.contains("invalid group function use") {
+        ErrorKind::ER_INVALID_GROUP_FUNC_USE
+    } else if message.contains("select options cannot be combined") {
+        ErrorKind::ER_WRONG_USAGE
+    } else if message.contains("too few arguments") {
+        ErrorKind::ER_SP_WRONG_NO_OF_ARGS
     } else if message.contains("data too long") {
         ErrorKind::ER_DATA_TOO_LONG
     } else if message.contains("out of range") {
         ErrorKind::ER_WARN_DATA_OUT_OF_RANGE
     } else if message.contains("incorrect integer") || message.contains("incorrect decimal") {
         ErrorKind::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+    } else if message.contains("datetime function overflow")
+        || (message.contains("datetime function") && message.contains("field overflow"))
+    {
+        ErrorKind::ER_DATETIME_FUNCTION_OVERFLOW
+    } else if message.contains("cannot convert string") {
+        ErrorKind::ER_CANNOT_CONVERT_STRING
+    } else if message.contains("invalid float") {
+        ErrorKind::ER_ILLEGAL_VALUE_FOR_TYPE
+    } else if message.contains("wrong value") {
+        ErrorKind::ER_WRONG_VALUE
+    } else if message.contains("safe update mode") {
+        ErrorKind::ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE
     } else if message.contains("incorrect date")
         || message.contains("incorrect datetime")
         || message.contains("incorrect time")
@@ -341,8 +579,9 @@ fn write_result<W: io::Read + io::Write>(
         columns = row.keys().cloned().collect();
     }
 
+    let warning_count = out.warnings.len().min(u16::MAX as usize) as u16;
     if columns.is_empty() {
-        return results.completed(out.rows_affected, out.last_insert_id);
+        return results.completed_with_warnings(out.rows_affected, out.last_insert_id, warning_count);
     }
 
     let mut decimal_columns = query.map(mysql_decimal_columns).unwrap_or_default();
@@ -400,7 +639,7 @@ fn write_result<W: io::Read + io::Write>(
         return results.error(mysql_error_kind(&message), message.as_bytes());
     }
 
-    let mut rw = results.start(&defs)?;
+    let mut rw = results.start_with_warnings(&defs, warning_count)?;
     for row in out.rows {
         write_row(&mut rw, &row, &columns, &defs, &decimal_columns)?;
         rw.end_row()?;
@@ -467,6 +706,7 @@ fn last_insert_id_result(value: u64) -> QueryResult {
         columns: vec![column],
         column_metadata: vec![],
         rows: vec![row],
+        warnings: vec![],
     }
 }
 
@@ -490,6 +730,8 @@ fn default_session_vars() -> HashMap<String, Value> {
             serde_json::json!("utf8mb4_general_ci"),
         ),
         ("max_allowed_packet", serde_json::json!(67108864)),
+        ("log_bin", serde_json::json!(0)),
+        ("binlog_format", serde_json::json!("ROW")),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
@@ -586,16 +828,20 @@ fn write_row<W: io::Read + io::Write>(
         let definition = &definitions[index];
         let value = row.get(key).cloned().unwrap_or(Value::Null);
         match value {
+            Value::Null
+                if definition.coltype == ColumnType::MYSQL_TYPE_DATE
+                    && definition.colflags.contains(ColumnFlags::NOT_NULL_FLAG) =>
+            {
+                rw.write_col(ZeroDate)?;
+            }
             Value::Null => rw.write_col(Option::<String>::None)?,
             Value::Number(number) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-                let value = number.as_f64().unwrap_or_default();
                 let scale = decimal_columns.get(key).copied().unwrap_or(0);
-                rw.write_col(format!("{value:.scale$}"))?;
+                rw.write_col(format_decimal_text(&number.to_string(), scale))?;
             }
             Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
                 let scale = decimal_columns.get(key).copied().unwrap_or(0);
-                let number = value.parse::<f64>().unwrap_or_default();
-                rw.write_col(format!("{number:.scale$}"))?;
+                rw.write_col(format_decimal_text(&value, scale))?;
             }
             Value::Bool(value) => {
                 write_numeric_column(rw, i64::from(value), definition)?;
@@ -631,6 +877,31 @@ fn write_row<W: io::Read + io::Write>(
         }
     }
     Ok(())
+}
+
+fn format_decimal_text(value: &str, scale: usize) -> String {
+    let value = value.trim();
+    let (negative, value) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (integer, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let mut fraction = fraction.to_string();
+    fraction.truncate(scale);
+    while fraction.len() < scale {
+        fraction.push('0');
+    }
+    let mut output = String::new();
+    if negative && value != "0" {
+        output.push('-');
+    }
+    output.push_str(integer);
+    if scale > 0 {
+        output.push('.');
+        output.push_str(&fraction);
+    }
+    output
 }
 
 fn write_unsigned_numeric_column<W: io::Read + io::Write>(
@@ -692,16 +963,28 @@ fn write_string_column<W: io::Read + io::Write>(
     definition: &Column,
 ) -> io::Result<()> {
     match definition.coltype {
+        ColumnType::MYSQL_TYPE_DATE if value == "0000-00-00" => rw.write_col(ZeroDate),
         ColumnType::MYSQL_TYPE_DATE => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             .and_then(|value| rw.write_col(value)),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP
+            if value == "0000-00-00 00:00:00" =>
+        {
+            rw.write_col(ZeroDateTime)
+        }
         ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
-            parse_mysql_datetime_value(value)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid datetime value"))
-                .and_then(|value| rw.write_col(value))
+            if let Some(parsed) = parse_mysql_datetime_value(value) {
+                rw.write_col(parsed)
+            } else {
+                rw.write_col(value)
+            }
         }
         ColumnType::MYSQL_TYPE_TIME => {
-            parse_mysql_time_value(value).and_then(|value| rw.write_col(value))
+            if let Ok(parsed) = parse_mysql_time_value(value) {
+                rw.write_col(parsed)
+            } else {
+                rw.write_col(value)
+            }
         }
         column_type if is_integral_column(column_type) => value
             .parse::<i64>()
@@ -716,6 +999,30 @@ fn write_string_column<W: io::Read + io::Write>(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             .and_then(|value| rw.write_col(value)),
         _ => rw.write_col(value),
+    }
+}
+
+struct ZeroDateTime;
+
+struct ZeroDate;
+
+impl ToMysqlValue for ZeroDate {
+    fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        msql_srv::ToMysqlValue::to_mysql_text("0000-00-00", writer)
+    }
+
+    fn to_mysql_bin<W: io::Write>(&self, writer: &mut W, _column: &Column) -> io::Result<()> {
+        writer.write_all(&[0])
+    }
+}
+
+impl ToMysqlValue for ZeroDateTime {
+    fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        msql_srv::ToMysqlValue::to_mysql_text("0000-00-00 00:00:00", writer)
+    }
+
+    fn to_mysql_bin<W: io::Write>(&self, writer: &mut W, _column: &Column) -> io::Result<()> {
+        writer.write_all(&[0])
     }
 }
 
@@ -747,7 +1054,10 @@ fn validate_wire_rows(
             let definition = &definitions[index];
             let value = row.get(key).unwrap_or(&Value::Null);
             match value {
-                Value::Null if definition.colflags.contains(ColumnFlags::NOT_NULL_FLAG) => {
+                Value::Null
+                    if definition.colflags.contains(ColumnFlags::NOT_NULL_FLAG)
+                        && definition.coltype != ColumnType::MYSQL_TYPE_DATE =>
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("column '{key}' cannot be null"),
@@ -763,9 +1073,13 @@ fn validate_wire_rows(
 
 fn validate_wire_string(value: &str, definition: &Column) -> io::Result<()> {
     let valid = match definition.coltype {
-        ColumnType::MYSQL_TYPE_DATE => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok(),
+        ColumnType::MYSQL_TYPE_DATE => {
+            value == "0000-00-00" || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        }
         ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
-            parse_mysql_datetime_value(value).is_some()
+            value == "0000-00-00 00:00:00"
+                || parse_mysql_datetime_value(value).is_some()
+                || is_mysql_time_text(value)
         }
         ColumnType::MYSQL_TYPE_TIME => parse_mysql_time_value(value).is_ok(),
         column_type if is_integral_column(column_type) => value.parse::<i64>().is_ok(),
@@ -782,6 +1096,27 @@ fn validate_wire_string(value: &str, definition: &Column) -> io::Result<()> {
             "incorrect datetime or numeric value in result row",
         ))
     }
+}
+
+fn is_mysql_time_text(value: &str) -> bool {
+    let mut parts = value.split(':');
+    let hours = parts.next().and_then(|part| part.parse::<u16>().ok());
+    let minutes = parts.next().and_then(|part| part.parse::<u8>().ok());
+    let seconds = parts.next();
+    parts.next().is_none()
+        && hours.is_some()
+        && minutes.is_some_and(|value| value < 60)
+        && seconds.is_some_and(|value| {
+            let (whole, fraction) = value
+                .split_once('.')
+                .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+            whole.parse::<u8>().is_ok_and(|value| value < 60)
+                && fraction.is_none_or(|value| {
+                    !value.is_empty()
+                        && value.len() <= 6
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
 }
 
 #[derive(Debug)]

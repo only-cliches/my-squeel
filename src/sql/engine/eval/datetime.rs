@@ -395,7 +395,78 @@ pub(super) fn eval_date_format(
     )))
 }
 
-pub(super) fn eval_date_add_sub(
+pub(super) fn eval_time_format(
+    time_arg: Option<&String>,
+    format_arg: Option<&String>,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let time = time_arg
+        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let format = format_arg
+        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if time == Value::Null || format == Value::Null {
+        return Ok(Value::Null);
+    }
+    let raw = json_scalar_to_string(&time);
+    let pieces = raw
+        .trim_start_matches(['-', '+'])
+        .split(':')
+        .collect::<Vec<_>>();
+    let hours = pieces.first().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let minutes = pieces.get(1).and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let seconds_text = pieces.get(2).copied().unwrap_or("0");
+    let seconds = seconds_text
+        .split('.').next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    let micros = seconds_text
+        .split_once('.')
+        .map(|(_, fraction)| {
+            let mut value = fraction.chars().take(6).collect::<String>().parse().unwrap_or(0);
+            for _ in fraction.chars().take(6).count()..6 {
+                value *= 10;
+            }
+            value
+        })
+        .unwrap_or(0);
+    let hour12 = match hours % 24 {
+        0 | 12 => 12,
+        hour => hour % 12,
+    };
+    let meridiem = if hours % 24 < 12 { "AM" } else { "PM" };
+    let format = json_scalar_to_string(&format);
+    let mut output = String::new();
+    let mut chars = format.chars();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        let Some(specifier) = chars.next() else { break };
+        output.push_str(match specifier {
+            'H' => format!("{hours:02}"),
+            'k' => hours.to_string(),
+            'h' | 'I' => format!("{hour12:02}"),
+            'l' => hour12.to_string(),
+            'i' => format!("{minutes:02}"),
+            's' | 'S' => format!("{seconds:02}"),
+            'f' => format!("{micros:06}"),
+            'p' => meridiem.to_string(),
+            'r' => format!("{hour12:02}:{minutes:02}:{seconds:02} {meridiem}"),
+            'T' => format!("{hours:02}:{minutes:02}:{seconds:02}"),
+            '%' => "%".to_string(),
+            other => format!("%{other}"),
+        }.as_str());
+    }
+    Ok(Value::String(output))
+}
+
+pub(crate) fn eval_date_add_sub(
     date_arg: Option<&String>,
     interval_arg: Option<&String>,
     data: &Map<String, Value>,
@@ -421,7 +492,59 @@ pub(super) fn eval_date_add_sub(
     let Some(result) = apply_mysql_interval(date, interval, direction) else {
         return Ok(Value::Null);
     };
-    Ok(Value::String(result.to_string()))
+    let date_only = !json_scalar_to_string(&date_value).contains(' ')
+        && matches!(
+            interval.unit,
+            MysqlIntervalUnit::Day
+                | MysqlIntervalUnit::Week
+                | MysqlIntervalUnit::Month
+                | MysqlIntervalUnit::Quarter
+                | MysqlIntervalUnit::Year
+        );
+    Ok(Value::String(if date_only {
+        result.date().to_string()
+    } else {
+        result.to_string()
+    }))
+}
+
+pub(super) fn eval_str_to_date(
+    date_arg: Option<&String>,
+    format_arg: Option<&String>,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let date = date_arg
+        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let format = format_arg
+        .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if date == Value::Null || format == Value::Null {
+        return Ok(Value::Null);
+    }
+    let input = json_scalar_to_string(&date);
+    let format = json_scalar_to_string(&format)
+        .replace("%i", "%M")
+        .replace("%s", "%S")
+        .replace("%#", "%f");
+    if let Ok(value) = NaiveDateTime::parse_from_str(&input, &format) {
+        let rendered = if format.contains("%f") {
+            format_mysql_datetime(value, "%Y-%m-%d %H:%i:%s.%f")
+        } else {
+            value.to_string()
+        };
+        return Ok(Value::String(rendered));
+    }
+    if let Ok(value) = NaiveDate::parse_from_str(&input, &format) {
+        return Ok(Value::String(value.to_string()));
+    }
+    if let Ok(value) = NaiveTime::parse_from_str(&input, &format) {
+        return Ok(Value::String(format_mysql_naive_time(value)));
+    }
+    Ok(Value::Null)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -510,7 +633,7 @@ fn parse_mysql_interval_unit(unit: &str) -> Option<MysqlIntervalUnit> {
     }
 }
 
-pub(super) fn parse_mysql_datetime_value(value: &Value) -> Option<NaiveDateTime> {
+pub(crate) fn parse_mysql_datetime_value(value: &Value) -> Option<NaiveDateTime> {
     let raw = json_scalar_to_string(value);
     let trimmed = raw.trim();
     if trimmed.is_empty() {

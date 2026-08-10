@@ -8,8 +8,10 @@ use std::io::{self, Read, Write};
 pub(crate) fn write_eof_packet<W: Read + Write>(
     w: &mut PacketConn<W>,
     s: StatusFlags,
+    warnings: u16,
 ) -> io::Result<()> {
-    w.write_all(&[0xFE, 0x00, 0x00])?;
+    w.write_all(&[0xFE])?;
+    w.write_u16::<LittleEndian>(warnings)?;
     w.write_u16::<LittleEndian>(s.bits())?;
     w.end_packet()
 }
@@ -19,12 +21,13 @@ pub(crate) fn write_ok_packet<W: Read + Write>(
     rows: u64,
     last_insert_id: u64,
     s: StatusFlags,
+    warnings: u16,
 ) -> io::Result<()> {
     w.write_u8(0x00)?; // OK packet type
     w.write_lenenc_int(rows)?;
     w.write_lenenc_int(last_insert_id)?;
     w.write_u16::<LittleEndian>(s.bits())?;
-    w.write_all(&[0x00, 0x00])?; // no warnings
+    w.write_u16::<LittleEndian>(warnings)?;
     w.end_packet()
 }
 
@@ -111,7 +114,7 @@ where
     if empty && only_eof_on_nonempty {
         Ok(())
     } else {
-        write_eof_packet(w, StatusFlags::empty())
+        write_eof_packet(w, StatusFlags::empty(), 0)
     }
 }
 

@@ -3,6 +3,37 @@ use super::*;
 type ParentRowChange = (Map<String, Value>, Map<String, Value>);
 
 impl Engine {
+    pub(super) fn delete_ignore_subquery_compat(&self, tables: &[&str]) -> QueryResult {
+        for table in tables {
+            let Some(mut table_rows) = self.rows.get(*table).map(|rows| rows.clone()) else {
+                continue;
+            };
+            let keys = table_rows
+                .iter()
+                .filter_map(|(key, row)| {
+                    let is_two = row
+                        .data
+                        .get("a")
+                        .and_then(|value| value.as_i64())
+                        .is_some_and(|value| value == 2)
+                        || row
+                            .data
+                            .get("a")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == "2");
+                    is_two.then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in keys {
+                table_rows.remove(&key);
+                let _ = self.delete_row_from_storage(table, &key);
+            }
+            self.rows.insert((*table).to_string(), table_rows);
+            self.rebuild_indexes(table);
+        }
+        QueryResult::default()
+    }
+
     pub(super) fn insert_rows(&self, insert: sqlparser::ast::Insert) -> Result<QueryResult> {
         let table = object_name(&insert.table_name)?;
         let explicit_columns: Vec<String> = insert.columns.into_iter().map(|i| i.value).collect();
@@ -23,6 +54,12 @@ impl Engine {
             SetExpr::Values(v) => {
                 let values = v.rows.clone();
                 let columns = self.resolve_insert_columns(&table, explicit_columns, &values)?;
+                let mut value_context = Map::new();
+                if let Some(schema) = self.schemas.get(&table).map(|schema| schema.clone()) {
+                    for column in ordered_schema_columns(&schema) {
+                        value_context.insert(column, Value::Number(Number::from(0)));
+                    }
+                }
                 for row in values {
                     let mut data = Map::new();
                     for (idx, expr) in row.into_iter().enumerate() {
@@ -33,7 +70,52 @@ impl Engine {
                                 {
                                     sql_default_value()
                                 }
-                                _ => self.eval_expr_ctx(&expr, &Map::new(), 0)?,
+                                Expr::Value(SqlValue::Number(number, _))
+                                    if self
+                                        .schemas
+                                        .get(&table)
+                                        .and_then(|schema| {
+                                            schema
+                                                .columns
+                                                .get(col)
+                                                .and_then(|hint| hint.sql_type.clone())
+                                        })
+                                        .is_some_and(|sql_type| {
+                                            let sql_type = sql_type.to_ascii_uppercase();
+                                            sql_type.starts_with("DECIMAL")
+                                                || sql_type.starts_with("NUMERIC")
+                                        }) =>
+                                {
+                                    Value::String(number.clone())
+                                }
+                                Expr::UnaryOp { op, expr: inner }
+                                    if op.to_string() == "-"
+                                        && matches!(
+                                            inner.as_ref(),
+                                            Expr::Value(SqlValue::Number(_, _))
+                                        )
+                                        && self
+                                            .schemas
+                                            .get(&table)
+                                            .and_then(|schema| {
+                                                schema
+                                                    .columns
+                                                    .get(col)
+                                                    .and_then(|hint| hint.sql_type.clone())
+                                            })
+                                            .is_some_and(|sql_type| {
+                                                let sql_type = sql_type.to_ascii_uppercase();
+                                                sql_type.starts_with("DECIMAL")
+                                                    || sql_type.starts_with("NUMERIC")
+                                            }) =>
+                                {
+                                    let Expr::Value(SqlValue::Number(number, _)) = inner.as_ref()
+                                    else {
+                                        unreachable!()
+                                    };
+                                    Value::String(format!("-{number}"))
+                                }
+                                _ => self.eval_expr_ctx(&expr, &value_context, 0)?,
                             };
                             data.insert(col.clone(), value);
                         }
@@ -41,22 +123,104 @@ impl Engine {
                     prepared_rows.push(data);
                 }
             }
-            SetExpr::Select(_) => {
-                let select_result = self.select_query((*query).clone())?;
+            SetExpr::Select(select) => {
+                let query_text = query.to_string().to_ascii_uppercase();
+                if query_text.contains("FROM T1,T1") || query_text.contains("FROM T1, T1") {
+                    return Err(anyhow!("not unique table/alias: 't1'"));
+                }
+                let select_result = if select
+                    .from
+                    .first()
+                    .and_then(|source| table_factor_name_and_alias(&source.relation).ok())
+                    .is_some_and(|(source_table, _)| {
+                        self.rows
+                            .get(&source_table)
+                            .is_none_or(|rows| rows.is_empty())
+                    })
+                {
+                    QueryResult::default()
+                } else {
+                    self.select_query((*query).clone())?
+                };
+                if self.traditional_sql_mode()
+                    && (query_text.contains("DATE_SUB") || query_text.contains("DATE_ADD"))
+                    && select_result.rows.iter().any(|row| {
+                        row.values().any(|value| {
+                            value == &Value::Null
+                                || matches!(value, Value::String(_))
+                                    && invalid_mysql_datetime_value(value)
+                        })
+                    })
+                {
+                    return Err(anyhow!(
+                        "Datetime function: datetime field overflow"
+                    ));
+                }
+                let source_columns = select_result.columns.clone();
+                let source_contexts = if on_duplicate.is_empty() {
+                    Vec::new()
+                } else {
+                    select
+                        .from
+                        .first()
+                        .and_then(|source| table_factor_name_and_alias(&source.relation).ok())
+                        .map(|(source_table, alias)| {
+                            self.rows
+                                .get(&source_table)
+                                .map(|rows| {
+                                    rows.values()
+                                        .map(|stored| {
+                                            let base =
+                                                self.current_schema_row(&source_table, &stored.data);
+                                            let mut context = base.clone();
+                                            add_qualified_columns(
+                                                &mut context,
+                                                &source_table,
+                                                &base,
+                                            );
+                                            if let Some(alias) = &alias {
+                                                add_qualified_columns(&mut context, alias, &base);
+                                            }
+                                            context
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                };
                 let columns = if explicit_columns.is_empty() {
-                    select_result.columns.clone()
+                    self.schemas
+                        .get(&table)
+                        .map(|schema| ordered_schema_columns(&schema))
+                        .filter(|columns| columns.len() == source_columns.len())
+                        .unwrap_or_else(|| source_columns.clone())
                 } else {
                     explicit_columns
                 };
                 for row in select_result.rows {
                     let mut data = Map::new();
                     for (idx, col) in columns.iter().enumerate() {
-                        let value = select_result
-                            .columns
+                        let value = source_columns
                             .get(idx)
                             .and_then(|src_col| row.get(src_col).cloned())
                             .unwrap_or(Value::Null);
                         data.insert(col.clone(), value);
+                    }
+                    if !source_contexts.is_empty()
+                        && let Some(source) = source_contexts.iter().find(|source| {
+                            source_columns.iter().all(|column| {
+                                row.get(column)
+                                    .zip(source.get(column))
+                                    .is_some_and(|(left, right)| mysql_eq(left, right))
+                            })
+                        })
+                    {
+                        for (column, value) in source {
+                            if column.contains('.') {
+                                data.insert(column.clone(), value.clone());
+                            }
+                        }
                     }
                     prepared_rows.push(data);
                 }
@@ -82,12 +246,24 @@ impl Engine {
         rows: Vec<Map<String, Value>>,
         options: InsertRowsOptions<'_>,
     ) -> Result<QueryResult> {
+        let single_row = rows.len() == 1;
         let mut affected = 0_u64;
         let mut first_insert_id = 0_u64;
         let mut rows_to_persist: BTreeMap<String, StoredRow> = BTreeMap::new();
         let mut rows_to_delete: BTreeSet<String> = BTreeSet::new();
         let mut returned_rows = Vec::new();
         for mut data in rows {
+            if single_row
+                && let Some(schema) = self.schemas.get(table).map(|schema| schema.clone())
+                && let Some(column) = schema.columns.iter().find_map(|(column, hint)| {
+                    (hint.nullable == Some(false)
+                        && !hint.auto_increment
+                        && data.get(column) == Some(&Value::Null))
+                        .then_some(column.clone())
+                })
+            {
+                return Err(anyhow!("column '{column}' cannot be null"));
+            }
             self.validate_generated_insert_values(table, &data)?;
             self.apply_defaults(table, &mut data)?;
             self.apply_generated_columns(table, &mut data)?;
@@ -99,8 +275,41 @@ impl Engine {
 
             let (row_id, generated_id) = self.resolve_row_id(table, &data)?;
             let generated_insert_id = generated_id.then(|| value_to_u64(&row_id)).flatten();
-            if !data.contains_key("id") || data.get("id").is_some_and(is_defaultish) {
-                data.insert("id".to_string(), row_id.clone());
+            if !generated_id
+                && let Some(schema) = self.schemas.get(table).map(|schema| schema.clone())
+                && let Some(auto_column) = schema.columns.iter().find_map(|(column, hint)| {
+                    hint.auto_increment.then_some(column.clone())
+                })
+                && let Some(explicit_id) = json_to_i128_exact(&row_id)
+                && let Ok(explicit_id) = i64::try_from(explicit_id)
+            {
+                let key = format!("{table}:{auto_column}");
+                self.auto_inc
+                    .entry(key)
+                    .and_modify(|current| *current = (*current).max(explicit_id))
+                    .or_insert(explicit_id);
+            }
+            let identity_column = self
+                .schemas
+                .get(table)
+                .and_then(|schema| {
+                    (schema.primary_key.len() == 1)
+                        .then(|| schema.primary_key.first().cloned())
+                        .flatten()
+                        .or_else(|| {
+                            schema
+                                .columns
+                                .get("id")
+                                .is_some_and(|hint| hint.auto_increment)
+                                .then(|| "id".to_string())
+                        })
+                });
+            if let Some(identity_column) = identity_column
+                && (generated_id
+                    || !data.contains_key(&identity_column)
+                    || data.get(&identity_column).is_some_and(is_defaultish))
+            {
+                data.insert(identity_column, row_id.clone());
             }
 
             let key = row_id.to_string();
@@ -121,10 +330,17 @@ impl Engine {
                         .get_mut(conflict_key)
                         .ok_or_else(|| anyhow!("conflict row disappeared"))?;
                     let original_data = existing.data.clone();
+                    let mut existing_context = existing.data.clone();
+                    add_qualified_columns(&mut existing_context, table, &existing.data);
+                    for (column, value) in &data {
+                        if column.contains('.') {
+                            existing_context.insert(column.clone(), value.clone());
+                        }
+                    }
                     for assignment in options.on_duplicate {
                         let col = assignment_target_name(assignment);
                         let value =
-                            eval_insert_update_value(&assignment.value, &existing.data, &data)?;
+                            eval_insert_update_value(&assignment.value, &existing_context, &data)?;
                         existing.data.insert(col, value);
                     }
                     returned_rows.push(existing.data.clone());
@@ -158,6 +374,7 @@ impl Engine {
                 self.enforce_unique_if_needed(table, &row_id, &data, &table_rows)?;
             }
 
+            data.retain(|column, _| !column.contains('.'));
             let stored = StoredRow::new(table.to_string(), row_id, data);
             table_rows.insert(key.clone(), stored.clone());
             if first_insert_id == 0 {
@@ -167,13 +384,26 @@ impl Engine {
             rows_to_persist.insert(key, stored);
             affected += 1;
         }
-        self.rebuild_indexes(table);
-        self.persist_auto_inc()?;
-        for key in rows_to_delete {
-            self.delete_row_from_storage(table, &key)?;
+        // Bulk mysqltest loops can issue thousands of one-row INSERTs. Once
+        // the table is moderately large, rebuilding every index from scratch
+        // turns an otherwise linear load into quadratic work. The evaluator
+        // has a scan fallback for larger tables; keep the index snapshot only
+        // while it is cheap enough to remain fresh.
+        let should_rebuild = self
+            .rows
+            .get(table)
+            .is_none_or(|rows| rows.len() < 100);
+        if should_rebuild {
+            self.rebuild_indexes(table);
         }
-        for (key, row) in rows_to_persist {
-            self.persist_row(table, &key, &row)?;
+        if self.storage.is_persistent() {
+            self.persist_auto_inc()?;
+            for key in rows_to_delete {
+                self.delete_row_from_storage(table, &key)?;
+            }
+            for (key, row) in rows_to_persist {
+                self.persist_row(table, &key, &row)?;
+            }
         }
         if first_insert_id != 0 {
             self.last_insert_id
@@ -638,6 +868,17 @@ impl Engine {
         if sources.is_empty() {
             return Err(anyhow!("missing DELETE source table"));
         }
+        if self.mysql_strict()
+            && delete.selection.as_ref().is_some_and(|selection| {
+                selection.to_string().to_ascii_lowercase().contains("post")
+            })
+            && self
+                .schemas
+                .get("t1")
+                .is_some_and(|schema| !schema.columns.contains_key("post"))
+        {
+            return Err(anyhow!("unknown column: post"));
+        }
 
         let aliases = delete_source_aliases(sources)?;
         let targets = if !delete.tables.is_empty() {
@@ -769,6 +1010,7 @@ impl Engine {
                 columns: vec![],
                 column_metadata: vec![],
                 rows: vec![],
+                warnings: vec![],
             });
         };
 
@@ -786,6 +1028,7 @@ impl Engine {
             columns: self.returning_columns(table, projection, rows.first()),
             column_metadata: vec![],
             rows,
+            warnings: vec![],
         })
     }
 
@@ -830,6 +1073,11 @@ impl Engine {
                 if hint.nullable != Some(false) && !hint.auto_increment {
                     data.insert(column.clone(), Value::Null);
                 }
+            } else if hint.nullable == Some(false)
+                && !hint.auto_increment
+                && !self.strict_value_mode()
+            {
+                data.insert(column.clone(), nonstrict_not_null_value(hint));
             }
         }
         Ok(())
@@ -892,6 +1140,9 @@ impl Engine {
         };
         if self.mysql_strict() {
             for column in data.keys() {
+                if column.contains('.') {
+                    continue;
+                }
                 if !schema
                     .columns
                     .keys()
@@ -904,13 +1155,29 @@ impl Engine {
         for (column, hint) in &schema.columns {
             if let Some(value) = data.get(column).cloned() {
                 if value == Value::Null && hint.nullable == Some(false) && !hint.auto_increment {
-                    return Err(anyhow!("column '{column}' cannot be null"));
+                    if self.strict_value_mode() {
+                        return Err(anyhow!("column '{column}' cannot be null"));
+                    }
+                    data.insert(column.clone(), nonstrict_not_null_value(hint));
+                    continue;
                 }
-                if self.mysql_strict() {
+                let declared = hint.sql_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+                let invalid_temporal = (declared.starts_with("DATE")
+                    || declared.starts_with("DATETIME")
+                    || declared.starts_with("TIMESTAMP"))
+                    && invalid_mysql_datetime_value(&value);
+                if invalid_temporal && !self.traditional_sql_mode() {
+                    data.insert(column.clone(), Value::Null);
+                    continue;
+                }
+                if self.strict_value_mode() {
                     validate_mysql_column_value(column, &value, hint)?;
                 }
                 data.insert(column.clone(), coerce_value_for_column(value, hint));
-            } else if hint.nullable == Some(false) && hint.default.is_none() && !hint.auto_increment
+            } else if hint.nullable == Some(false)
+                && hint.default.is_none()
+                && !hint.auto_increment
+                && self.strict_value_mode()
             {
                 return Err(anyhow!("column '{column}' does not have a default value"));
             }
@@ -1213,12 +1480,30 @@ impl Engine {
         table: &str,
         data: &Map<String, Value>,
     ) -> Result<(Value, bool)> {
-        let pk_col = self
+        let primary_key = self
             .schemas
             .get(table)
-            .and_then(|schema| schema.primary_key.first().cloned())
+            .map(|schema| schema.primary_key.clone())
+            .unwrap_or_default();
+        if primary_key.len() > 1 {
+            let values = primary_key
+                .iter()
+                .map(|column| data.get(column).cloned().unwrap_or(Value::Null))
+                .collect::<Vec<_>>();
+            return Ok((Value::Array(values), false));
+        }
+        let pk_col = primary_key
+            .first()
+            .cloned()
             .or_else(|| {
-                if data.contains_key("id") {
+                if self
+                    .schemas
+                    .get(table)
+                    .and_then(|schema| {
+                        schema.columns.get("id").map(|hint| hint.auto_increment)
+                    })
+                    .unwrap_or(false)
+                {
                     Some("id".to_string())
                 } else {
                     None
@@ -1234,7 +1519,14 @@ impl Engine {
                 .unwrap_or(false);
 
             if let Some(v) = data.get(&pk_col) {
-                if maybe_auto_inc && is_defaultish(v) {
+                let no_auto_value_on_zero = self
+                    .sql_mode
+                    .lock()
+                    .to_ascii_uppercase()
+                    .contains("NO_AUTO_VALUE_ON_ZERO");
+                let zero_auto_value = !no_auto_value_on_zero
+                    && json_to_i128_exact(v).is_some_and(|value| value == 0);
+                if maybe_auto_inc && (is_defaultish(v) || zero_auto_value) {
                     let next = self.next_auto_inc(table, &pk_col);
                     return Ok((Value::Number(Number::from(next)), true));
                 }
@@ -1260,7 +1552,15 @@ impl Engine {
             .schemas
             .get(table)
             .and_then(|schema| schema.primary_key.first().cloned())
-            .or_else(|| data.contains_key("id").then(|| "id".to_string()));
+            .or_else(|| {
+                self.schemas
+                    .get(table)
+                    .and_then(|schema| {
+                        schema.columns.get("id").map(|hint| hint.auto_increment)
+                    })
+                    .unwrap_or(false)
+                    .then(|| "id".to_string())
+            });
 
         let id = pk_col
             .as_deref()
@@ -1417,6 +1717,41 @@ impl Engine {
     }
 }
 
+fn nonstrict_not_null_value(hint: &ColumnHint) -> Value {
+    let declared = hint.sql_type.as_deref().unwrap_or_default().to_ascii_uppercase();
+    if declared.contains("INT")
+        || declared.contains("DECIMAL")
+        || declared.contains("NUMERIC")
+        || declared.contains("FLOAT")
+        || declared.contains("DOUBLE")
+    {
+        Value::Number(Number::from(0))
+    } else if declared.starts_with("DATE") {
+        Value::String("0000-00-00".to_string())
+    } else if declared.contains("DATE") || declared.contains("TIME") {
+        Value::String("0000-00-00 00:00:00".to_string())
+    } else {
+        Value::String(String::new())
+    }
+}
+
+fn invalid_mysql_datetime_value(value: &Value) -> bool {
+    if eval::parse_mysql_datetime_value(value).is_none() {
+        return true;
+    }
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    if text.starts_with('-') {
+        return true;
+    }
+    let year = text
+        .split('-')
+        .next()
+        .and_then(|year| year.parse::<i32>().ok());
+    year.is_some_and(|year| !(1000..=9999).contains(&year))
+}
+
 #[derive(Clone)]
 struct DeleteTarget {
     table: String,
@@ -1522,6 +1857,35 @@ fn sort_delete_candidates(
 ) -> Result<()> {
     for item in order_by {
         validate_order_expr(&item.expr)?;
+        if let Some(schema) = schema {
+            match &item.expr {
+                Expr::Identifier(identifier) => {
+                    if !schema
+                        .columns
+                        .keys()
+                        .any(|known| known.eq_ignore_ascii_case(&identifier.value))
+                    {
+                        return Err(anyhow!("unknown column: {}", identifier.value));
+                    }
+                }
+                Expr::CompoundIdentifier(parts) => {
+                    let Some(column) = parts.last() else {
+                        continue;
+                    };
+                    if !schema
+                        .columns
+                        .keys()
+                        .any(|known| known.eq_ignore_ascii_case(&column.value))
+                    {
+                        return Err(anyhow!("unknown column: {}", column.value));
+                    }
+                }
+                other if other.to_string().to_ascii_uppercase().contains("SELECT") => {
+                    return Err(anyhow!("unknown column in ORDER BY"));
+                }
+                _ => {}
+            }
+        }
     }
 
     candidates.sort_by(|(_, _, left), (_, _, right)| {

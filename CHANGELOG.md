@@ -8,6 +8,13 @@ All notable changes to MySqweel will be documented in this file.
 - Added optional full query-result payloads to completion events; result payloads remain disabled by default to avoid copying large result sets.
 - Expanded MySQL sorting parity across primitive and compound ordering, including exact integer/decimal handling, FLOAT rounding, temporal, binary, text collation, JSON, ENUM, and SET behavior across window, aggregate, DML, derived-table, and set-operation paths.
 - Added regression coverage for sorting edge cases, compound-key stress, aliases and expressions, `GROUP_CONCAT` ordering, `DELETE ... ORDER BY`, windows, derived tables, and `UNION` results.
+- Added a pinned MySQL 8.0.43 upstream MTR compatibility runner with an explicit supported-surface allowlist, strict MySQL baseline validation, JSON/Markdown reports, and a 90% CI floor.
+- Added the MySQL metadata and MTR suppression compatibility needed for upstream external-server execution, with per-case baseline state reset to keep comparisons independent.
+- Expanded MySQL wire compatibility with declared result-column types, nullability, unsigned and decimal metadata, character sets and collations, warning propagation, `SHOW WARNINGS`, zero date and datetime values, and additional MySQL error-code mappings.
+- Expanded query compatibility with correlated `EXISTS`, nested joins, `DUAL`, user variables, aggregate expressions, `EXPLAIN`, `CREATE TABLE ... AS SELECT`, ordered and limited deletes, and stricter MySQL value, safe-update, auto-increment, and decimal semantics.
+- Expanded DDL and metadata coverage for case-insensitive schemas, foreign-key indexes, index comments, `SHOW FULL COLUMNS`, `SHOW TABLE STATUS`, `information_schema` engines, process lists, variables, indexes, constraints, and richer table/index introspection.
+- Added MySQL date/time and scalar compatibility for `TIME_FORMAT`, `STR_TO_DATE`, `GET_FORMAT`, `FROM_UNIXTIME`, `INTERVAL`, `SOUNDEX`, `MD5`, `SHA`, `SHA2`, `CRC32`, `BIT_LENGTH`, and expanded aggregate support including variance, standard deviation, and bitwise aggregates.
+- Verified the supported MySQL 8.0.43 MTR surface at 19/19 tests passing (100%) against both the MySQL baseline and MySqweel.
 
 ## 0.3.2 July 24, 2026
 
