@@ -11,7 +11,7 @@ use my_sqweel::sql::engine::{Engine, EngineConfig};
 use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, Row, Value as MyValue};
 
-const MIN_COMPATIBILITY_PERCENT: f64 = 95.0;
+const MIN_COMPATIBILITY_PERCENT: f64 = 100.0;
 const MIN_CORPUS_SIZE: usize = 2_500;
 const GENERATED_CASES_PER_FAMILY: i64 = 489;
 const CORPUS_WORKERS: usize = 8;

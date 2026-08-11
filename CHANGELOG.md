@@ -17,6 +17,9 @@ All notable changes to MySqweel will be documented in this file.
 - Improved query execution by resolving sort keys once per row, reusing stored schema column order, avoiding unnecessary row/schema/projection/window/aggregate allocations, and using hash-based lookup and deduplication paths where ordering is not required.
 - Added a no-subscriber fast path that avoids query-event timing, IDs, and result processing when query lifecycle events are not being observed.
 - Added logical row/cell read and physical row/cell write metrics to query completion events, including filtered rows and aggregate multi-statement totals.
+- Added a pinned upstream MySQL 8.0.43 MTR gate using complete, unmodified test files with test/result hashes, independent MySQL-baseline and MySqweel jobs, and a 100% requirement.
+- Added MTR execution canaries that reject no-op `mysqltest_safe_process` helpers and incomplete MTR runs, preventing false-positive compatibility reports.
+- Raised the differential MySQL query-corpus requirement from 95% to 100%.
 
 ## 0.3.2 July 24, 2026
 

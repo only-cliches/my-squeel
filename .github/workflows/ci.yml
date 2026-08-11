@@ -7,8 +7,13 @@ on:
 permissions:
   contents: read
 
+env:
+  MYSQL_MTR_CACHE_KEY: mysql-mtr-ubuntu24-amd64-8.0.43-v1
+  MYSQL_MTR_REVISION: 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7
+
 jobs:
-  test:
+  feature-parity:
+    name: MySQL feature parity
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     services:
@@ -31,6 +36,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test compatibility report tooling
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Test all targets against real MySQL
+        run: cargo test --all-targets --locked
+
+  mtr-baseline:
+    name: Upstream MTR baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      mysql:
+        image: mysql:8.0.43
+        env:
+          MYSQL_ROOT_PASSWORD: my-sqweel
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent -h 127.0.0.1 -pmy-sqweel"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      MYSQL_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3306/test
+    steps:
+      - uses: actions/checkout@v4
       - name: Install MySQL MTR runtime dependencies
         run: |
           sudo apt-get update
@@ -45,58 +76,129 @@ jobs:
             libtirpc3t64 \
             mecab-ipadic-utf8 \
             zlib1g
-      - name: Test compatibility report tooling
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
-      - name: Test all targets against real MySQL
-        run: cargo test --all-targets --locked
       - name: Restore pinned MySQL MTR packages
         id: mysql-mtr-package-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/mysql-mtr-packages
-          key: mysql-mtr-ubuntu24-amd64-8.0.43-v1
+          key: ${{ env.MYSQL_MTR_CACHE_KEY }}
       - name: Prepare pinned MySQL upstream MTR binaries and suite
         run: |
+          set -euo pipefail
           MYSQL_MTR_CACHE_DIR="$RUNNER_TEMP/mysql-mtr-packages" \
             tools/prepare_mysql_mtr.sh \
             "$RUNNER_TEMP/mysql-mtr" \
             --print-env > "$RUNNER_TEMP/mysql-mtr.env"
           source "$RUNNER_TEMP/mysql-mtr.env"
-          test -f "$MYSQL_MTR_ROOT/mysql-test/t/select_all.test"
+          test -f "$MYSQL_MTR_ROOT/mysql-test/t/ctype_filename.test"
           test -x "$MYSQLTEST_BIN"
-          test -x "$MYSQL_CLIENT_BINDIR/mysql"
+          test -x "$MYSQL_CLIENT_BINDIR/mysqltest_safe_process"
       - name: Save pinned MySQL MTR packages
         if: steps.mysql-mtr-package-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/mysql-mtr-packages
           key: ${{ steps.mysql-mtr-package-cache.outputs.cache-primary-key }}
-      - name: Build MySqweel binary for MTR
-        run: cargo build --locked --bin sqwl
-      - name: Run supported MySQL upstream MTR surface
+      - name: Validate unmodified upstream tests against MySQL
         run: |
+          set -euo pipefail
           source "$RUNNER_TEMP/mysql-mtr.env"
           python3 tools/mysql_mtr_compat.py \
+            --target mysql \
             --suite-root "$MYSQL_MTR_ROOT" \
             --allowlist tests/mysql-mtr-allowlist.txt \
             --mysql-url "$MYSQL_COMPARE_URL" \
             --mysqltest-bin "$MYSQLTEST_BIN" \
             --client-bindir "$MYSQL_CLIENT_BINDIR" \
-            --mysqweel-bin target/debug/sqwl \
-            --report-dir artifacts/mysql-mtr \
+            --report-dir artifacts/mysql-mtr-baseline \
             --mysql-version 8.0.43 \
-            --source-revision 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7 \
+            --source-revision "$MYSQL_MTR_REVISION" \
             --minimum-percent 100
-      - name: Upload MySQL MTR compatibility report
+      - name: Upload MySQL baseline report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mysql-mtr-compatibility-report
+          name: mysql-mtr-baseline-report
           path: |
-            artifacts/mysql-mtr/mysql-mtr-report.json
-            artifacts/mysql-mtr/mysql-mtr-report.md
-            artifacts/mysql-mtr/**/stdout.log
-            artifacts/mysql-mtr/**/stderr.log
-            artifacts/mysql-mtr/**/mysqweel.log
-            artifacts/mysql-mtr/**/my.cnf
+            artifacts/mysql-mtr-baseline/mysql-mtr-report.json
+            artifacts/mysql-mtr-baseline/mysql-mtr-report.md
+            artifacts/mysql-mtr-baseline/**/stdout.log
+            artifacts/mysql-mtr-baseline/**/stderr.log
+            artifacts/mysql-mtr-baseline/**/log/**/*.log
+            artifacts/mysql-mtr-baseline/**/*.reject
+            artifacts/mysql-mtr-baseline/**/my.cnf
+          if-no-files-found: warn
+
+  mtr-mysqweel:
+    name: Upstream MTR compatibility
+    needs: mtr-baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install MySQL MTR runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            libaio1t64 \
+            libjson-perl \
+            libmecab2 \
+            libnuma1 \
+            libssl3t64 \
+            libtirpc3t64 \
+            mecab-ipadic-utf8 \
+            zlib1g
+      - name: Restore pinned MySQL MTR packages
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/mysql-mtr-packages
+          key: ${{ env.MYSQL_MTR_CACHE_KEY }}
+          fail-on-cache-miss: true
+      - name: Prepare pinned MySQL upstream MTR binaries and suite
+        run: |
+          set -euo pipefail
+          MYSQL_MTR_CACHE_DIR="$RUNNER_TEMP/mysql-mtr-packages" \
+            tools/prepare_mysql_mtr.sh \
+            "$RUNNER_TEMP/mysql-mtr" \
+            --print-env > "$RUNNER_TEMP/mysql-mtr.env"
+          source "$RUNNER_TEMP/mysql-mtr.env"
+          test -f "$MYSQL_MTR_ROOT/mysql-test/t/ctype_filename.test"
+          test -x "$MYSQLTEST_BIN"
+          test -x "$MYSQL_CLIENT_BINDIR/mysqltest_safe_process"
+      - name: Build MySqweel binary for MTR
+        run: cargo build --locked --bin sqwl
+      - name: Run unmodified upstream tests against MySqweel
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/mysql-mtr.env"
+          python3 tools/mysql_mtr_compat.py \
+            --target mysqweel \
+            --suite-root "$MYSQL_MTR_ROOT" \
+            --allowlist tests/mysql-mtr-allowlist.txt \
+            --mysqltest-bin "$MYSQLTEST_BIN" \
+            --client-bindir "$MYSQL_CLIENT_BINDIR" \
+            --mysqweel-bin target/debug/sqwl \
+            --report-dir artifacts/mysql-mtr-mysqweel \
+            --mysql-version 8.0.43 \
+            --source-revision "$MYSQL_MTR_REVISION" \
+            --minimum-percent 100
+      - name: Upload MySqweel MTR report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysqweel-mtr-compatibility-report
+          path: |
+            artifacts/mysql-mtr-mysqweel/mysql-mtr-report.json
+            artifacts/mysql-mtr-mysqweel/mysql-mtr-report.md
+            artifacts/mysql-mtr-mysqweel/**/stdout.log
+            artifacts/mysql-mtr-mysqweel/**/stderr.log
+            artifacts/mysql-mtr-mysqweel/**/log/**/*.log
+            artifacts/mysql-mtr-mysqweel/**/*.reject
+            artifacts/mysql-mtr-mysqweel/**/mysqweel.log
+            artifacts/mysql-mtr-mysqweel/**/my.cnf
           if-no-files-found: warn
