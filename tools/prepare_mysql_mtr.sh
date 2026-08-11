@@ -53,15 +53,16 @@ else
     -DWITH_ZSTD=system \
     -DWITH_PROTOBUF=system
   # MTR's external-server mode still uses the client-side helpers below to
-  # launch tests and inspect the server.  Build them explicitly so a fresh CI
-  # checkout does not fail during MTR setup with a misleading missing-tool
-  # error.
+  # initialize its environment even though it never launches the built server.
+  # Build the complete startup set explicitly so a fresh CI checkout reaches
+  # the test case instead of failing while MTR populates its client variables.
   run_logged cmake --build "$build_dir" \
-    --target mysql mysqltest mysqltest_safe_process mysql_migrate_keyring \
-    mysql_ssl_rsa_setup \
-    mysql_keyring_encryption_test mysqladmin mysqlbinlog mysqlpump mysql_upgrade \
-    mysqlcheck mysqlshow mysqldump my_print_defaults innochecksum ibd2sdi \
-    myisamchk myisampack perror mysql_tzinfo_to_sql \
+    --target mysqld mysql mysqltest mysqltest_safe_process mysql_migrate_keyring \
+    mysql_ssl_rsa_setup mysql_keyring_encryption_test mysqladmin mysqlbinlog \
+    mysqlcheck mysql_config_editor mysqlimport mysqlpump mysql_secure_installation \
+    mysqlshow mysqlslap mysql_upgrade mysqldump my_print_defaults innochecksum \
+    ibd2sdi lz4_decompress zlib_decompress myisamchk myisampack perror \
+    mysql_tzinfo_to_sql \
     --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
   mysqltest_bin="$(find "$build_dir" -type f -name mysqltest -perm -111 -print -quit)"
 fi
@@ -77,10 +78,11 @@ if [[ ! -x "$client_bindir/mysql" ]]; then
   exit 1
 fi
 
-for required_tool in mysqladmin mysqlbinlog mysqlpump mysql_upgrade mysql_ssl_rsa_setup \
-  mysql_migrate_keyring mysql_keyring_encryption_test mysqltest_safe_process mysqlcheck \
-  mysqlshow mysqldump my_print_defaults innochecksum ibd2sdi myisamchk myisampack perror \
-  mysql_tzinfo_to_sql; do
+for required_tool in mysqld mysqladmin mysqlbinlog mysqlcheck mysql_config_editor \
+  mysqlimport mysqlpump mysql_secure_installation mysqlshow mysqlslap mysql_upgrade \
+  mysqldump mysql_ssl_rsa_setup mysql_migrate_keyring mysql_keyring_encryption_test \
+  mysqltest_safe_process my_print_defaults innochecksum ibd2sdi lz4_decompress \
+  zlib_decompress myisamchk myisampack perror mysql_tzinfo_to_sql; do
   if [[ ! -x "$client_bindir/$required_tool" ]]; then
     echo "required MTR helper is unavailable beside mysqltest: $client_bindir/$required_tool" >&2
     exit 1

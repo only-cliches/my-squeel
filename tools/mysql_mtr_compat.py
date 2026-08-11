@@ -351,6 +351,32 @@ def render_markdown(report: dict) -> str:
     ]
     for result in report["results"]:
         lines.append(f"| `{result['test']}` | {result['mysql']} | {result['mysqweel']} |")
+
+    failed_by_server: dict[str, dict] = {}
+    for invocation in report.get("invocations", []):
+        if invocation.get("status") == "pass":
+            continue
+        failed_by_server.setdefault(invocation["server"], invocation)
+    if failed_by_server:
+        lines.extend(["", "## Representative failure diagnostics", ""])
+        for server, invocation in failed_by_server.items():
+            streams = []
+            for stream_name in ("stdout", "stderr"):
+                output = (invocation.get(stream_name) or "").strip()
+                if len(output) > 1_000:
+                    output = "... output truncated ...\n" + output[-1_000:]
+                if output:
+                    streams.append(f"{stream_name}:\n{output}")
+            output = "\n\n".join(streams)
+            lines.extend(
+                [
+                    f"### {server}: `{invocation['test']}`",
+                    "",
+                    f"Return code: `{invocation.get('returncode')}`",
+                    "",
+                ]
+            )
+            lines.extend(f"    {line}" for line in (output or "No output captured.").splitlines())
     return "\n".join(lines) + "\n"
 
 

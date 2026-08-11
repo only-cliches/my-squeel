@@ -84,5 +84,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mysql-mtr-compatibility-report
-          path: artifacts/mysql-mtr
+          path: |
+            artifacts/mysql-mtr/mysql-mtr-report.json
+            artifacts/mysql-mtr/mysql-mtr-report.md
+            artifacts/mysql-mtr/**/stdout.log
+            artifacts/mysql-mtr/**/stderr.log
+            artifacts/mysql-mtr/**/mysqweel.log
+            artifacts/mysql-mtr/**/my.cnf
           if-no-files-found: warn

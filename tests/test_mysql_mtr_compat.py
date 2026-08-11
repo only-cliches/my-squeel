@@ -58,6 +58,40 @@ class ReportTests(unittest.TestCase):
         }
         self.assertIn("Status: **pass**", render_markdown(report))
 
+    def test_report_includes_one_representative_failure_per_server(self):
+        report = {
+            "mysql_version": "8.0.43",
+            "source_revision": "abc123",
+            "status": "invalid",
+            "score_percent": 0.0,
+            "counts": {"included": 1, "passed": 0, "failed": 1, "infrastructure": 0},
+            "results": [{"test": "select_all", "mysql": "fail", "mysqweel": "fail"}],
+            "invocations": [
+                {
+                    "test": "select_all",
+                    "server": "mysql",
+                    "status": "fail",
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "missing mysqlimport",
+                },
+                {
+                    "test": "select_all",
+                    "server": "mysqweel",
+                    "status": "fail",
+                    "returncode": 1,
+                    "stdout": "result mismatch",
+                    "stderr": "",
+                },
+            ],
+        }
+        markdown = render_markdown(report)
+        self.assertIn("Representative failure diagnostics", markdown)
+        self.assertIn("### mysql: `select_all`", markdown)
+        self.assertIn("missing mysqlimport", markdown)
+        self.assertIn("### mysqweel: `select_all`", markdown)
+        self.assertIn("result mismatch", markdown)
+
     def test_json_report_is_serializable(self):
         report = {"counts": {"included": 1}, "results": []}
         self.assertEqual(json.loads(json.dumps(report))["counts"]["included"], 1)
