@@ -4,10 +4,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.mysql_mtr_compat import parse_manifest, render_markdown
+from tools.mysql_mtr_compat import (
+    parse_manifest,
+    render_markdown,
+    validate_distinct_servers,
+)
 
 
 class ManifestTests(unittest.TestCase):
+    def test_same_host_and_port_for_both_servers_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "same host and port"):
+            validate_distinct_servers(
+                "mysql://root:baseline@127.0.0.1:3306/test",
+                "mysql://root@127.0.0.1:3306/test",
+            )
+
+    def test_separate_mysqweel_server_is_accepted(self):
+        validate_distinct_servers(
+            "mysql://root:baseline@127.0.0.1:3306/test",
+            "mysql://root@127.0.0.1:3307/test",
+        )
+
     def test_comments_and_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "allowlist.txt"

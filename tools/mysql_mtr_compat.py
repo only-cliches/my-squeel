@@ -102,6 +102,19 @@ def parse_server_url(url: str) -> dict[str, str]:
     }
 
 
+def validate_distinct_servers(mysql_url: str, mysqweel_url: str | None) -> None:
+    """Reject a comparison that would run both MTR sides against one server."""
+    if not mysqweel_url:
+        return
+    mysql = parse_server_url(mysql_url)
+    mysqweel = parse_server_url(mysqweel_url)
+    if (mysql["host"], mysql["port"]) == (mysqweel["host"], mysqweel["port"]):
+        raise ValueError(
+            "--mysql-url and --mysqweel-url point to the same host and port; "
+            "use --mysqweel-bin or a separately running MySqweel server"
+        )
+
+
 def wait_for_port(host: str, port: int, process: subprocess.Popen[str], timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -402,6 +415,7 @@ def run(args: argparse.Namespace) -> int:
     mysql_url = args.mysql_url or os.environ.get("MYSQL_COMPARE_URL")
     if not mysql_url:
         raise ValueError("--mysql-url or MYSQL_COMPARE_URL is required")
+    validate_distinct_servers(mysql_url, args.mysqweel_url)
     mysql_server = Server("mysql", mysql_url)
     ensure_mtr_database(mysql_server, client_bindir)
     binary = (args.mysqweel_bin or Path("target/debug/sqwl")).resolve()

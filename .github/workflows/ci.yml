@@ -86,7 +86,7 @@ jobs:
             --report-dir artifacts/mysql-mtr \
             --mysql-version 8.0.43 \
             --source-revision 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7 \
-            --minimum-percent 90
+            --minimum-percent 100
       - name: Upload MySQL MTR compatibility report
         if: always()
         uses: actions/upload-artifact@v4

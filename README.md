@@ -366,9 +366,6 @@ instead of being silently evaluated as `NULL`, `FALSE`, or a partial result.
 
 - A deterministic 2,500-query corpus compares column names and normalized values with MySQL 8.0.43.
 - The current corpus result is 2,500/2,500 exact matches; CI fails below 95%.
-- CI runs an explicit, version-pinned allowlist from MySQL 8.0.43's upstream MTR suite against
-  both servers. The compatibility floor is 90% of that allowlist, with the full report published
-  as a CI artifact.
 - Broader parity tests require exact results for every claimed DDL, DML, metadata, and query shape.
 - Wire tests verify common MySQL error numbers and typed prepared-statement behavior.
 - ORM-shaped tests cover migration, CRUD, relation, and introspection patterns used by Diesel,
@@ -376,11 +373,6 @@ instead of being silently evaluated as `NULL`, `FALSE`, or a partial result.
 
 The percentage describes this versioned corpus, not the entire MySQL grammar. Every reported edge
 case should become a regression case before its implementation is changed.
-
-The upstream-test claim is similarly qualified: it means “passes X/Y (Z%) of the pinned MTR tests
-in `tests/mysql-mtr-allowlist.txt`.” The full upstream suite includes transactions, replication,
-permissions, optimizer, storage-engine, and platform tests outside MySqweel's contract. See
-[`tests/mysql-mtr-exclusions.md`](tests/mysql-mtr-exclusions.md) for the exclusion policy.
 
 ### Schema, DDL, and metadata
 
@@ -565,24 +557,6 @@ remove their own comparison server. To require comparison or use an existing MyS
 MYSQL_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test \
 MYSQL_PARITY_REQUIRED=1 \
 cargo test --all-targets --locked
-```
-
-The upstream MTR report runs in CI using checksum-pinned Oracle MySQL 8.0.43 packages for
-Ubuntu 24.04 amd64. This avoids compiling MySQL while preserving the official test suite,
-`mysqltest`, and its helper binaries. To reproduce it on a compatible host:
-
-```sh
-eval "$(tools/prepare_mysql_mtr.sh .cache/mysql-mtr --print-env)"
-cargo build --locked --bin sqwl
-python3 tools/mysql_mtr_compat.py \
-  --suite-root "$MYSQL_MTR_ROOT" \
-  --mysql-url "$MYSQL_COMPARE_URL" \
-  --mysqltest-bin "$MYSQLTEST_BIN" \
-  --client-bindir "$MYSQL_CLIENT_BINDIR" \
-  --mysqweel-bin target/debug/sqwl \
-  --report-dir artifacts/mysql-mtr \
-  --source-revision 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7 \
-  --minimum-percent 90
 ```
 
 Formatting and linting:
