@@ -44,6 +44,7 @@ jobs:
             libncurses5-dev \
             libnuma-dev \
             libprotobuf-dev \
+            libprotoc-dev \
             libssl-dev \
             libtirpc-dev \
             libzstd-dev \
