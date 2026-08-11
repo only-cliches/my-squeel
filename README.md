@@ -567,11 +567,12 @@ MYSQL_PARITY_REQUIRED=1 \
 cargo test --all-targets --locked
 ```
 
-The upstream MTR report is run in CI because it requires the pinned MySQL test source and
-`mysqltest` client tools. To run it locally, prepare those tools and then execute:
+The upstream MTR report runs in CI using checksum-pinned Oracle MySQL 8.0.43 packages for
+Ubuntu 24.04 amd64. This avoids compiling MySQL while preserving the official test suite,
+`mysqltest`, and its helper binaries. To reproduce it on a compatible host:
 
 ```sh
-eval "$(tools/prepare_mysql_mtr.sh .cache/mysql-server --print-env)"
+eval "$(tools/prepare_mysql_mtr.sh .cache/mysql-mtr --print-env)"
 cargo build --locked --bin sqwl
 python3 tools/mysql_mtr_compat.py \
   --suite-root "$MYSQL_MTR_ROOT" \

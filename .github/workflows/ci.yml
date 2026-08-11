@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     services:
       mysql:
@@ -31,38 +31,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install MySQL MTR build dependencies
+      - name: Install MySQL MTR runtime dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bison \
-            libaio-dev \
-            libcurl4-openssl-dev \
-            libedit-dev \
-            libicu-dev \
-            liblz4-dev \
-            libncurses5-dev \
-            libnuma-dev \
-            libprotobuf-dev \
-            libprotoc-dev \
-            libssl-dev \
-            libtirpc-dev \
-            libzstd-dev \
-            protobuf-compiler \
-            zlib1g-dev
+            ca-certificates \
+            curl \
+            libaio1t64 \
+            libjson-perl \
+            libmecab2 \
+            libnuma1 \
+            libssl3t64 \
+            libtirpc3t64 \
+            mecab-ipadic-utf8 \
+            zlib1g
       - name: Test compatibility report tooling
         run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Test all targets against real MySQL
         run: cargo test --all-targets --locked
-      - name: Prepare pinned MySQL upstream MTR suite
+      - name: Restore pinned MySQL MTR packages
+        id: mysql-mtr-package-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/mysql-mtr-packages
+          key: mysql-mtr-ubuntu24-amd64-8.0.43-v1
+      - name: Prepare pinned MySQL upstream MTR binaries and suite
         run: |
-          tools/prepare_mysql_mtr.sh \
-            "$RUNNER_TEMP/mysql-server" \
+          MYSQL_MTR_CACHE_DIR="$RUNNER_TEMP/mysql-mtr-packages" \
+            tools/prepare_mysql_mtr.sh \
+            "$RUNNER_TEMP/mysql-mtr" \
             --print-env > "$RUNNER_TEMP/mysql-mtr.env"
           source "$RUNNER_TEMP/mysql-mtr.env"
           test -f "$MYSQL_MTR_ROOT/mysql-test/t/select_all.test"
           test -x "$MYSQLTEST_BIN"
           test -x "$MYSQL_CLIENT_BINDIR/mysql"
+      - name: Save pinned MySQL MTR packages
+        if: steps.mysql-mtr-package-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/mysql-mtr-packages
+          key: ${{ steps.mysql-mtr-package-cache.outputs.cache-primary-key }}
       - name: Build MySqweel binary for MTR
         run: cargo build --locked --bin sqwl
       - name: Run supported MySQL upstream MTR surface
