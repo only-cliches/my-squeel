@@ -55,16 +55,18 @@ jobs:
         run: cargo test --all-targets --locked
       - name: Prepare pinned MySQL upstream MTR suite
         run: |
-          eval "$(tools/prepare_mysql_mtr.sh "$RUNNER_TEMP/mysql-server" --print-env)"
-          {
-            echo "MYSQL_MTR_ROOT=$MYSQL_MTR_ROOT"
-            echo "MYSQLTEST_BIN=$MYSQLTEST_BIN"
-            echo "MYSQL_CLIENT_BINDIR=$MYSQL_CLIENT_BINDIR"
-          } >> "$GITHUB_ENV"
+          tools/prepare_mysql_mtr.sh \
+            "$RUNNER_TEMP/mysql-server" \
+            --print-env > "$RUNNER_TEMP/mysql-mtr.env"
+          source "$RUNNER_TEMP/mysql-mtr.env"
+          test -f "$MYSQL_MTR_ROOT/mysql-test/t/select_all.test"
+          test -x "$MYSQLTEST_BIN"
+          test -x "$MYSQL_CLIENT_BINDIR/mysql"
       - name: Build MySqweel binary for MTR
         run: cargo build --locked --bin sqwl
       - name: Run supported MySQL upstream MTR surface
         run: |
+          source "$RUNNER_TEMP/mysql-mtr.env"
           python3 tools/mysql_mtr_compat.py \
             --suite-root "$MYSQL_MTR_ROOT" \
             --allowlist tests/mysql-mtr-allowlist.txt \
