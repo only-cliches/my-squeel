@@ -501,15 +501,16 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
     } else if message.contains("invalid index name") {
         ErrorKind::ER_PARSE_ERROR
     } else if message.contains("cannot discard temporary table") {
-        ErrorKind::ER_CANNOT_DISCARD_TEMPORARY_TABLE
+        // msql-srv 0.11 predates this MySQL 8 error code.
+        ErrorKind::ER_NOT_SUPPORTED_YET
     } else if message.contains("tablespace missing") {
         ErrorKind::ER_TABLESPACE_MISSING
     } else if message.contains("table storage engine doesn't support") {
         ErrorKind::ER_ILLEGAL_HA
     } else if message.contains("spatial indexes can't be primary or unique indexes") {
-        ErrorKind::ER_SPATIAL_UNIQUE_INDEX
+        ErrorKind::ER_WRONG_USAGE
     } else if message.contains("unsupported action on generated column") {
-        ErrorKind::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN
+        ErrorKind::ER_NOT_SUPPORTED_YET
     } else if message.contains("partition management on nonpartitioned table") {
         ErrorKind::ER_PARTITION_MGMT_ON_NONPARTITIONED
     } else if message.contains("conflicting character set declarations") {
@@ -554,7 +555,7 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
     } else if message.contains("incorrect usage of or replace and if not exists") {
         ErrorKind::ER_WRONG_USAGE
     } else if message.contains("window frame bound specifications") {
-        ErrorKind::ER_BAD_COMBINATION_OF_WINDOW_FRAME_BOUND_SPECS
+        ErrorKind::ER_WRONG_USAGE
     } else if message.contains("too few arguments") {
         ErrorKind::ER_SP_WRONG_NO_OF_ARGS
     } else if message.contains("data too long") {
@@ -568,7 +569,7 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
     {
         ErrorKind::ER_DATETIME_FUNCTION_OVERFLOW
     } else if message.contains("cannot convert string") {
-        ErrorKind::ER_CANNOT_CONVERT_STRING
+        ErrorKind::ER_TRUNCATED_WRONG_VALUE
     } else if message.contains("invalid float") {
         ErrorKind::ER_ILLEGAL_VALUE_FOR_TYPE
     } else if message.contains("wrong value") {
@@ -599,13 +600,8 @@ fn write_result<W: io::Read + io::Write>(
         columns = row.keys().cloned().collect();
     }
 
-    let warning_count = out.warnings.len().min(u16::MAX as usize) as u16;
     if columns.is_empty() {
-        return results.completed_with_warnings(
-            out.rows_affected,
-            out.last_insert_id,
-            warning_count,
-        );
+        return results.completed(out.rows_affected, out.last_insert_id);
     }
 
     let mut decimal_columns = query.map(mysql_decimal_columns).unwrap_or_default();
@@ -667,7 +663,7 @@ fn write_result<W: io::Read + io::Write>(
         return results.error(mysql_error_kind(&message), message.as_bytes());
     }
 
-    let mut rw = results.start_with_warnings(&defs, warning_count)?;
+    let mut rw = results.start(&defs)?;
     for row in out.rows {
         write_row(
             &mut rw,
