@@ -301,6 +301,79 @@ fn evaluates_json_string_math_and_conversion_functions() {
 }
 
 #[test]
+fn evaluates_extended_json_functions() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    let result = engine
+        .execute_sql(
+            "SELECT \
+                JSON_TYPE('{\"a\":[1,2]}') AS json_type, \
+                JSON_DEPTH('{\"a\":[1,2]}') AS json_depth, \
+                JSON_LENGTH('{\"a\":[1,2]}', '$.a') AS json_length, \
+                JSON_KEYS('{\"a\":1,\"b\":2}') AS json_keys, \
+                JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a') AS contains_path, \
+                JSON_OVERLAPS('[1,2]', '[2,3]') AS overlaps, \
+                JSON_VALID('{bad json}') AS invalid_json, \
+                JSON_QUOTE('Ada') AS quoted, \
+                JSON_VALUE('{\"score\":42}', '$.score') AS json_value, \
+                JSON_SCHEMA_VALID('{\"type\":\"object\",\"required\":[\"a\"]}', '{\"a\":1}') AS schema_valid, \
+                JSON_STORAGE_SIZE('{\"a\":1}') AS storage_size, \
+                JSON_STORAGE_FREE('{\"a\":1}') AS storage_free, \
+                JSON_EXTRACT(JSON_ARRAY_APPEND('[1,2]', '$', 3), '$[2]') AS appended, \
+                JSON_EXTRACT(JSON_ARRAY_INSERT('[1,3]', '$[1]', 2), '$') AS inserted, \
+                JSON_EXTRACT(JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"a\":9,\"b\":null}'), '$') AS merged"
+        )
+        .expect("extended JSON functions should execute");
+    let row = &result[0].rows[0];
+    assert_eq!(row["json_type"], "OBJECT");
+    assert_eq!(row["json_depth"], 3);
+    assert_eq!(row["json_length"], 2);
+    assert_eq!(row["contains_path"], 1);
+    assert_eq!(row["overlaps"], 1);
+    assert_eq!(row["invalid_json"], 0);
+    assert_eq!(row["quoted"], "\"Ada\"");
+    assert_eq!(row["json_value"], "42");
+    assert_eq!(row["schema_valid"], 1);
+    assert_eq!(row["storage_size"], 7);
+    assert_eq!(row["storage_free"], 0);
+    assert_eq!(row["appended"], "3");
+    assert_eq!(row["inserted"], "[1,2,3]");
+    assert_eq!(row["merged"], "{\"a\":9}");
+
+    engine
+        .execute_sql(
+            "CREATE TABLE json_aggregate_rows (name TEXT, score INT); \
+             INSERT INTO json_aggregate_rows VALUES ('Ada', 10), ('Bob', 20);",
+        )
+        .expect("JSON aggregate input should load");
+    let result = engine
+        .execute_sql(
+            "SELECT JSON_ARRAYAGG(score) AS scores, JSON_OBJECTAGG(name, score) AS score_map \
+             FROM json_aggregate_rows",
+        )
+        .expect("JSON aggregate functions should execute");
+    let row = &result[0].rows[0];
+    assert_eq!(row["scores"], json!([10, 20]));
+    assert_eq!(row["score_map"], json!({"Ada": 10, "Bob": 20}));
+
+    let result = engine
+        .execute_sql(
+            "SELECT jt.ord, jt.name, jt.score \
+             FROM JSON_TABLE(\'{\"items\":[{\"name\":\"Ada\",\"score\":10},{\"name\":\"Bob\",\"score\":20}]}\', \
+                 \'$.items[*]\' COLUMNS (\
+                     ord FOR ORDINALITY, \
+                     name VARCHAR(20) PATH \'$.name\', \
+                     score INT PATH \'$.score\'\
+                 )) AS jt \
+             ORDER BY jt.ord",
+        )
+        .expect("basic JSON_TABLE should execute");
+    assert_eq!(result[0].rows.len(), 2);
+    assert_eq!(result[0].rows[0]["ord"], 1);
+    assert_eq!(result[0].rows[0]["name"], "Ada");
+    assert_eq!(result[0].rows[1]["score"], 20);
+}
+
+#[test]
 fn evaluates_group_concat_order_separator_and_multi_distinct_count() {
     let engine = Engine::default();
 
@@ -612,9 +685,7 @@ fn query_events_report_lifecycle_timing_size_and_optional_results() {
 fn query_events_report_logical_read_and_write_metrics() {
     let engine = Engine::new(EngineConfig::mysql_strict());
     engine
-        .execute_sql(
-            "CREATE TABLE metric_rows (id INT PRIMARY KEY, category VARCHAR(16))",
-        )
+        .execute_sql("CREATE TABLE metric_rows (id INT PRIMARY KEY, category VARCHAR(16))")
         .unwrap();
     let stream = engine.subscribe_query_events(QueryEventOptions::metadata_only());
 

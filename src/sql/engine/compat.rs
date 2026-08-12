@@ -221,6 +221,7 @@ pub(super) fn show_global_variables_result() -> QueryResult {
         "character_set_results",
         "collation_connection",
         "max_allowed_packet",
+        "max_binlog_stmt_cache_size",
         "have_innodb",
         "have_ssl",
         "performance_schema",
@@ -379,6 +380,7 @@ pub(super) fn session_variable_default(name: &str) -> Value {
         }
         "collation_connection" => Value::String("utf8mb4_general_ci".to_string()),
         "max_allowed_packet" => Value::Number(Number::from(67108864)),
+        "max_binlog_stmt_cache_size" => Value::Number(Number::from(4294963200_u64)),
         "log_bin" => Value::Number(Number::from(0)),
         "binlog_format" => Value::String("ROW".to_string()),
         "sql_require_primary_key" => Value::Number(Number::from(0)),

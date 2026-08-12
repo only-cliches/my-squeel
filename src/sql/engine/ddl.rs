@@ -1,6 +1,48 @@
 use super::*;
 
 impl Engine {
+    pub(super) fn replace_table_from_result(&self, table: &str, result: QueryResult) -> Result<()> {
+        self.schemas.remove(table);
+        self.rows.remove(table);
+        self.indexes.remove(table);
+        self.clear_auto_inc(table);
+        self.delete_table_from_storage(table)?;
+
+        let mut schema = TableSchemaHint {
+            table: table.to_string(),
+            ..TableSchemaHint::default()
+        };
+        for column in &result.columns {
+            let value = result.rows.first().and_then(|row| row.get(column));
+            schema.column_order.push(column.clone());
+            schema.columns.insert(
+                column.clone(),
+                ColumnHint {
+                    sql_type: Some(inferred_sql_type(value)),
+                    nullable: Some(value.is_none_or(Value::is_null)),
+                    ..ColumnHint::default()
+                },
+            );
+        }
+        schema.updated_at = Some(Utc::now());
+        self.schemas.insert(table.to_string(), schema);
+        let mut table_rows = BTreeMap::new();
+        for (index, row) in result.rows.into_iter().enumerate() {
+            let key = (index + 1).to_string();
+            let stored = StoredRow::new(
+                table.to_string(),
+                Value::Number(Number::from((index + 1) as u64)),
+                row,
+            );
+            self.persist_row(table, &key, &stored)?;
+            table_rows.insert(key, stored);
+        }
+        self.rows.insert(table.to_string(), table_rows);
+        self.rebuild_indexes(table);
+        self.persist_schema(table)?;
+        Ok(())
+    }
+
     pub(super) fn create_table_as_select(
         &self,
         name: ObjectName,
@@ -342,6 +384,10 @@ impl Engine {
             return Err(anyhow!("unsupported CREATE INDEX syntax: {sql}"));
         };
 
+        if index.or_replace && index.if_not_exists {
+            return Err(anyhow!("Incorrect usage of OR REPLACE and IF NOT EXISTS"));
+        }
+
         if self.mysql_strict() && !self.schemas.contains_key(&index.table) {
             return Err(anyhow!("unknown table: {}", index.table));
         }
@@ -356,7 +402,12 @@ impl Engine {
                 .iter()
                 .any(|existing| existing.name.eq_ignore_ascii_case(&index.name))
             {
-                return Err(anyhow!("duplicate key name: {}", index.name));
+                if index.if_not_exists && !index.or_replace {
+                    return Ok(QueryResult::default());
+                }
+                if !index.or_replace {
+                    return Err(anyhow!("duplicate key name: {}", index.name));
+                }
             }
             for column in &index.columns {
                 if !schema.columns.contains_key(column) {
@@ -373,6 +424,11 @@ impl Engine {
                 table: index.table.clone(),
                 ..TableSchemaHint::default()
             });
+        if index.or_replace {
+            schema
+                .indexes
+                .retain(|existing| !existing.name.eq_ignore_ascii_case(&index.name));
+        }
         add_index_metadata(
             &mut schema,
             IndexHint {
@@ -450,7 +506,11 @@ impl Engine {
         Ok(())
     }
 
-    pub(super) fn drop_index(&self, names: Vec<ObjectName>) -> Result<QueryResult> {
+    pub(super) fn drop_index(
+        &self,
+        names: Vec<ObjectName>,
+        if_exists: bool,
+    ) -> Result<QueryResult> {
         let index_names = names
             .into_iter()
             .map(|name| object_name(&name))
@@ -460,12 +520,31 @@ impl Engine {
             .iter()
             .map(|schema| schema.key().clone())
             .collect::<Vec<_>>();
+        let mut result = QueryResult::default();
         for table in tables {
             for index_name in &index_names {
+                let existed = self.schemas.get(&table).is_some_and(|schema| {
+                    schema
+                        .indexes
+                        .iter()
+                        .any(|index| index.name.eq_ignore_ascii_case(index_name))
+                        || schema.unique.iter().any(|unique| {
+                            unique
+                                .first()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(index_name))
+                        })
+                });
                 self.drop_index_from_table(&table, index_name)?;
+                if if_exists && !existed {
+                    result.warnings.push(QueryWarning {
+                        level: "Note".to_string(),
+                        code: 1091,
+                        message: format!("Can't DROP INDEX `{index_name}`; check that it exists"),
+                    });
+                }
             }
         }
-        Ok(QueryResult::default())
+        Ok(result)
     }
 
     pub(super) fn drop_index_from_table(
@@ -771,10 +850,14 @@ pub(super) fn table_schema_from_create(
         if let Some(foreign_key) = parse_foreign_key_hint(&hint.table, &constraint_text) {
             if !foreign_key.columns.is_empty()
                 && !hint.primary_key.starts_with(&foreign_key.columns)
-                && !hint.unique.iter().any(|columns| columns.starts_with(&foreign_key.columns))
-                && !hint.indexes.iter().any(|index| {
-                    index.columns.starts_with(&foreign_key.columns)
-                })
+                && !hint
+                    .unique
+                    .iter()
+                    .any(|columns| columns.starts_with(&foreign_key.columns))
+                && !hint
+                    .indexes
+                    .iter()
+                    .any(|index| index.columns.starts_with(&foreign_key.columns))
             {
                 add_index_metadata(
                     &mut hint,
@@ -1179,6 +1262,8 @@ struct ParsedIndexHint {
     columns: Vec<String>,
     unique: bool,
     prefix_lengths: Vec<Option<u32>>,
+    if_not_exists: bool,
+    or_replace: bool,
 }
 
 fn parse_create_index_hint(sql: &str) -> Result<Option<ParsedIndexHint>> {
@@ -1199,6 +1284,21 @@ fn parse_create_index_hint(sql: &str) -> Result<Option<ParsedIndexHint>> {
     let Some(name) = tokens.get(index_pos + 1).cloned() else {
         return Ok(None);
     };
+    let (name, if_not_exists) = if name.eq_ignore_ascii_case("IF")
+        && tokens
+            .get(index_pos + 2)
+            .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+        && tokens
+            .get(index_pos + 3)
+            .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+    {
+        let Some(name) = tokens.get(index_pos + 4).cloned() else {
+            return Ok(None);
+        };
+        (name, true)
+    } else {
+        (name, false)
+    };
     let Some(table) = tokens.get(on_pos + 1).cloned() else {
         return Ok(None);
     };
@@ -1213,6 +1313,8 @@ fn parse_create_index_hint(sql: &str) -> Result<Option<ParsedIndexHint>> {
         columns,
         unique: upper.iter().any(|token| token == "UNIQUE"),
         prefix_lengths,
+        if_not_exists,
+        or_replace: upper.windows(2).any(|tokens| tokens == ["OR", "REPLACE"]),
     }))
 }
 

@@ -21,9 +21,6 @@ impl Visitor for SupportValidator {
     type Break = String;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        if query.with.as_ref().is_some_and(|with| with.recursive) {
-            return unsupported("recursive common table expressions (WITH RECURSIVE)");
-        }
         if query.with.as_ref().is_some_and(|with| {
             with.cte_tables
                 .iter()
@@ -61,7 +58,8 @@ impl Visitor for SupportValidator {
         match factor {
             TableFactor::Table { .. }
             | TableFactor::Derived { .. }
-            | TableFactor::NestedJoin { .. } => ControlFlow::Continue(()),
+            | TableFactor::NestedJoin { .. }
+            | TableFactor::JsonTable { .. } => ControlFlow::Continue(()),
             _ => unsupported(format!("table factor `{factor}`")),
         }
     }
@@ -110,6 +108,8 @@ impl Visitor for SupportValidator {
                         | "AVG"
                         | "MIN"
                         | "MAX"
+                        | "STD"
+                        | "STDDEV"
                 ) {
                     ControlFlow::Continue(())
                 } else {
@@ -170,6 +170,7 @@ impl Visitor for SupportValidator {
             | Expr::Case { .. }
             | Expr::Exists { .. }
             | Expr::Subquery(_)
+            | Expr::Tuple(_)
             | Expr::Interval(_) => ControlFlow::Continue(()),
             _ => unsupported(format!("expression `{expr}`")),
         }
@@ -289,6 +290,8 @@ fn supported_binary_operator(operator: &BinaryOperator) -> bool {
             | BinaryOperator::BitwiseAnd
             | BinaryOperator::BitwiseXor
             | BinaryOperator::MyIntegerDivide
+            | BinaryOperator::Arrow
+            | BinaryOperator::LongArrow
     )
 }
 

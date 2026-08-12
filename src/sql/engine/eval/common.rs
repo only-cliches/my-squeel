@@ -48,7 +48,7 @@ pub(super) fn split_top_level_keyword<'a>(
     None
 }
 
-pub(super) fn unquote_sql_string(raw: &str) -> Option<String> {
+pub(crate) fn unquote_sql_string(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let quote = trimmed.chars().next()?;
     if quote != '\'' && quote != '"' {

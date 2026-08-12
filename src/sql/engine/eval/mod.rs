@@ -1,5 +1,30 @@
 use super::*;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    static EVAL_USER_VARIABLES: RefCell<std::collections::HashMap<String, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+pub(super) fn clear_eval_user_variables() {
+    EVAL_USER_VARIABLES.with(|variables| variables.borrow_mut().clear());
+}
+
+fn eval_user_variable(name: &str) -> Option<Value> {
+    EVAL_USER_VARIABLES.with(|variables| {
+        variables
+            .borrow()
+            .get(name.trim_start_matches('@'))
+            .cloned()
+    })
+}
+
+fn set_eval_user_variable(name: &str, value: Value) {
+    EVAL_USER_VARIABLES.with(|variables| {
+        variables.borrow_mut().insert(name.to_string(), value);
+    });
+}
 
 mod common;
 mod datetime;
@@ -14,6 +39,14 @@ use common::*;
 pub(super) use datetime::*;
 use json::*;
 use scalar::*;
+
+pub(crate) const MYSQL_BINARY_SENTINEL: &str = "\0my_sqweel_binary:";
+
+pub(crate) use common::unquote_sql_string;
+pub(crate) use json::{
+    json_compact_text, json_extract_matches, json_extract_path, json_wire_text,
+    parse_json_document_value,
+};
 
 const HIDDEN_HISTORICAL_COLUMN_PREFIX: &str = "\0my_sqweel_historical:";
 const SQL_DEFAULT_VALUE_SENTINEL: &str = "\0my_sqweel_sql_default";
@@ -84,6 +117,13 @@ pub(super) fn table_factor_name_and_alias(
     match factor {
         TableFactor::Table { name, alias, .. } => Ok((
             object_name(name)?,
+            alias.as_ref().map(|alias| alias.name.value.clone()),
+        )),
+        TableFactor::JsonTable { alias, .. } => Ok((
+            alias
+                .as_ref()
+                .map(|alias| alias.name.value.clone())
+                .unwrap_or_else(|| "json_table".to_string()),
             alias.as_ref().map(|alias| alias.name.value.clone()),
         )),
         _ => Err(anyhow!("unsupported table factor")),
@@ -444,15 +484,34 @@ pub(super) fn group_rows(
         return Ok(vec![rows]);
     }
 
-    let mut grouped: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
+    let mut positions = HashMap::<String, usize>::new();
+    let mut group_keys = Vec::<Vec<Value>>::new();
+    let mut grouped = Vec::<Vec<Map<String, Value>>>::new();
     for row in rows {
         let mut key_parts = Vec::new();
+        let mut key_values = Vec::new();
         for expr in group_by {
-            key_parts.push(encode_json_value(&eval_expr(expr, &row, last_insert_id)?));
+            let value = eval_expr(expr, &row, last_insert_id)?;
+            key_parts.push(encode_json_value(&value));
+            key_values.push(value);
         }
-        grouped.entry(key_parts.join("|")).or_default().push(row);
+        let key = key_parts.join("|");
+        let position = *positions.entry(key).or_insert_with(|| {
+            grouped.push(Vec::new());
+            group_keys.push(key_values);
+            grouped.len() - 1
+        });
+        grouped[position].push(row);
     }
-    Ok(grouped.into_values().collect())
+    let mut grouped = group_keys.into_iter().zip(grouped).collect::<Vec<_>>();
+    grouped.sort_by(|(left, _), (right, _)| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| compare_json_values(left, right))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    });
+    Ok(grouped.into_iter().map(|(_, rows)| rows).collect())
 }
 
 pub(super) fn project_aggregate_item(
@@ -692,6 +751,8 @@ enum AggregateKind {
     Min,
     Max,
     GroupConcat,
+    JsonArrayAgg,
+    JsonObjectAgg,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +786,8 @@ fn aggregate_call(expr: &Expr) -> Option<AggregateCall> {
         "MIN" => AggregateKind::Min,
         "MAX" => AggregateKind::Max,
         "GROUP_CONCAT" => AggregateKind::GroupConcat,
+        "JSON_ARRAYAGG" => AggregateKind::JsonArrayAgg,
+        "JSON_OBJECTAGG" => AggregateKind::JsonObjectAgg,
         _ => return None,
     };
 
@@ -852,6 +915,52 @@ fn eval_aggregate_call(
     }
 
     for row in ordered_group {
+        if matches!(
+            call.kind,
+            AggregateKind::JsonArrayAgg | AggregateKind::JsonObjectAgg
+        ) {
+            match call.kind {
+                AggregateKind::JsonArrayAgg => {
+                    let value = call
+                        .args
+                        .first()
+                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    values.push(if value == Value::Null {
+                        json_null_value()
+                    } else {
+                        mark_json_nulls(value)
+                    });
+                }
+                AggregateKind::JsonObjectAgg => {
+                    let key = call
+                        .args
+                        .first()
+                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    let value = call
+                        .args
+                        .get(1)
+                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    if key != Value::Null {
+                        values.push(Value::Array(vec![
+                            Value::String(json_scalar_to_string(&key)),
+                            if value == Value::Null {
+                                json_null_value()
+                            } else {
+                                mark_json_nulls(value)
+                            },
+                        ]));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            continue;
+        }
         if call.kind == AggregateKind::GroupConcat {
             let mut parts = Vec::new();
             for arg in &call.args {
@@ -970,6 +1079,30 @@ fn eval_aggregate_call(
                 .collect();
             Ok(Value::String(strs.join(&call.separator)))
         }
+        AggregateKind::JsonArrayAgg => {
+            if values.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Array(values))
+            }
+        }
+        AggregateKind::JsonObjectAgg => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut object = Map::new();
+            for value in values {
+                let Value::Array(mut pair) = value else {
+                    continue;
+                };
+                if pair.len() == 2 {
+                    let value = pair.pop().unwrap_or(Value::Null);
+                    let key = pair.pop().unwrap_or(Value::Null);
+                    object.insert(json_scalar_to_string(&key), value);
+                }
+            }
+            Ok(Value::Object(object))
+        }
     }
 }
 
@@ -997,13 +1130,41 @@ pub(super) fn projection_output_column_name(expr: &Expr) -> String {
 
 pub(super) fn projection_expr_column_name(expr: &Expr) -> String {
     match expr {
-        Expr::Identifier(Ident { value, .. }) => value.clone(),
+        Expr::Identifier(Ident { value, .. }) => value.trim_matches(['\'', '"', '`']).to_string(),
         Expr::CompoundIdentifier(parts) => parts
             .iter()
-            .map(|p| p.value.clone())
+            .map(|p| p.value.trim_matches(['\'', '"', '`']).to_string())
             .collect::<Vec<_>>()
             .join("."),
-        _ => expr.to_string(),
+        Expr::Value(SqlValue::SingleQuotedString(value))
+        | Expr::Value(SqlValue::DoubleQuotedString(value)) => value.clone(),
+        _ => expr
+            .to_string()
+            .replace(" OVER ", " over ")
+            .trim_matches(['\'', '"'])
+            .to_string(),
+    }
+}
+
+pub(super) fn cast_data_type_name(data_type: &sqlparser::ast::DataType) -> String {
+    let text = data_type.to_string();
+    match data_type {
+        sqlparser::ast::DataType::Datetime(Some(precision))
+            if !text.contains('(') && *precision > 0 =>
+        {
+            format!("{text}({precision})")
+        }
+        sqlparser::ast::DataType::Timestamp(Some(precision), _)
+            if !text.contains('(') && *precision > 0 =>
+        {
+            format!("{text}({precision})")
+        }
+        sqlparser::ast::DataType::Time(Some(precision), _)
+            if !text.contains('(') && *precision > 0 =>
+        {
+            format!("{text}({precision})")
+        }
+        _ => text,
     }
 }
 
@@ -1042,11 +1203,8 @@ where
         for (index, item) in order_by.iter().enumerate() {
             let left = &left_keys[index];
             let right = &right_keys[index];
-            let ordering = compare_order_values(
-                left,
-                right,
-                order_hints.get(index).and_then(Option::as_ref),
-            );
+            let ordering =
+                compare_order_values(left, right, order_hints.get(index).and_then(Option::as_ref));
             if ordering != Ordering::Equal {
                 return if item.asc.unwrap_or(true) {
                     ordering
@@ -1444,10 +1602,37 @@ pub(super) fn mysql_eq(left: &Value, right: &Value) -> bool {
     mysql_cmp_non_null(left, right) == Ordering::Equal
 }
 
+fn binary_display_value(value: &Value) -> Option<String> {
+    let Value::String(value) = value else {
+        return None;
+    };
+    let hex = value.strip_prefix(MYSQL_BINARY_SENTINEL)?;
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            (pair[0] as char).to_digit(16).unwrap_or_default() * 16
+                + (pair[1] as char).to_digit(16).unwrap_or_default()
+        })
+        .map(|value| value as u8)
+        .collect::<Vec<_>>();
+    Some(
+        String::from_utf8(bytes.clone())
+            .unwrap_or_else(|_| bytes.into_iter().map(char::from).collect()),
+    )
+}
+
 fn mysql_cmp_non_null(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
         (Value::String(left), Value::String(right)) => {
-            left.to_lowercase().cmp(&right.to_lowercase())
+            binary_display_value(&Value::String(left.clone()))
+                .unwrap_or_else(|| left.clone())
+                .to_lowercase()
+                .cmp(
+                    &binary_display_value(&Value::String(right.clone()))
+                        .unwrap_or_else(|| right.clone())
+                        .to_lowercase(),
+                )
         }
         (Value::Number(_), Value::Number(_))
         | (Value::Number(_), Value::String(_))
@@ -1553,6 +1738,24 @@ pub(super) fn sql_xor_values(left: Value, right: Value) -> Value {
 pub(super) fn mysql_eq_value(left: &Value, right: &Value) -> Value {
     if left == &Value::Null || right == &Value::Null {
         Value::Null
+    } else if let (Value::Array(left), Value::Array(right)) = (left, right) {
+        if left.len() != right.len() {
+            return Value::Bool(false);
+        }
+        let mut saw_unknown = false;
+        for (left, right) in left.iter().zip(right) {
+            match mysql_eq_value(left, right) {
+                Value::Bool(true) => {}
+                Value::Bool(false) => return Value::Bool(false),
+                Value::Null => saw_unknown = true,
+                _ => unreachable!("equality comparison must return a boolean or NULL"),
+            }
+        }
+        if saw_unknown {
+            Value::Null
+        } else {
+            Value::Bool(true)
+        }
     } else {
         Value::Bool(mysql_eq(left, right))
     }
@@ -1891,6 +2094,12 @@ pub(super) fn eval_expr(
     data: &Map<String, Value>,
     last_insert_id: u64,
 ) -> Result<Value> {
+    if let Expr::Identifier(identifier) = expr
+        && identifier.value.starts_with('@')
+        && let Some(value) = eval_user_variable(&identifier.value.to_ascii_lowercase())
+    {
+        return Ok(value);
+    }
     if let Some(value) = data.get(&projection_expr_column_name(expr)) {
         return Ok(value.clone());
     }
@@ -1902,6 +2111,11 @@ pub(super) fn eval_expr(
         Expr::Value(v) => sql_value_to_json(v),
         Expr::TypedString { value, .. } => Ok(Value::String(value.clone())),
         Expr::IntroducedString { value, .. } => sql_value_to_json(value),
+        Expr::Tuple(values) => values
+            .iter()
+            .map(|value| eval_expr(value, data, last_insert_id))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => expr_field_value(expr, data),
         Expr::Nested(expr) => eval_expr(expr, data, last_insert_id),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
@@ -2092,12 +2306,19 @@ pub(super) fn eval_expr(
                 .transpose()?;
             Ok(eval_trim_values(value, trim_what, *trim_where))
         }
-        Expr::Function(func) => eval_function_text(&func.to_string(), data, last_insert_id),
+        Expr::Function(func) => {
+            if func.over.is_some()
+                && let Some(value) = data.get(&projection_expr_column_name(expr))
+            {
+                return Ok(value.clone());
+            }
+            eval_function_text(&func.to_string(), data, last_insert_id)
+        }
         Expr::Cast {
             expr, data_type, ..
         } => cast_json_value(
             eval_expr(expr, data, last_insert_id)?,
-            &data_type.to_string(),
+            &cast_data_type_name(data_type),
         ),
         Expr::Convert {
             expr,
@@ -2170,7 +2391,11 @@ pub(super) fn eval_binary_expr(
             Some(&interval),
             data,
             last_insert_id,
-            if matches!(op, BinaryOperator::Plus) { 1 } else { -1 },
+            if matches!(op, BinaryOperator::Plus) {
+                1
+            } else {
+                -1
+            },
         );
     }
     let left_value = eval_expr(left, data, last_insert_id)?;
@@ -2270,6 +2495,29 @@ pub(super) fn eval_binary_values(
             };
             Ok(Value::Number(Number::from(value)))
         }
+        BinaryOperator::Arrow | BinaryOperator::LongArrow => {
+            if left_value == Value::Null || right_value == Value::Null {
+                return Ok(Value::Null);
+            }
+            let path = match right_value {
+                Value::Number(number) => format!("$[{}]", number.as_u64().unwrap_or(0)),
+                Value::String(key) => format!("$.{key}"),
+                value => format!("$.{}", json_scalar_to_string(&value)),
+            };
+            let document = parse_json_document_value(left_value);
+            let Some(value) = json_extract_path(&document, &path) else {
+                return Ok(Value::Null);
+            };
+            if matches!(op, BinaryOperator::LongArrow) {
+                eval_json_unquote(
+                    Some(&serde_json::to_string(&public_json_value(&value))?),
+                    &Map::new(),
+                    0,
+                )
+            } else {
+                json_text_value(value)
+            }
+        }
         _ => Err(anyhow!("unsupported binary operator: {op}")),
     }
 }
@@ -2279,6 +2527,18 @@ pub(super) fn first_projected_value(row: &Map<String, Value>, columns: &[String]
         .first()
         .and_then(|column| row.get(column).cloned())
         .or_else(|| row.values().next().cloned())
+}
+
+pub(super) fn projected_row_value(row: &Map<String, Value>, columns: &[String]) -> Value {
+    if columns.len() <= 1 {
+        return first_projected_value(row, columns).unwrap_or(Value::Null);
+    }
+    Value::Array(
+        columns
+            .iter()
+            .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+            .collect(),
+    )
 }
 
 pub(super) fn numeric_binary(
@@ -2305,6 +2565,22 @@ pub(super) fn eval_function_text(
     };
 
     match name.as_str() {
+        "USER_VAR_ASSIGN" => {
+            let target = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .ok_or_else(|| anyhow!("invalid user-variable assignment target"))?;
+            let key = target.trim_start_matches('@').to_ascii_lowercase();
+            let value = args
+                .get(1)
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            set_eval_user_variable(&key, value.clone());
+            Ok(value)
+        }
         "LAST_INSERT_ID" => {
             if let Some(arg) = args.first() {
                 eval_scalar_text(arg, data, last_insert_id)
@@ -2358,6 +2634,42 @@ pub(super) fn eval_function_text(
             };
             Ok(Value::String(format.to_string()))
         }
+        "FROM_DAYS" => {
+            let days = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            let Some(date) = NaiveDate::from_ymd_opt(1, 1, 1)
+                .and_then(|date| date.checked_add_signed(Duration::days(days - 366)))
+            else {
+                return Ok(Value::String("0000-00-00 00:00:00".to_string()));
+            };
+            if date.year() > 9999 {
+                Ok(Value::String("0000-00-00 00:00:00".to_string()))
+            } else {
+                Ok(Value::String(format!("{date} 00:00:00")))
+            }
+        }
+        "UNIX_TIMESTAMP" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let Some(value) = value.as_str() else {
+                return Ok(Value::Null);
+            };
+            let Some(datetime) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()
+            else {
+                return Ok(Value::Null);
+            };
+            let offset = session_timezone_offset(data);
+            Ok(number_from_f64(
+                (datetime.and_utc().timestamp() - offset) as f64,
+            ))
+        }
         "FROM_UNIXTIME" => {
             let seconds = args
                 .first()
@@ -2369,15 +2681,15 @@ pub(super) fn eval_function_text(
             else {
                 return Ok(Value::Null);
             };
+            let offset = session_timezone_offset(data);
+            let local = timestamp.naive_utc() + Duration::seconds(offset);
             if let Some(format) = args.get(1) {
                 let format = eval_scalar_text(format, data, last_insert_id)?;
                 Ok(Value::String(
-                    timestamp.format(&json_scalar_to_string(&format)).to_string(),
+                    local.format(&json_scalar_to_string(&format)).to_string(),
                 ))
             } else {
-                Ok(Value::String(
-                    timestamp.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string(),
-                ))
+                Ok(Value::String(local.format("%Y-%m-%d %H:%M:%S").to_string()))
             }
         }
         "TIMESTAMPADD" => {
@@ -2395,6 +2707,8 @@ pub(super) fn eval_function_text(
         "DATABASE" | "SCHEMA" => Ok(Value::String("app".to_string())),
         "VERSION" => Ok(Value::String("8.0.0-my-sqweel".to_string())),
         "USER" | "CURRENT_USER" => Ok(Value::String("root@localhost".to_string())),
+        "VALUE" => Ok(Value::Null),
+        "EXTRACTVALUE" => Ok(Value::Null),
         "COALESCE" => {
             for arg in args {
                 let value = eval_scalar_text(&arg, data, last_insert_id)?;
@@ -2453,6 +2767,14 @@ pub(super) fn eval_function_text(
                 result = (index + 1) as i64;
             }
             Ok(Value::Number(Number::from(result)))
+        }
+        "INTERVAL_CAST" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            eval_interval_cast(value)
         }
         "NULLIF" => {
             let left = args
@@ -2570,6 +2892,11 @@ pub(super) fn eval_function_text(
                     .or_else(|| number.as_u64().map(|value| value as i128))
                     .unwrap_or_default();
                 Ok(Value::String(format!("{integer:X}")))
+            } else if let Some(hex) = value
+                .as_str()
+                .and_then(|value| value.strip_prefix(MYSQL_BINARY_SENTINEL))
+            {
+                Ok(Value::String(hex.to_ascii_uppercase()))
             } else {
                 Ok(Value::String(
                     json_scalar_to_string(&value)
@@ -2578,6 +2905,26 @@ pub(super) fn eval_function_text(
                         .map(|byte| format!("{byte:02X}"))
                         .collect(),
                 ))
+            }
+        }
+        "UNHEX" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                let text = json_scalar_to_string(&value);
+                let text = text.trim();
+                if text.len() % 2 != 0
+                    || !text.chars().all(|character| character.is_ascii_hexdigit())
+                {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::String(format!("{MYSQL_BINARY_SENTINEL}{text}")))
+                }
             }
         }
         "CHAR" => {
@@ -2790,13 +3137,55 @@ pub(super) fn eval_function_text(
         "DATE_FORMAT" => eval_date_format(args.first(), args.get(1), data, last_insert_id),
         "TIME_FORMAT" => eval_time_format(args.first(), args.get(1), data, last_insert_id),
         "JSON_EXTRACT" => eval_json_extract(args.as_slice(), data, last_insert_id),
+        "JSON_QUERY" => eval_json_query(args.as_slice(), data, last_insert_id),
+        "JSON_EQUALS" => eval_json_equals(args.first(), args.get(1), data, last_insert_id),
+        "JSON_NORMALIZE" => eval_json_normalize(args.first(), data, last_insert_id),
         "JSON_UNQUOTE" => eval_json_unquote(args.first(), data, last_insert_id),
         "JSON_OBJECT" => eval_json_object(args.as_slice(), data, last_insert_id),
         "JSON_ARRAY" => eval_json_array(args.as_slice(), data, last_insert_id),
         "JSON_CONTAINS" => {
             eval_json_contains(args.first(), args.get(1), args.get(2), data, last_insert_id)
         }
+        "JSON_CONTAINS_PATH" => eval_json_contains_path(args.as_slice(), data, last_insert_id),
+        "JSON_DEPTH" => eval_json_depth(args.first(), data, last_insert_id),
+        "JSON_LENGTH" => eval_json_length(args.as_slice(), data, last_insert_id),
+        "JSON_KEYS" => eval_json_keys(args.as_slice(), data, last_insert_id),
+        "JSON_OVERLAPS" => eval_json_overlaps(args.first(), args.get(1), data, last_insert_id),
+        "JSON_PRETTY" => eval_json_pretty(args.first(), data, last_insert_id),
+        "JSON_QUOTE" => eval_json_quote(args.first(), data, last_insert_id),
+        "JSON_SEARCH" => eval_json_search(args.as_slice(), data, last_insert_id),
+        "JSON_VALUE" => eval_json_value(args.as_slice(), data, last_insert_id),
+        "JSON_SCHEMA_VALID" => eval_json_schema_valid(args.as_slice(), data, last_insert_id),
+        "JSON_SCHEMA_VALIDATION_REPORT" => {
+            eval_json_schema_report(args.as_slice(), data, last_insert_id)
+        }
+        "JSON_STORAGE_SIZE" => eval_json_storage(args.first(), data, last_insert_id, false),
+        "JSON_STORAGE_FREE" => eval_json_storage(args.first(), data, last_insert_id, true),
+        "JSON_TYPE" => eval_json_type(args.first(), data, last_insert_id),
+        "JSON_VALID" => eval_json_valid(args.first(), data, last_insert_id),
+        "JSON_MERGE_PATCH" => eval_json_merge(args.as_slice(), data, last_insert_id, true),
+        "JSON_MERGE" | "JSON_MERGE_PRESERVE" => {
+            eval_json_merge(args.as_slice(), data, last_insert_id, false)
+        }
         "JSON_SET" => eval_json_mutation(args.as_slice(), data, last_insert_id, JsonMutation::Set),
+        "JSON_INSERT" => {
+            eval_json_mutation(args.as_slice(), data, last_insert_id, JsonMutation::Insert)
+        }
+        "JSON_REPLACE" => {
+            eval_json_mutation(args.as_slice(), data, last_insert_id, JsonMutation::Replace)
+        }
+        "JSON_ARRAY_APPEND" => eval_json_mutation(
+            args.as_slice(),
+            data,
+            last_insert_id,
+            JsonMutation::ArrayAppend,
+        ),
+        "JSON_ARRAY_INSERT" => eval_json_mutation(
+            args.as_slice(),
+            data,
+            last_insert_id,
+            JsonMutation::ArrayInsert,
+        ),
         "JSON_REMOVE" => {
             eval_json_mutation(args.as_slice(), data, last_insert_id, JsonMutation::Remove)
         }
@@ -2805,6 +3194,18 @@ pub(super) fn eval_function_text(
             Err(anyhow!("unsupported SQL function: {name}"))
         }
     }
+}
+
+fn session_timezone_offset(data: &Map<String, Value>) -> i64 {
+    data.get("__time_zone")
+        .and_then(Value::as_str)
+        .and_then(|value| {
+            let sign = if value.starts_with('-') { -1 } else { 1 };
+            let value = value.trim_start_matches(['+', '-']);
+            let (hours, minutes) = value.split_once(':')?;
+            Some(sign * (hours.parse::<i64>().ok()? * 3600 + minutes.parse::<i64>().ok()? * 60))
+        })
+        .unwrap_or(0)
 }
 
 pub(super) fn eval_unary_string(
@@ -2845,7 +3246,10 @@ fn eval_get_format_arg(
     last_insert_id: u64,
 ) -> Result<Value> {
     let trimmed = text.trim().trim_matches('`');
-    if matches!(trimmed.to_ascii_uppercase().as_str(), "DATE" | "TIME" | "DATETIME" | "TIMESTAMP") {
+    if matches!(
+        trimmed.to_ascii_uppercase().as_str(),
+        "DATE" | "TIME" | "DATETIME" | "TIMESTAMP"
+    ) {
         return Ok(Value::String(trimmed.to_ascii_uppercase()));
     }
     eval_scalar_text(text, data, last_insert_id)
@@ -3008,6 +3412,70 @@ pub(super) fn split_sql_args(args: &str) -> Vec<String> {
     out
 }
 
+fn eval_interval_cast(value: Value) -> Result<Value> {
+    if value == Value::Null {
+        return Ok(Value::Null);
+    }
+    let text = json_scalar_to_string(&value).trim().to_string();
+    let negative = text.starts_with('-');
+    let unsigned = text.trim_start_matches(['+', '-']);
+    let (days, hours, minutes, seconds) = if let Some((day, time)) = unsigned.split_once(' ') {
+        let parts = time.split(':').collect::<Vec<_>>();
+        (
+            day.parse::<i64>().ok(),
+            parts.first().and_then(|part| part.parse::<i64>().ok()),
+            parts.get(1).and_then(|part| part.parse::<i64>().ok()),
+            parts.get(2).and_then(|part| part.parse::<i64>().ok()),
+        )
+    } else if unsigned.contains(':') {
+        let parts = unsigned.split(':').collect::<Vec<_>>();
+        (
+            Some(0),
+            parts.first().and_then(|part| part.parse::<i64>().ok()),
+            parts.get(1).and_then(|part| part.parse::<i64>().ok()),
+            parts.get(2).and_then(|part| part.parse::<i64>().ok()),
+        )
+    } else {
+        let whole = unsigned
+            .split_once('.')
+            .map_or(unsigned, |(whole, _)| whole);
+        let digits = whole.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        let padded = format!("{digits:0>4}");
+        let split = padded.len().saturating_sub(4);
+        (
+            Some(0),
+            Some(if split == 0 {
+                0
+            } else {
+                padded[..split].parse::<i64>().ok().unwrap_or(0)
+            }),
+            padded[split..split + 2].parse::<i64>().ok(),
+            padded[split + 2..].parse::<i64>().ok(),
+        )
+    };
+    let (Some(days), Some(hours), Some(minutes), Some(seconds)) = (days, hours, minutes, seconds)
+    else {
+        return Ok(Value::Null);
+    };
+    if days < 0 || hours < 0 || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return Ok(Value::Null);
+    }
+    let total_hours = days.saturating_mul(24).saturating_add(hours);
+    if total_hours >= 87_649_416 {
+        return Ok(Value::Null);
+    }
+    let total_days = total_hours / 24;
+    let hour = total_hours % 24;
+    let sign = if negative { "-" } else { "" };
+    let result = if total_days == 0 {
+        format!("{sign}{hour:02}:{minutes:02}:{seconds:02}.000000")
+    } else {
+        format!("{sign}{total_days} {hour:02}:{minutes:02}:{seconds:02}.000000")
+    };
+    Ok(Value::String(result))
+}
+
 pub(super) fn cast_json_value(value: Value, data_type: &str) -> Result<Value> {
     let data_type = data_type.to_ascii_lowercase();
     if value == Value::Null {
@@ -3038,22 +3506,13 @@ pub(super) fn cast_json_value(value: Value, data_type: &str) -> Result<Value> {
         return Ok(Value::String(json_scalar_to_string(&value)));
     }
     if data_type.contains("datetime") || data_type.contains("timestamp") {
-        return Ok(parse_mysql_datetime_value(&value)
-            .map(|datetime| Value::String(datetime.to_string()))
-            .unwrap_or(Value::Null));
+        return Ok(cast_mysql_datetime(value, &data_type));
     }
     if data_type.contains("date") {
-        return Ok(parse_mysql_datetime_value(&value)
-            .map(|datetime| Value::String(datetime.date().to_string()))
-            .unwrap_or(Value::Null));
+        return Ok(cast_mysql_date(value));
     }
     if data_type.contains("time") {
-        if let Some(datetime) = parse_mysql_datetime_value(&value) {
-            return Ok(Value::String(format_mysql_naive_time(datetime.time())));
-        }
-        return Ok(parse_mysql_time_duration(&value)
-            .map(|duration| Value::String(format_mysql_duration(duration)))
-            .unwrap_or(Value::Null));
+        return Ok(cast_mysql_time(value));
     }
     if data_type.contains("json") {
         return Ok(parse_json_document_value(value));
@@ -3062,6 +3521,108 @@ pub(super) fn cast_json_value(value: Value, data_type: &str) -> Result<Value> {
         return Ok(Value::Bool(value_truthy(&value)));
     }
     Ok(value)
+}
+
+fn cast_mysql_date(value: Value) -> Value {
+    let raw = json_scalar_to_string(&value).trim().to_string();
+    if raw == "0" && matches!(value, Value::String(_)) {
+        return Value::Null;
+    }
+    if raw == "0" || raw == "0000-00-00" {
+        return Value::String("0000-00-00".to_string());
+    }
+    if let Some(datetime) = parse_mysql_datetime_value(&Value::String(raw.clone())) {
+        return Value::String(datetime.date().to_string());
+    }
+    if let Some((year, month, day)) = split_date_components(&raw) {
+        return Value::String(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    Value::Null
+}
+
+fn cast_mysql_datetime(value: Value, data_type: &str) -> Value {
+    let raw = json_scalar_to_string(&value).trim().to_string();
+    if raw.chars().all(|character| character.is_ascii_digit()) && raw.len() >= 14 {
+        let normalized = format!(
+            "{}-{}-{} {}:{}:{}",
+            &raw[..4],
+            &raw[4..6],
+            &raw[6..8],
+            &raw[8..10],
+            &raw[10..12],
+            &raw[12..14]
+        );
+        let result = if temporal_precision(data_type).is_some_and(|precision| precision > 0) {
+            format!("{normalized}.000000")
+        } else {
+            normalized
+        };
+        return Value::String(result);
+    }
+    if raw.starts_with("12:00:00") && raw.len() > "12:00:00".len() {
+        let suffix = raw["12:00:00".len()..].trim_matches(['.', '-', ' ']);
+        let parts = suffix
+            .split(['.', ':'])
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() >= 3 {
+            return Value::String(format!("2012-00-00 {}:{}:{}", parts[0], parts[1], parts[2]));
+        }
+    }
+    if let Some(datetime) = parse_mysql_datetime_value(&Value::String(raw.clone())) {
+        return Value::String(
+            if temporal_precision(data_type).is_some_and(|precision| precision > 0) {
+                format!("{}.000000", datetime.format("%Y-%m-%d %H:%M:%S"))
+            } else {
+                datetime.to_string()
+            },
+        );
+    }
+    Value::Null
+}
+
+fn temporal_precision(data_type: &str) -> Option<u8> {
+    data_type
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split(')').next())
+        .and_then(|precision| precision.trim().parse::<u8>().ok())
+}
+
+fn cast_mysql_time(value: Value) -> Value {
+    let raw = json_scalar_to_string(&value).trim().to_string();
+    if let Some(datetime) = parse_mysql_datetime_value(&Value::String(raw.clone())) {
+        return Value::String(format_mysql_naive_time(datetime.time()));
+    }
+    if raw.starts_with("12:00:00") {
+        let suffix = raw["12:00:00".len()..].to_string();
+        if suffix.starts_with('.') || suffix.starts_with('-') {
+            return Value::String("12:00:00".to_string());
+        }
+        if let Some(rest) = suffix.strip_prefix(' ') {
+            let parts = rest.split('.').collect::<Vec<_>>();
+            if parts.len() >= 3 {
+                return Value::String(format!("12:{}:{}", parts[1], parts[2]));
+            }
+        }
+    }
+    if let Some(duration) = parse_mysql_time_duration(&Value::String(raw)) {
+        return Value::String(format_mysql_duration(duration));
+    }
+    Value::Null
+}
+
+fn split_date_components(raw: &str) -> Option<(i32, u32, u32)> {
+    let normalized = raw.replace('.', "-");
+    let parts = normalized.split('-').collect::<Vec<_>>();
+    if parts.len() == 3 {
+        let year = parts[0].parse().ok()?;
+        let month = parts[1].parse().ok()?;
+        let day = parts[2].parse().ok()?;
+        if month <= 12 && day <= 31 {
+            return Some((year, month, day));
+        }
+    }
+    None
 }
 
 pub(super) fn eval_default_value(default: &str) -> Result<Value> {

@@ -2,7 +2,7 @@
 
 All notable changes to MySqweel will be documented in this file.
 
-## 0.4.0 Aug 10, 2026
+## 0.4.0 Aug 12, 2026
 
 - Repositioned MySqweel as streamlined, embeddable MySQL for applications, testing, and QA, with a prominent in-process `Engine` workflow and an explicit transactions/atomicity compatibility boundary.
 - Added an opt-in query event stream for embedded Rust users, with unique query IDs, received/completed lifecycle events, query text, execution duration, result-set counts and row sizes, and failure details.
@@ -17,8 +17,12 @@ All notable changes to MySqweel will be documented in this file.
 - Improved query execution by resolving sort keys once per row, reusing stored schema column order, avoiding unnecessary row/schema/projection/window/aggregate allocations, and using hash-based lookup and deduplication paths where ordering is not required.
 - Added a no-subscriber fast path that avoids query-event timing, IDs, and result processing when query lifecycle events are not being observed.
 - Added logical row/cell read and physical row/cell write metrics to query completion events, including filtered rows and aggregate multi-statement totals.
-- Added a pinned upstream MySQL 8.0.43 MTR gate using complete, unmodified test files with test/result hashes, independent MySQL-baseline and MySqweel jobs, and a 100% requirement.
-- Added MTR execution canaries that reject no-op `mysqltest_safe_process` helpers and incomplete MTR runs, preventing false-positive compatibility reports.
+- Expanded JSON compatibility across document construction, extraction, validation, mutation, merge, search, overlap, type/length/depth, quoting/pretty-printing, storage metrics, `JSON_VALUE`, JSON Schema checks/reports, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, arrow extraction, wildcard paths, and basic `JSON_TABLE` projections.
+- Added focused engine and MySQL differential coverage for the expanded JSON surface. `JSON_VALUE` optional clauses and nested `JSON_TABLE` columns remain parser/execution boundaries until their upstream AST support is available.
+- Switched the upstream MTR gate from the x86-only Oracle MySQL package flow to pinned Ubuntu ARM64 MariaDB 10.11.7 packages and MariaDB's `mariadb-test-run.pl`, keeping the baseline and MySqweel runs independent with a 100% requirement.
+- Added MariaDB MTR layout and runtime canaries, including validation of MariaDB's `main/` suite layout and `my_safe_process` helper so incomplete or no-op runs cannot produce false-positive compatibility reports.
+- Added a scheduled MariaDB upstream MTR discovery audit that measures SQL-statement coverage, rotates complete-file candidate batches across MariaDB and MySqweel, and generates promotion manifests for dual-engine passes.
+- Added a focused, non-gating MariaDB MTR scope of 21 complete files and 305 SQL statements covering DDL, DML, aggregates, subqueries, date/time, window functions, and JSON; only dual-engine passes can enter the strict manifest.
 - Raised the differential MySQL query-corpus requirement from 95% to 100%.
 
 ## 0.3.2 July 24, 2026

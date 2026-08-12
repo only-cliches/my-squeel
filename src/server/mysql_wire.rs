@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use chrono::{Datelike, Timelike};
 use msql_srv::{
     Column, ColumnFlags, ColumnType, ErrorKind, InitWriter, MysqlIntermediary, MysqlShim,
     ParamParser, ParamValue, QueryResultWriter, StatementMetaWriter, ToMysqlValue, ValueInner,
@@ -258,7 +259,11 @@ impl Backend {
                     .split_once('=')
                     .map(|(_, value)| {
                         matches!(
-                            value.trim().trim_matches(['\'', '"']).to_ascii_uppercase().as_str(),
+                            value
+                                .trim()
+                                .trim_matches(['\'', '"'])
+                                .to_ascii_uppercase()
+                                .as_str(),
                             "ON" | "1" | "TRUE"
                         )
                     })
@@ -289,8 +294,12 @@ impl Backend {
                 continue;
             };
             let name = normalize_session_var_name(name);
-            self.session_vars
-                .insert(name, parse_session_value(value.trim()));
+            let parsed = parse_session_value(value.trim());
+            if name.eq_ignore_ascii_case("time_zone") {
+                self.engine
+                    .set_session_time_zone(parsed.as_str().unwrap_or("+00:00"));
+            }
+            self.session_vars.insert(name, parsed);
         }
     }
 
@@ -393,7 +402,11 @@ fn system_variable_query_result(sql: &str) -> QueryResult {
 }
 
 fn show_warnings_result(warnings: &[QueryWarning]) -> QueryResult {
-    let columns = vec!["Level".to_string(), "Code".to_string(), "Message".to_string()];
+    let columns = vec![
+        "Level".to_string(),
+        "Code".to_string(),
+        "Message".to_string(),
+    ];
     let rows = warnings
         .iter()
         .map(|warning| {
@@ -403,7 +416,10 @@ fn show_warnings_result(warnings: &[QueryWarning]) -> QueryResult {
                 "Code".to_string(),
                 Value::Number(serde_json::Number::from(warning.code)),
             );
-            row.insert("Message".to_string(), Value::String(warning.message.clone()));
+            row.insert(
+                "Message".to_string(),
+                Value::String(warning.message.clone()),
+            );
             row
         })
         .collect();
@@ -535,6 +551,10 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_INVALID_GROUP_FUNC_USE
     } else if message.contains("select options cannot be combined") {
         ErrorKind::ER_WRONG_USAGE
+    } else if message.contains("incorrect usage of or replace and if not exists") {
+        ErrorKind::ER_WRONG_USAGE
+    } else if message.contains("window frame bound specifications") {
+        ErrorKind::ER_BAD_COMBINATION_OF_WINDOW_FRAME_BOUND_SPECS
     } else if message.contains("too few arguments") {
         ErrorKind::ER_SP_WRONG_NO_OF_ARGS
     } else if message.contains("data too long") {
@@ -581,15 +601,23 @@ fn write_result<W: io::Read + io::Write>(
 
     let warning_count = out.warnings.len().min(u16::MAX as usize) as u16;
     if columns.is_empty() {
-        return results.completed_with_warnings(out.rows_affected, out.last_insert_id, warning_count);
+        return results.completed_with_warnings(
+            out.rows_affected,
+            out.last_insert_id,
+            warning_count,
+        );
     }
 
     let mut decimal_columns = query.map(mysql_decimal_columns).unwrap_or_default();
+    let mut float_columns = HashMap::new();
     for metadata in &out.column_metadata {
         if metadata.column_type == MysqlColumnType::Decimal {
             decimal_columns
                 .entry(metadata.name.clone())
                 .or_insert(metadata.decimals as usize);
+        }
+        if metadata.column_type == MysqlColumnType::Float && metadata.decimals > 0 {
+            float_columns.insert(metadata.name.clone(), metadata.decimals as usize);
         }
     }
     let defs: Vec<Column> = columns
@@ -641,7 +669,14 @@ fn write_result<W: io::Read + io::Write>(
 
     let mut rw = results.start_with_warnings(&defs, warning_count)?;
     for row in out.rows {
-        write_row(&mut rw, &row, &columns, &defs, &decimal_columns)?;
+        write_row(
+            &mut rw,
+            &row,
+            &columns,
+            &defs,
+            &decimal_columns,
+            &float_columns,
+        )?;
         rw.end_row()?;
     }
     rw.finish()
@@ -823,10 +858,28 @@ fn write_row<W: io::Read + io::Write>(
     columns: &[String],
     definitions: &[Column],
     decimal_columns: &HashMap<String, usize>,
+    float_columns: &HashMap<String, usize>,
 ) -> io::Result<()> {
     for (index, key) in columns.iter().enumerate() {
         let definition = &definitions[index];
         let value = row.get(key).cloned().unwrap_or(Value::Null);
+        if let Value::String(value) = &value
+            && let Some(hex) = value.strip_prefix(crate::sql::engine::MYSQL_BINARY_SENTINEL)
+        {
+            let bytes = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    (pair[0] as char).to_digit(16).unwrap_or_default() * 16
+                        + (pair[1] as char).to_digit(16).unwrap_or_default()
+                })
+                .map(|value| value as u8)
+                .collect::<Vec<_>>();
+            let display = String::from_utf8(bytes.clone())
+                .unwrap_or_else(|_| bytes.into_iter().map(char::from).collect());
+            rw.write_col(display)?;
+            continue;
+        }
         match value {
             Value::Null
                 if definition.coltype == ColumnType::MYSQL_TYPE_DATE
@@ -859,7 +912,12 @@ fn write_row<W: io::Read + io::Write>(
                         write_numeric_column(rw, value, definition)?;
                     }
                 } else if definition.coltype == ColumnType::MYSQL_TYPE_FLOAT {
-                    rw.write_col(number.as_f64().unwrap_or_default() as f32)?;
+                    let value = number.as_f64().unwrap_or_default() as f32;
+                    if let Some(scale) = float_columns.get(key) {
+                        rw.write_col(format!("{value:.scale$}"))?;
+                    } else {
+                        rw.write_col(value)?;
+                    }
                 } else if definition.coltype == ColumnType::MYSQL_TYPE_DOUBLE {
                     rw.write_col(number.as_f64().unwrap_or_default())?;
                 } else {
@@ -871,6 +929,31 @@ fn write_row<W: io::Read + io::Write>(
                     && value == crate::sql::engine::JSON_NULL_SENTINEL =>
             {
                 rw.write_col("null")?;
+            }
+            Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_JSON => {
+                if definition.table.is_empty() {
+                    match serde_json::from_str::<serde_json::Value>(&value) {
+                        Ok(value) => {
+                            rw.write_col(crate::sql::engine::json_wire_text(&value).map_err(
+                                |error| io::Error::new(io::ErrorKind::InvalidData, error),
+                            )?)?
+                        }
+                        Err(_) => rw.write_col(value)?,
+                    }
+                } else {
+                    rw.write_col(value)?;
+                }
+            }
+            Value::Array(_) | Value::Object(_)
+                if definition.coltype == ColumnType::MYSQL_TYPE_JSON =>
+            {
+                let text = if definition.table.is_empty() {
+                    crate::sql::engine::json_wire_text(&value)
+                } else {
+                    crate::sql::engine::json_compact_text(&value)
+                }
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                rw.write_col(text)?;
             }
             Value::String(value) => write_string_column(rw, &value, definition)?,
             other => rw.write_col(other.to_string())?,
@@ -964,6 +1047,7 @@ fn write_string_column<W: io::Read + io::Write>(
 ) -> io::Result<()> {
     match definition.coltype {
         ColumnType::MYSQL_TYPE_DATE if value == "0000-00-00" => rw.write_col(ZeroDate),
+        ColumnType::MYSQL_TYPE_DATE if zero_component_date(value) => rw.write_col(value),
         ColumnType::MYSQL_TYPE_DATE => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             .and_then(|value| rw.write_col(value)),
@@ -974,7 +1058,10 @@ fn write_string_column<W: io::Read + io::Write>(
         }
         ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
             if let Some(parsed) = parse_mysql_datetime_value(value) {
-                rw.write_col(parsed)
+                rw.write_col(MysqlDateTimeValue {
+                    value: parsed,
+                    force_fraction: value.contains('.'),
+                })
             } else {
                 rw.write_col(value)
             }
@@ -1005,6 +1092,60 @@ fn write_string_column<W: io::Read + io::Write>(
 struct ZeroDateTime;
 
 struct ZeroDate;
+
+struct MysqlDateTimeValue {
+    value: chrono::NaiveDateTime,
+    force_fraction: bool,
+}
+
+impl ToMysqlValue for MysqlDateTimeValue {
+    fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        let micros = self.value.nanosecond() / 1_000;
+        let text = if self.force_fraction && micros == 0 {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.000000",
+                self.value.year(),
+                self.value.month(),
+                self.value.day(),
+                self.value.hour(),
+                self.value.minute(),
+                self.value.second()
+            )
+        } else if self.force_fraction || micros != 0 {
+            self.value.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+        } else {
+            self.value.format("%Y-%m-%d %H:%M:%S").to_string()
+        };
+        msql_srv::ToMysqlValue::to_mysql_text(&text, writer)
+    }
+
+    fn to_mysql_bin<W: io::Write>(&self, writer: &mut W, column: &Column) -> io::Result<()> {
+        if !matches!(
+            column.coltype,
+            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "datetime value used with a non-datetime column",
+            ));
+        }
+        let micros = self.value.nanosecond() / 1_000;
+        let include_fraction = self.force_fraction || micros != 0;
+        writer.write_all(&[if include_fraction { 11 } else { 7 }])?;
+        writer.write_all(&(self.value.year() as u16).to_le_bytes())?;
+        writer.write_all(&[
+            self.value.month() as u8,
+            self.value.day() as u8,
+            self.value.hour() as u8,
+            self.value.minute() as u8,
+            self.value.second() as u8,
+        ])?;
+        if include_fraction {
+            writer.write_all(&micros.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
 
 impl ToMysqlValue for ZeroDate {
     fn to_mysql_text<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -1074,11 +1215,14 @@ fn validate_wire_rows(
 fn validate_wire_string(value: &str, definition: &Column) -> io::Result<()> {
     let valid = match definition.coltype {
         ColumnType::MYSQL_TYPE_DATE => {
-            value == "0000-00-00" || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+            value == "0000-00-00"
+                || zero_component_date(value)
+                || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
         }
         ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => {
             value == "0000-00-00 00:00:00"
                 || parse_mysql_datetime_value(value).is_some()
+                || zero_component_datetime(value)
                 || is_mysql_time_text(value)
         }
         ColumnType::MYSQL_TYPE_TIME => parse_mysql_time_value(value).is_ok(),
@@ -1096,6 +1240,23 @@ fn validate_wire_string(value: &str, definition: &Column) -> io::Result<()> {
             "incorrect datetime or numeric value in result row",
         ))
     }
+}
+
+fn zero_component_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value[..4].chars().all(|c| c.is_ascii_digit())
+        && value[5..7].chars().all(|c| c.is_ascii_digit())
+        && value[8..].chars().all(|c| c.is_ascii_digit())
+        && (value[5..7] == *"00" || value[8..] == *"00")
+}
+
+fn zero_component_datetime(value: &str) -> bool {
+    let Some((date, time)) = value.split_once(' ') else {
+        return false;
+    };
+    zero_component_date(date) && parse_mysql_time_value(time).is_ok()
 }
 
 fn is_mysql_time_text(value: &str) -> bool {
@@ -1428,17 +1589,24 @@ fn param_to_json(param: ParamValue<'_>) -> Value {
             .unwrap_or(Value::Null),
         ValueInner::Date(bytes) => Value::String(
             decode_mysql_date_parameter(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+                .unwrap_or_else(|| normalize_text_temporal_parameter(bytes)),
         ),
         ValueInner::Time(bytes) => Value::String(
             decode_mysql_time_parameter(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+                .unwrap_or_else(|| normalize_text_temporal_parameter(bytes)),
         ),
         ValueInner::Datetime(bytes) => Value::String(
             decode_mysql_datetime_parameter(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string()),
+                .unwrap_or_else(|| normalize_text_temporal_parameter(bytes)),
         ),
     }
+}
+
+fn normalize_text_temporal_parameter(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_string()
 }
 
 fn decode_mysql_date_parameter(bytes: &[u8]) -> Option<String> {

@@ -1,0 +1,8 @@
+# Unmodified MariaDB 10.11.7 MTR files selected for external-server verification.
+#
+# Columns: test feature test_sha256 result_sha256
+# The hashes bind the compatibility claim to the Ubuntu Noble ARM64 package
+# revision 1:10.11.7-2ubuntu2. Promotion should happen only after the same
+# file passes against both the MariaDB baseline and MySqweel in CI.
+adddate_454 date-time 361e082d719dbab64dc5aafb0a5e896847309517a81edffdb56ac1e21d7b8d26 7a42effcc85e501619aa7e8424854396c5829b00b03ff6b5358c225c82aeb56e
+timezone4 date-time eef631cf99f540f935a15a1cfa2d577004950ee9f11dbf1705259bec146f2f7f 44845fd5905e84efb8c64ee003fb17250afb3b0479e3946b5d3fa06c385c9eb0

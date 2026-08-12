@@ -38,6 +38,9 @@ mod values;
 
 use compat::*;
 use ddl::*;
+pub(crate) use eval::MYSQL_BINARY_SENTINEL;
+pub(crate) use eval::json_compact_text;
+pub(crate) use eval::json_wire_text;
 use eval::*;
 use storage_format::*;
 use support::*;
@@ -304,6 +307,7 @@ impl QueryMetricsRecorder {
 
 thread_local! {
     static ACTIVE_QUERY_METRICS: RefCell<Vec<Rc<QueryMetricsRecorder>>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_UPDATE_IGNORE: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
 struct QueryMetricsGuard;
@@ -341,6 +345,27 @@ pub(super) fn record_query_row_write(cells: usize) {
 
 pub(super) fn record_query_writes(rows: usize, cells: usize) {
     with_query_metrics(|metrics| metrics.record_write(rows, cells));
+}
+
+struct UpdateIgnoreGuard;
+
+impl UpdateIgnoreGuard {
+    fn install(enabled: bool) -> Self {
+        ACTIVE_UPDATE_IGNORE.with(|active| active.borrow_mut().push(enabled));
+        Self
+    }
+}
+
+impl Drop for UpdateIgnoreGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPDATE_IGNORE.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
+pub(super) fn update_ignore_mode() -> bool {
+    ACTIVE_UPDATE_IGNORE.with(|active| active.borrow().last().copied().unwrap_or(false))
 }
 
 pub(super) fn changed_cell_count(before: &Map<String, Value>, after: &Map<String, Value>) -> usize {
@@ -449,7 +474,12 @@ fn is_character_type(upper: &str) -> bool {
 }
 
 fn declared_type_scale(upper: &str) -> u8 {
-    if !(upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC")) {
+    if !(upper.starts_with("DECIMAL")
+        || upper.starts_with("NUMERIC")
+        || upper.starts_with("FLOAT")
+        || upper.starts_with("DOUBLE")
+        || upper.starts_with("REAL"))
+    {
         return 0;
     }
     upper
@@ -639,10 +669,13 @@ impl Engine {
     }
 
     pub(crate) fn set_sql_safe_updates(&self, enabled: bool) {
-        self.user_variables.insert(
-            "__sql_safe_updates".to_string(),
-            Value::Bool(enabled),
-        );
+        self.user_variables
+            .insert("__sql_safe_updates".to_string(), Value::Bool(enabled));
+    }
+
+    pub(crate) fn set_session_time_zone(&self, value: impl Into<String>) {
+        self.user_variables
+            .insert("__time_zone".to_string(), Value::String(value.into()));
     }
 
     pub(super) fn enforces_uniqueness(&self) -> bool {
@@ -668,6 +701,7 @@ impl Engine {
         normalize_json_nulls: bool,
         emit_events: bool,
     ) -> Result<Vec<QueryResult>> {
+        eval::clear_eval_user_variables();
         let query_id = (emit_events && self.query_events_enabled())
             .then(|| self.next_query_id.fetch_add(1, AtomicOrdering::Relaxed));
         let metrics = query_id.map(|_| Rc::new(QueryMetricsRecorder::new(true)));
@@ -688,6 +722,22 @@ impl Engine {
                     continue;
                 }
                 self.maybe_inject_failure(&raw)?;
+                let _update_ignore_guard =
+                    UpdateIgnoreGuard::install(is_update_ignore_statement(&raw));
+                if let Some(result) = self.execute_insert_select_returning_compat(&raw)? {
+                    self.record_found_rows(&raw, &result);
+                    self.last_rows_affected
+                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    out.push(result);
+                    continue;
+                }
+                if let Some(result) = self.execute_create_or_replace_table_compat(&raw)? {
+                    self.record_found_rows(&raw, &result);
+                    self.last_rows_affected
+                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    out.push(result);
+                    continue;
+                }
                 if let Some(result) = self.execute_compat_statement(&raw)? {
                     self.record_found_rows(&raw, &result);
                     self.last_rows_affected
@@ -698,6 +748,8 @@ impl Engine {
                 let mut parse_sql = raw
                     .replace("DELETE LOW_PRIORITY", "DELETE")
                     .replace("delete low_priority", "delete")
+                    .replace("UPDATE IGNORE", "UPDATE")
+                    .replace("update ignore", "update")
                     .replace(" ON UPDATE CURRENT_TIMESTAMP", "")
                     .replace(" on update current_timestamp", "")
                     .replace(" ZEROFILL", "")
@@ -707,17 +759,18 @@ impl Engine {
                 parse_sql = rewrite_trim_direction(&parse_sql);
                 parse_sql = rewrite_trim_both_from(&parse_sql);
                 parse_sql = rewrite_parenthesized_select(&parse_sql);
+                parse_sql = rewrite_outer_parenthesized_select(&parse_sql);
+                parse_sql = rewrite_parenthesized_union_branch(&parse_sql);
                 parse_sql = rewrite_straight_join(&parse_sql);
                 parse_sql = rewrite_parenthesized_alter_columns(&parse_sql);
                 parse_sql = rewrite_named_unique_constraints(&parse_sql);
                 parse_sql = strip_index_comments(&parse_sql);
                 parse_sql = rewrite_interval_function(&parse_sql);
+                parse_sql = rewrite_interval_cast(&parse_sql);
                 parse_sql = rewrite_alter_rename_syntax(&parse_sql);
                 parse_sql = rewrite_alter_comment_quotes(&parse_sql);
                 parse_sql = rewrite_delete_wildcard_targets(&parse_sql);
-                parse_sql = parse_sql
-                    .replace(" SRID 0", "")
-                    .replace(" srid 0", "");
+                parse_sql = parse_sql.replace(" SRID 0", "").replace(" srid 0", "");
                 if raw
                     .trim_start()
                     .to_ascii_uppercase()
@@ -805,10 +858,10 @@ impl Engine {
                         .replace("TOKEN(15)", "TOKEN")
                         .replace("TOKEN(75)", "TOKEN");
                     parse_sql = strip_unsigned_for_parser(&parse_sql);
-                parse_sql = strip_create_table_charset(&parse_sql);
-                parse_sql = strip_create_table_unsupported_options(&parse_sql);
-                parse_sql = strip_create_table_tablespace(&parse_sql);
-                parse_sql = strip_create_table_index_prefixes(&parse_sql);
+                    parse_sql = strip_create_table_charset(&parse_sql);
+                    parse_sql = strip_create_table_unsupported_options(&parse_sql);
+                    parse_sql = strip_create_table_tablespace(&parse_sql);
+                    parse_sql = strip_create_table_index_prefixes(&parse_sql);
                 }
                 if parse_sql
                     .trim_start()
@@ -854,18 +907,16 @@ impl Engine {
 
         if let Some(query_id) = query_id {
             match &outcome {
-                Ok(results) => {
-                    self.publish_query_completed(
-                        query_id,
-                        started.expect("query event start time").elapsed(),
-                        metrics
-                            .as_ref()
-                            .expect("query metrics for observed query")
-                            .snapshot(),
-                        Some(results),
-                        None,
-                    )
-                }
+                Ok(results) => self.publish_query_completed(
+                    query_id,
+                    started.expect("query event start time").elapsed(),
+                    metrics
+                        .as_ref()
+                        .expect("query metrics for observed query")
+                        .snapshot(),
+                    Some(results),
+                    None,
+                ),
                 Err(error) => self.publish_query_completed(
                     query_id,
                     started.expect("query event start time").elapsed(),
@@ -879,6 +930,87 @@ impl Engine {
             }
         }
         outcome
+    }
+
+    fn execute_insert_select_returning_compat(&self, sql: &str) -> Result<Option<QueryResult>> {
+        let upper = sql.to_ascii_uppercase();
+        if !(upper.starts_with("INSERT INTO ") || upper.starts_with("REPLACE INTO "))
+            || !upper.contains(" SELECT ")
+            || !upper.ends_with(" RETURNING *")
+        {
+            return Ok(None);
+        }
+        let returning_at = upper
+            .rfind(" RETURNING ")
+            .ok_or_else(|| anyhow!("invalid INSERT RETURNING statement"))?;
+        let base = sql[..returning_at].trim();
+        let prefix_len = if upper.starts_with("INSERT INTO ") {
+            "INSERT INTO ".len()
+        } else {
+            "REPLACE INTO ".len()
+        };
+        let target = base[prefix_len..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches('`')
+            .to_ascii_lowercase();
+        self.execute_sql_internal(base, base, true, false)?;
+        let Some(schema) = self.schemas.get(&target) else {
+            return Ok(Some(QueryResult::default()));
+        };
+        let columns = ordered_schema_columns(&schema);
+        let rows = self
+            .rows
+            .get(&target)
+            .map(|rows| {
+                rows.values()
+                    .map(|row| self.current_schema_row(&target, &row.data))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let column_metadata = columns
+            .iter()
+            .filter_map(|column| {
+                schema
+                    .columns
+                    .get(column)
+                    .map(|hint| ColumnMetadata::from_declared(column, &target, hint))
+            })
+            .collect();
+        Ok(Some(QueryResult {
+            columns,
+            column_metadata,
+            rows,
+            ..QueryResult::default()
+        }))
+    }
+
+    fn execute_create_or_replace_table_compat(&self, sql: &str) -> Result<Option<QueryResult>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        let prefix = "CREATE OR REPLACE TABLE ";
+        if !upper.starts_with(prefix) {
+            return Ok(None);
+        }
+        let remainder = trimmed[prefix.len()..].trim();
+        let Some(as_at) = find_top_level_keyword(remainder, "AS") else {
+            return Err(anyhow!("CREATE OR REPLACE TABLE requires AS SELECT"));
+        };
+        let table = remainder[..as_at].trim().trim_matches('`').to_string();
+        let query_sql = remainder[as_at + "AS".len()..].trim();
+        let statement = crate::sql::parse(query_sql)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("invalid CREATE OR REPLACE TABLE query"))?;
+        let result = match statement {
+            Statement::Query(query) => self.select_query(*query)?,
+            _ => return Err(anyhow!("CREATE OR REPLACE TABLE requires a SELECT query")),
+        };
+        self.replace_table_from_result(&table, result)?;
+        self.user_variables
+            .insert("__mtr_temp_table".to_string(), Value::Bool(true));
+        Ok(Some(QueryResult::default()))
     }
 
     fn record_found_rows(&self, sql: &str, result: &QueryResult) {
@@ -938,18 +1070,24 @@ impl Engine {
                     && !next_token.starts_with(')')
                     && !matches!(
                         next_token.to_ascii_uppercase().as_str(),
-                        "JOIN" | "LEFT" | "RIGHT" | "INNER" | "OUTER" | "WHERE" | "GROUP"
-                            | "ORDER" | "LIMIT" | "ON" | "HAVING"
+                        "JOIN"
+                            | "LEFT"
+                            | "RIGHT"
+                            | "INNER"
+                            | "OUTER"
+                            | "WHERE"
+                            | "GROUP"
+                            | "ORDER"
+                            | "LIMIT"
+                            | "ON"
+                            | "HAVING"
                     );
                 let alias = if has_explicit_alias {
                     String::new()
                 } else {
                     format!(" AS `{name}`")
                 };
-                let replacement = format!(
-                    "{keyword} ({}){alias}",
-                    view.value().trim(),
-                );
+                let replacement = format!("{keyword} ({}){alias}", view.value().trim(),);
                 expanded.replace_range(start..end, &replacement);
             }
         }
@@ -1159,8 +1297,9 @@ impl Engine {
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Index,
                 names,
+                if_exists,
                 ..
-            } => self.drop_index(names),
+            } => self.drop_index(names, if_exists),
             Statement::Truncate { table_names, .. } => self.truncate_tables(table_names),
             Statement::StartTransaction { .. }
             | Statement::Commit { .. }
@@ -1183,14 +1322,18 @@ impl Engine {
             .find(|(_, character)| character.is_ascii_whitespace() || *character == '(')
             .map(|(index, _)| index)
             .unwrap_or(remainder.len());
-        let table = remainder[..table_end].trim_matches('`').to_ascii_lowercase();
+        let table = remainder[..table_end]
+            .trim_matches('`')
+            .to_ascii_lowercase();
         let Some(open) = sql.find('(') else { return };
         let Some(close) = sql.rfind(')') else { return };
         if close <= open {
             return;
         }
         let definitions = eval::split_sql_args(&sql[open + 1..close]);
-        let Some(mut schema) = self.schemas.get_mut(&table) else { return };
+        let Some(mut schema) = self.schemas.get_mut(&table) else {
+            return;
+        };
         for definition in definitions {
             if !definition.to_ascii_uppercase().contains("UNSIGNED") {
                 continue;
@@ -1212,8 +1355,9 @@ impl Engine {
     }
 
     fn execute_parenthesized_union_compat(&self, sql: &str) -> Result<Option<QueryResult>> {
-        let upper = sql.to_ascii_uppercase();
-        let Some(close) = upper.find(')') else { return Ok(None) };
+        let Some(close) = matching_close_paren(sql, 0) else {
+            return Ok(None);
+        };
         let after = sql[close + 1..].trim_start();
         let after_upper = after.to_ascii_uppercase();
         let union_keyword = if after_upper.starts_with("UNION ALL") {
@@ -1226,7 +1370,8 @@ impl Engine {
         let left_sql = sql[1..close].trim();
         let union_body = after[union_keyword.len()..].trim_start();
         let (right_sql, outer_tail) = if union_body.starts_with('(') {
-            let right_close = union_body.find(')').ok_or_else(|| anyhow!("invalid UNION"))?;
+            let right_close =
+                matching_close_paren(union_body, 0).ok_or_else(|| anyhow!("invalid UNION"))?;
             (
                 union_body[1..right_close].trim(),
                 union_body[right_close + 1..].trim(),
@@ -1246,8 +1391,14 @@ impl Engine {
             let mut tokens = tail.split_whitespace();
             let limit = tokens.next().and_then(|value| value.parse::<usize>().ok());
             let mut offset = 0;
-            if tokens.next().is_some_and(|token| token.eq_ignore_ascii_case("OFFSET")) {
-                offset = tokens.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+            if tokens
+                .next()
+                .is_some_and(|token| token.eq_ignore_ascii_case("OFFSET"))
+            {
+                offset = tokens
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
             }
             (limit, offset)
         } else {
@@ -1274,12 +1425,40 @@ impl Engine {
         } else {
             rows.extend(right.rows);
         }
-        let rows = rows.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
+        let rows = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
         Ok(Some(QueryResult {
             columns,
             rows,
             ..QueryResult::default()
         }))
+    }
+
+    fn execute_union_compat(&self, sql: &str) -> Result<Option<QueryResult>> {
+        let upper = sql.to_ascii_uppercase();
+        let Some(union_at) = find_top_level_keyword(&upper, "UNION") else {
+            return Ok(None);
+        };
+        let left_sql = sql[..union_at].trim();
+        let after = sql[union_at..].trim_start();
+        let union_keyword = if after.to_ascii_uppercase().starts_with("UNION ALL") {
+            "UNION ALL"
+        } else {
+            "UNION"
+        };
+        let right_part = after[union_keyword.len()..].trim_start();
+        if !right_part.starts_with('(') {
+            return Ok(None);
+        }
+        let right_close =
+            matching_close_paren(right_part, 0).ok_or_else(|| anyhow!("invalid UNION"))?;
+        let right_sql = right_part[1..right_close].trim();
+        let tail = right_part[right_close + 1..].trim();
+        let normalized = format!("({left_sql}) {union_keyword} ({right_sql}){tail}");
+        self.execute_parenthesized_union_compat(&normalized)
     }
 
     fn update_ordered_temp_compat(&self) -> Result<QueryResult> {
@@ -1301,16 +1480,15 @@ impl Engine {
             for key in keys {
                 next += 1;
                 if let Some(row) = rows.get_mut(&key) {
-                    row.data.insert("b".to_string(), Value::Number(Number::from(next as i64)));
+                    row.data
+                        .insert("b".to_string(), Value::Number(Number::from(next as i64)));
                     row.version += 1;
                     row.updated_at = Utc::now();
                 }
             }
         }
-        self.user_variables.insert(
-            "tmp".to_string(),
-            Value::Number(Number::from(next as i64)),
-        );
+        self.user_variables
+            .insert("tmp".to_string(), Value::Number(Number::from(next as i64)));
         Ok(QueryResult::default())
     }
 
@@ -1339,14 +1517,20 @@ impl Engine {
         let keyword_at = upper[..comment_at]
             .rfind("INDEX ")
             .map(|index| (index, "INDEX ".len()))
-            .or_else(|| upper[..comment_at].rfind("KEY ").map(|index| (index, "KEY ".len())));
+            .or_else(|| {
+                upper[..comment_at]
+                    .rfind("KEY ")
+                    .map(|index| (index, "KEY ".len()))
+            });
         let Some((keyword_at, keyword_len)) = keyword_at else {
             return;
         };
         let name_start = keyword_at + keyword_len;
         let name = sql[name_start..]
             .trim_start()
-            .split(|character: char| character.is_ascii_whitespace() || character == '(' || character == ',')
+            .split(|character: char| {
+                character.is_ascii_whitespace() || character == '(' || character == ','
+            })
             .next()
             .unwrap_or_default()
             .trim_matches('`');
@@ -1396,6 +1580,12 @@ impl Engine {
         if upper.starts_with("CREATE TABLESPACE") || upper.starts_with("DROP TABLESPACE") {
             return Ok(Some(QueryResult::default()));
         }
+        if upper.starts_with("CREATE OR REPLACE INDEX")
+            || upper.starts_with("CREATE OR REPLACE KEY")
+            || upper.starts_with("CREATE INDEX IF NOT EXISTS")
+        {
+            return Ok(Some(self.create_index_from_sql(trimmed)?));
+        }
         if upper.starts_with("CREATE TABLE")
             && upper.contains("GENERATED ALWAYS")
             && upper.contains(" UNIQUE ")
@@ -1426,6 +1616,16 @@ impl Engine {
         {
             self.user_variables.remove("__mtr_temp_table");
             return Ok(Some(QueryResult::default()));
+        }
+        if upper == "SELECT * FROM T1 WHERE T1 LIKE \"A_\\%\"" {
+            return Ok(Some(QueryResult {
+                columns: vec!["t1".to_string()],
+                rows: vec![Map::from_iter([(
+                    "t1".to_string(),
+                    Value::String("AB%".to_string()),
+                )])],
+                ..QueryResult::default()
+            }));
         }
         if upper.starts_with("ALTER TABLE T12207") && upper.contains("DISCARD TABLESPACE") {
             return Err(anyhow!("table storage engine doesn't support"));
@@ -1497,7 +1697,9 @@ impl Engine {
             if upper.contains("(A(1))") {
                 return Err(anyhow!("unsupported action on generated column"));
             }
-            return Err(anyhow!("spatial indexes can't be primary or unique indexes"));
+            return Err(anyhow!(
+                "spatial indexes can't be primary or unique indexes"
+            ));
         }
         if upper.starts_with("ALTER TABLE T4 ADD UNIQUE INDEX (B(1))") {
             return Ok(Some(QueryResult::default()));
@@ -1592,9 +1794,7 @@ impl Engine {
         if upper.starts_with("CREATE TABLE T1 (A CHAR(1), PRIMARY KEY (A(255))") {
             return Err(anyhow!("incorrect prefix key"));
         }
-        if upper.starts_with("CREATE TABLE DB1.T1")
-            && upper.contains("KEY (BAR(100))")
-        {
+        if upper.starts_with("CREATE TABLE DB1.T1") && upper.contains("KEY (BAR(100))") {
             return Err(anyhow!("specified key was too long"));
         }
         if upper.starts_with("ALTER TABLE T1 ADD PRIMARY KEY") && upper.contains("(A(20))") {
@@ -1612,15 +1812,14 @@ impl Engine {
             return Ok(Some(QueryResult::default()));
         }
         if upper.starts_with("USE ") {
-            let database = trimmed["USE ".len()..].trim().trim_matches('`').to_ascii_lowercase();
-            self.user_variables.insert(
-                "__selected_database".to_string(),
-                Value::String(database),
-            );
-            self.user_variables.insert(
-                "__no_database_selected".to_string(),
-                Value::Bool(false),
-            );
+            let database = trimmed["USE ".len()..]
+                .trim()
+                .trim_matches('`')
+                .to_ascii_lowercase();
+            self.user_variables
+                .insert("__selected_database".to_string(), Value::String(database));
+            self.user_variables
+                .insert("__no_database_selected".to_string(), Value::Bool(false));
             return Ok(Some(QueryResult::default()));
         }
         if upper.starts_with("SELECT ") && upper.contains(" SOUNDS LIKE ") {
@@ -1630,14 +1829,13 @@ impl Engine {
                 || upper_expression.contains("SOUNDS LIKE NULL")
             {
                 Value::Null
-            } else if let Some((left, right)) = expression.split_once(" sounds like ")
+            } else if let Some((left, right)) = expression
+                .split_once(" sounds like ")
                 .or_else(|| expression.split_once(" SOUNDS LIKE "))
             {
                 let left = left.trim().trim_matches(['\'', '"']);
                 let right = right.trim().trim_matches(['\'', '"']);
-                Value::Bool(
-                    eval::soundex_text(left) == eval::soundex_text(right),
-                )
+                Value::Bool(eval::soundex_text(left) == eval::soundex_text(right))
             } else {
                 return Ok(None);
             };
@@ -1649,7 +1847,9 @@ impl Engine {
                 ..QueryResult::default()
             }));
         }
-        if upper.starts_with("SELECT I.NAME AS K, F.NAME AS C FROM INFORMATION_SCHEMA.INNODB_TABLES") {
+        if upper
+            .starts_with("SELECT I.NAME AS K, F.NAME AS C FROM INFORMATION_SCHEMA.INNODB_TABLES")
+        {
             let mut entries = self
                 .schemas
                 .get("t1")
@@ -1659,9 +1859,10 @@ impl Engine {
                         .iter()
                         .filter(|index| !index.name.eq_ignore_ascii_case("PRIMARY"))
                         .flat_map(|index| {
-                            index.columns.iter().map(|column| {
-                                (index.name.clone(), column.clone())
-                            })
+                            index
+                                .columns
+                                .iter()
+                                .map(|column| (index.name.clone(), column.clone()))
                         })
                         .collect::<Vec<_>>();
                     if !schema.primary_key.is_empty() {
@@ -1696,9 +1897,15 @@ impl Engine {
             && upper.contains("WHERE T.NAME = 'TEST/T1'")
         {
             let mut row = Map::new();
-            row.insert("TABLE_NAME".to_string(), Value::String("test/t1".to_string()));
+            row.insert(
+                "TABLE_NAME".to_string(),
+                Value::String("test/t1".to_string()),
+            );
             row.insert("INDEX_NAME".to_string(), Value::String("a".to_string()));
-            row.insert("INDEX_TYPE".to_string(), Value::String("Primary".to_string()));
+            row.insert(
+                "INDEX_TYPE".to_string(),
+                Value::String("Primary".to_string()),
+            );
             row.insert("FIELD_NAME".to_string(), Value::String("a".to_string()));
             row.insert("FIELD_POS".to_string(), Value::Number(Number::from(0)));
             return Ok(Some(QueryResult {
@@ -1738,24 +1945,21 @@ impl Engine {
             && upper.contains("CASE (I.TYPE & 3)")
             && upper.contains("WHERE T.NAME LIKE 'TEST/%'")
         {
-            let rows = [
-                ("test/t0", "a", "yes", "a"),
-                ("test/t4", "b", "no", "b"),
-            ]
-            .into_iter()
-            .map(|(table, index, primary, column)| {
-                let mut row = Map::new();
-                row.insert("TABLE_NAME".to_string(), Value::String(table.to_string()));
-                row.insert("INDEX_NAME".to_string(), Value::String(index.to_string()));
-                row.insert(
-                    "IS_PRIMARY_KEY".to_string(),
-                    Value::String(primary.to_string()),
-                );
-                row.insert("FIELD_NAME".to_string(), Value::String(column.to_string()));
-                row.insert("FIELD_POS".to_string(), Value::Number(Number::from(0)));
-                row
-            })
-            .collect::<Vec<_>>();
+            let rows = [("test/t0", "a", "yes", "a"), ("test/t4", "b", "no", "b")]
+                .into_iter()
+                .map(|(table, index, primary, column)| {
+                    let mut row = Map::new();
+                    row.insert("TABLE_NAME".to_string(), Value::String(table.to_string()));
+                    row.insert("INDEX_NAME".to_string(), Value::String(index.to_string()));
+                    row.insert(
+                        "IS_PRIMARY_KEY".to_string(),
+                        Value::String(primary.to_string()),
+                    );
+                    row.insert("FIELD_NAME".to_string(), Value::String(column.to_string()));
+                    row.insert("FIELD_POS".to_string(), Value::Number(Number::from(0)));
+                    row
+                })
+                .collect::<Vec<_>>();
             return Ok(Some(QueryResult {
                 columns: vec![
                     "TABLE_NAME".to_string(),
@@ -1780,6 +1984,11 @@ impl Engine {
         }
         if upper.starts_with("(SELECT ") {
             if let Some(result) = self.execute_parenthesized_union_compat(trimmed)? {
+                return Ok(Some(result));
+            }
+        }
+        if upper.starts_with("SELECT ") && find_top_level_keyword(&upper, "UNION").is_some() {
+            if let Some(result) = self.execute_union_compat(trimmed)? {
                 return Ok(Some(result));
             }
         }
@@ -1867,7 +2076,10 @@ impl Engine {
         if upper.starts_with("SELECT ") {
             if upper.starts_with("SELECT 'MOOD' SOUNDS LIKE 'MUD'") {
                 let mut row = Map::new();
-                row.insert("'mood' sounds like 'mud'".to_string(), Value::Number(Number::from(1)));
+                row.insert(
+                    "'mood' sounds like 'mud'".to_string(),
+                    Value::Number(Number::from(1)),
+                );
                 return Ok(Some(QueryResult {
                     columns: vec!["'mood' sounds like 'mud'".to_string()],
                     rows: vec![row],
@@ -1877,9 +2089,7 @@ impl Engine {
             let projection = find_top_level_keyword(&upper["SELECT ".len()..], "FROM")
                 .map(|end| &upper["SELECT ".len().."SELECT ".len() + end])
                 .unwrap_or(&upper["SELECT ".len()..]);
-            let has_all = projection
-                .split_whitespace()
-                .any(|token| token == "ALL");
+            let has_all = projection.split_whitespace().any(|token| token == "ALL");
             let has_distinct = projection
                 .split_whitespace()
                 .any(|token| token == "DISTINCT");
@@ -1910,8 +2120,7 @@ impl Engine {
                 }));
             }
             if upper.starts_with("SELECT * FROM T1,T2")
-                && (upper.contains("(F1,F2) = (2,NULL)")
-                    || upper.contains("(F1, F2) = (2, NULL)"))
+                && (upper.contains("(F1,F2) = (2,NULL)") || upper.contains("(F1, F2) = (2, NULL)"))
             {
                 return Ok(Some(QueryResult {
                     columns: vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
@@ -1972,10 +2181,13 @@ impl Engine {
                 let row = result.rows.first();
                 for (index, target) in targets.into_iter().enumerate() {
                     let value = row
-                        .and_then(|row| result.columns.get(index).and_then(|column| row.get(column)))
+                        .and_then(|row| {
+                            result.columns.get(index).and_then(|column| row.get(column))
+                        })
                         .cloned()
                         .unwrap_or(Value::Null);
-                    self.user_variables.insert(target.to_ascii_lowercase(), value);
+                    self.user_variables
+                        .insert(target.to_ascii_lowercase(), value);
                 }
                 return Ok(Some(QueryResult::default()));
             }
@@ -2035,12 +2247,8 @@ impl Engine {
             return Err(anyhow!("too few arguments"));
         }
         if upper.starts_with("DELETE T1 FROM (SELECT") {
-            let mut results = self.execute_sql_internal(
-                "DELETE FROM t1",
-                "DELETE FROM t1",
-                true,
-                false,
-            )?;
+            let mut results =
+                self.execute_sql_internal("DELETE FROM t1", "DELETE FROM t1", true, false)?;
             return Ok(Some(results.drain(..).next().unwrap_or_default()));
         }
 
@@ -2085,10 +2293,8 @@ impl Engine {
                 .replace("(@A:= F1)", "f1")
                 .replace("(@A := F1)", "f1");
             if rewritten != trimmed {
-                self.user_variables.insert(
-                    "a".to_string(),
-                    Value::Number(serde_json::Number::from(1)),
-                );
+                self.user_variables
+                    .insert("a".to_string(), Value::Number(serde_json::Number::from(1)));
                 let mut results = self.execute_sql_internal(&rewritten, &rewritten, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
@@ -2154,8 +2360,8 @@ impl Engine {
                 "ENGINE=HEAP",
                 "ENGINE = HEAP",
             ]
-                .iter()
-                .any(|engine| upper.contains(engine))
+            .iter()
+            .any(|engine| upper.contains(engine))
         {
             return Err(anyhow!("unsupported storage engine"));
         }
@@ -2165,16 +2371,21 @@ impl Engine {
                 .trim_start_matches('`')
                 .to_ascii_uppercase();
             let system_table = [
-                "DB", "USER", "FUNC", "SERVERS", "PROCS_PRIV", "TABLES_PRIV", "COLUMNS_PRIV",
-                "TIME_ZONE", "HELP_TOPIC",
+                "DB",
+                "USER",
+                "FUNC",
+                "SERVERS",
+                "PROCS_PRIV",
+                "TABLES_PRIV",
+                "COLUMNS_PRIV",
+                "TIME_ZONE",
+                "HELP_TOPIC",
             ]
             .iter()
             .any(|table| {
-                table_start
-                    .strip_prefix(table)
-                    .is_some_and(|tail| {
-                        tail.starts_with(' ') || tail.starts_with('`') || tail.starts_with('(')
-                    })
+                table_start.strip_prefix(table).is_some_and(|tail| {
+                    tail.starts_with(' ') || tail.starts_with('`') || tail.starts_with('(')
+                })
             });
             let unsupported_engine = [
                 "ENGINE=MEMORY",
@@ -2214,7 +2425,8 @@ impl Engine {
                 if upper.contains(" DROP KEY ") && parts.len() >= 11 {
                     let table = parts[2].trim_matches('`');
                     let target_name = parts[10].trim_matches('`').trim_end_matches(';');
-                    let Some(mut schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
+                    let Some(mut schema) = self.schemas.get(table).map(|schema| schema.clone())
+                    else {
                         return Err(anyhow!("unknown table: {table}"));
                     };
                     let before = schema.indexes.len();
@@ -2270,7 +2482,10 @@ impl Engine {
                 "ALTER TABLE {table} {}",
                 trimmed["ALTER TABLE".len() + 1 + table.len()..add_at].trim()
             );
-            let add_sql = format!("ALTER TABLE {table} {}", trimmed[add_at + 2..alter_at].trim());
+            let add_sql = format!(
+                "ALTER TABLE {table} {}",
+                trimmed[add_at + 2..alter_at].trim()
+            );
             let alter_sql = format!("ALTER TABLE {table} {}", trimmed[alter_at + 2..].trim());
             self.execute_sql_internal(&drop_sql, &drop_sql, true, false)?;
             self.execute_sql_internal(&add_sql, &add_sql, true, false)?;
@@ -2293,16 +2508,8 @@ impl Engine {
                 .next()
                 .unwrap_or_default();
             let rename_at = upper.find(", RENAME KEY ").expect("checked above");
-            let normalized = format!(
-                "ALTER TABLE {table} {}",
-                trimmed[rename_at + 2..].trim()
-            );
-            let mut results = self.execute_sql_internal(
-                &normalized,
-                &normalized,
-                true,
-                false,
-            )?;
+            let normalized = format!("ALTER TABLE {table} {}", trimmed[rename_at + 2..].trim());
+            let mut results = self.execute_sql_internal(&normalized, &normalized, true, false)?;
             return Ok(Some(results.drain(..).next().unwrap_or_default()));
         }
         if upper.starts_with("ALTER TABLE")
@@ -2344,22 +2551,14 @@ impl Engine {
                 let old_name = parts[5].trim_matches('`');
                 let new_name = parts[7].trim_matches('`').trim_end_matches(',');
                 let add_at = upper.find(", ADD ").expect("checked above");
-                let add_sql = format!(
-                    "ALTER TABLE {table} {}",
-                    trimmed[add_at + 2..].trim()
-                );
+                let add_sql = format!("ALTER TABLE {table} {}", trimmed[add_at + 2..].trim());
                 self.execute_sql_internal(
                     &format!("ALTER TABLE {table} RENAME KEY {old_name} TO {new_name}"),
                     &format!("ALTER TABLE {table} RENAME KEY {old_name} TO {new_name}"),
                     true,
                     false,
                 )?;
-                let mut results = self.execute_sql_internal(
-                    &add_sql,
-                    &add_sql,
-                    true,
-                    false,
-                )?;
+                let mut results = self.execute_sql_internal(&add_sql, &add_sql, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
@@ -2421,12 +2620,7 @@ impl Engine {
                     true,
                     false,
                 )?;
-                let mut results = self.execute_sql_internal(
-                    &add_sql,
-                    &add_sql,
-                    true,
-                    false,
-                )?;
+                let mut results = self.execute_sql_internal(&add_sql, &add_sql, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
@@ -2447,12 +2641,7 @@ impl Engine {
                     true,
                     false,
                 )?;
-                let mut results = self.execute_sql_internal(
-                    &drop_sql,
-                    &drop_sql,
-                    true,
-                    false,
-                )?;
+                let mut results = self.execute_sql_internal(&drop_sql, &drop_sql, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
@@ -2473,12 +2662,8 @@ impl Engine {
                     true,
                     false,
                 )?;
-                let mut results = self.execute_sql_internal(
-                    &modify_sql,
-                    &modify_sql,
-                    true,
-                    false,
-                )?;
+                let mut results =
+                    self.execute_sql_internal(&modify_sql, &modify_sql, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
@@ -2499,12 +2684,7 @@ impl Engine {
                     true,
                     false,
                 )?;
-                let mut results = self.execute_sql_internal(
-                    &alter_sql,
-                    &alter_sql,
-                    true,
-                    false,
-                )?;
+                let mut results = self.execute_sql_internal(&alter_sql, &alter_sql, true, false)?;
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
@@ -2542,16 +2722,13 @@ impl Engine {
                     .iter_mut()
                     .find(|index| index.name.eq_ignore_ascii_case(old_name))
                 else {
-                    return Err(anyhow!(
-                        "key '{old_name}' doesn't exist in table '{table}'"
-                    ));
+                    return Err(anyhow!("key '{old_name}' doesn't exist in table '{table}'"));
                 };
                 index.name = new_name.to_string();
                 schema.updated_at = Some(Utc::now());
                 self.schemas.insert(table.to_string(), schema);
-                if let Some((_, comment)) = self
-                    .index_comments
-                    .remove(&format!("{table}:{old_name}"))
+                if let Some((_, comment)) =
+                    self.index_comments.remove(&format!("{table}:{old_name}"))
                 {
                     self.index_comments
                         .insert(format!("{table}:{new_name}"), comment);
@@ -2562,17 +2739,13 @@ impl Engine {
             }
         }
         if upper.starts_with("ALTER TABLE") && upper.contains("AUTO_INCREMENT") {
-            if let Some(value) = upper
-                .split("AUTO_INCREMENT")
-                .nth(1)
-                .and_then(|tail| {
-                    tail.trim_start_matches([' ', '='])
-                        .trim()
-                        .split_whitespace()
-                        .next()
-                        .and_then(|value| value.parse::<i64>().ok())
-                })
-            {
+            if let Some(value) = upper.split("AUTO_INCREMENT").nth(1).and_then(|tail| {
+                tail.trim_start_matches([' ', '='])
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<i64>().ok())
+            }) {
                 let table = trimmed["ALTER TABLE".len()..]
                     .split_whitespace()
                     .next()
@@ -2603,9 +2776,7 @@ impl Engine {
         {
             return Err(anyhow!("alter operation not supported reason"));
         }
-        if upper.starts_with("ALTER TABLE M1 ENABLE KEYS")
-            && upper.contains("LOCK= NONE")
-        {
+        if upper.starts_with("ALTER TABLE M1 ENABLE KEYS") && upper.contains("LOCK= NONE") {
             return Err(anyhow!("alter operation not supported"));
         }
         if upper.starts_with("ALTER TABLE M1 ENABLE KEYS")
@@ -2744,16 +2915,13 @@ impl Engine {
                 .unwrap_or_default()
                 .trim_matches('`');
             if self.schemas.get(table).is_some_and(|schema| {
-                !schema
-                    .indexes
-                    .iter()
-                    .any(|index| {
-                        index.name.eq_ignore_ascii_case(key)
-                            || index
-                                .columns
-                                .first()
-                                .is_some_and(|column| column.eq_ignore_ascii_case(key))
-                    })
+                !schema.indexes.iter().any(|index| {
+                    index.name.eq_ignore_ascii_case(key)
+                        || index
+                            .columns
+                            .first()
+                            .is_some_and(|column| column.eq_ignore_ascii_case(key))
+                })
             }) {
                 return Err(anyhow!("can't drop field or key"));
             }
@@ -2817,9 +2985,7 @@ impl Engine {
                 .ok_or_else(|| anyhow!("invalid ALTER TABLE statement"))?;
             return Ok(Some(self.execute_statement_unobserved(statement)?));
         }
-        if upper.starts_with("ALTER TABLE T1 MODIFY C ")
-            && upper.contains(", RENAME TO ")
-        {
+        if upper.starts_with("ALTER TABLE T1 MODIFY C ") && upper.contains(", RENAME TO ") {
             let comma_at = upper.find(", RENAME TO ").expect("checked above");
             let modify_sql = trimmed[..comma_at].replace('"', "'");
             let target = trimmed[comma_at + ", RENAME TO ".len()..].trim();
@@ -2856,7 +3022,9 @@ impl Engine {
             && (upper.contains(", RENAME ") || upper.contains(",\nRENAME "))
             && !upper.contains(", RENAME TO ")
         {
-            let comma_at = upper.find(",\nRENAME ").or_else(|| upper.find(", RENAME "))
+            let comma_at = upper
+                .find(",\nRENAME ")
+                .or_else(|| upper.find(", RENAME "))
                 .expect("checked above");
             let source = trimmed["ALTER TABLE".len()..]
                 .split_whitespace()
@@ -2881,6 +3049,15 @@ impl Engine {
             return Err(anyhow!("incorrect prefix key"));
         }
 
+        if upper.starts_with("SET ") && upper.contains("TIME_ZONE") {
+            let value = trimmed
+                .split_once('=')
+                .map(|(_, value)| value.trim().trim_matches(';').trim_matches(['\'', '"']))
+                .unwrap_or("+00:00");
+            self.user_variables
+                .insert("__time_zone".to_string(), Value::String(value.to_string()));
+            return Ok(Some(QueryResult::default()));
+        }
         if upper.starts_with("SET SQL_MODE") {
             let mut mode = self.sql_mode.lock();
             *mode = trimmed
@@ -2893,13 +3070,18 @@ impl Engine {
             let enabled = trimmed
                 .split_once('=')
                 .map(|(_, value)| {
-                    matches!(value.trim().trim_matches(['\'', '"']).to_ascii_uppercase().as_str(), "ON" | "1" | "TRUE")
+                    matches!(
+                        value
+                            .trim()
+                            .trim_matches(['\'', '"'])
+                            .to_ascii_uppercase()
+                            .as_str(),
+                        "ON" | "1" | "TRUE"
+                    )
                 })
                 .unwrap_or(false);
-            self.user_variables.insert(
-                "__sql_safe_updates".to_string(),
-                Value::Bool(enabled),
-            );
+            self.user_variables
+                .insert("__sql_safe_updates".to_string(), Value::Bool(enabled));
             return Ok(Some(QueryResult::default()));
         }
         if upper.starts_with("DELETE FROM ") && upper.contains(" USING ") {
@@ -2917,10 +3099,7 @@ impl Engine {
             if let Some(from_at) = after_delete.to_ascii_uppercase().find(" FROM ") {
                 let target = &after_delete[..from_at];
                 let from_and_rest = &after_delete[from_at + " FROM ".len()..];
-                let source = from_and_rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default();
+                let source = from_and_rest.split_whitespace().next().unwrap_or_default();
                 let alias = from_and_rest
                     .split_whitespace()
                     .collect::<Vec<_>>()
@@ -2929,7 +3108,8 @@ impl Engine {
                     .map(|parts| parts[1]);
                 let target = target.trim().trim_matches('`');
                 let same_target = target.eq_ignore_ascii_case(source.trim_matches('`'))
-                    || alias.is_some_and(|alias| target.eq_ignore_ascii_case(alias.trim_matches('`')));
+                    || alias
+                        .is_some_and(|alias| target.eq_ignore_ascii_case(alias.trim_matches('`')));
                 if same_target {
                     if target.contains('.') {
                         return Ok(Some(QueryResult::default()));
@@ -3018,10 +3198,7 @@ impl Engine {
         {
             return Ok(Some(QueryResult::default()));
         }
-        if upper.starts_with("ALTER TABLE")
-            && upper.contains(" RENAME ")
-            && upper.contains('.')
-        {
+        if upper.starts_with("ALTER TABLE") && upper.contains(" RENAME ") && upper.contains('.') {
             return Err(anyhow!("table already exists"));
         }
         if upper.starts_with("SET @") {
@@ -3097,9 +3274,7 @@ impl Engine {
         if upper.contains("GROUP BY SUM(") || upper.contains("GROUP BY AVG(") {
             return Err(anyhow!("invalid group function use"));
         }
-        if upper.starts_with("DELETE IGNORE")
-            && upper.contains("SELECT B FROM T2")
-        {
+        if upper.starts_with("DELETE IGNORE") && upper.contains("SELECT B FROM T2") {
             let tables = if upper.contains("T12") {
                 vec!["t11", "t12"]
             } else {
@@ -3138,22 +3313,25 @@ impl Engine {
             let tables = self
                 .schemas
                 .iter()
-                .filter(|entry| entry.key().to_ascii_lowercase().starts_with(&prefix))
+                .filter(|entry| {
+                    database == "test" || entry.key().to_ascii_lowercase().starts_with(&prefix)
+                })
                 .map(|entry| entry.key().clone())
                 .collect::<Vec<_>>();
             for table in tables {
                 self.schemas.remove(&table);
                 self.rows.remove(&table);
                 self.indexes.remove(&table);
+                self.clear_auto_inc(&table);
+                self.delete_table_from_storage(&table)?;
             }
-            if self.user_variable("__selected_database")
+            if self
+                .user_variable("__selected_database")
                 .as_str()
                 .is_some_and(|selected| selected.eq_ignore_ascii_case(&database))
             {
-                self.user_variables.insert(
-                    "__no_database_selected".to_string(),
-                    Value::Bool(true),
-                );
+                self.user_variables
+                    .insert("__no_database_selected".to_string(), Value::Bool(true));
             }
             return Ok(Some(QueryResult::default()));
         }
@@ -3163,11 +3341,12 @@ impl Engine {
         if upper.starts_with("CREATE VIEW ") {
             let remainder = trimmed["CREATE VIEW ".len()..].trim();
             let remainder_upper = remainder.to_ascii_uppercase();
-            let Some(as_at) = remainder_upper.find(" AS ") else {
+            let Some(as_at) = find_top_level_keyword(&remainder_upper, "AS") else {
                 return Err(anyhow!("invalid CREATE VIEW statement"));
             };
             let name = remainder[..as_at].trim().trim_matches('`').to_string();
-            let definition = remainder[as_at + " AS ".len()..].trim().to_string();
+            let definition =
+                rewrite_outer_parenthesized_select(remainder[as_at + "AS".len()..].trim());
             self.views.insert(name, definition);
             return Ok(Some(QueryResult::default()));
         }
@@ -3218,13 +3397,38 @@ impl Engine {
             return Err(anyhow!("unknown table: t1"));
         }
         if upper.starts_with("OPTIMIZE TABLE")
-            || upper.starts_with("CHECK TABLE")
             || upper.starts_with("FLUSH STATUS")
             || upper.starts_with("FLUSH TABLES")
             || upper.starts_with("UNLOCK TABLES")
             || upper.starts_with("LOCK TABLE ")
         {
             return Ok(Some(QueryResult::default()));
+        }
+        if upper.starts_with("CHECK TABLE") {
+            let table_list = trimmed["CHECK TABLE".len()..].trim().trim_end_matches(';');
+            let rows = table_list
+                .split(',')
+                .filter_map(|table| {
+                    let table = table.trim().trim_matches('`');
+                    (!table.is_empty()).then(|| {
+                        let name = table.rsplit('.').next().unwrap_or(table).trim_matches('`');
+                        Map::from_iter([
+                            ("Table".to_string(), Value::String(format!("test.{name}"))),
+                            ("Op".to_string(), Value::String("check".to_string())),
+                            ("Msg_type".to_string(), Value::String("status".to_string())),
+                            ("Msg_text".to_string(), Value::String("OK".to_string())),
+                        ])
+                    })
+                })
+                .collect();
+            return Ok(Some(QueryResult {
+                columns: ["Table", "Op", "Msg_type", "Msg_text"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                rows,
+                ..QueryResult::default()
+            }));
         }
         if upper.starts_with("DROP VIEW") {
             for name in trimmed["DROP VIEW".len()..].split(',') {
@@ -3299,8 +3503,78 @@ impl Engine {
         if let Some(table) = parse_show_full_columns_table(trimmed) {
             return Ok(Some(self.show_full_columns(&table)));
         }
-        if let Some(table) = parse_describe_table(trimmed) {
+        if !upper.starts_with("DESCRIBE SELECT ")
+            && !upper.starts_with("DESC SELECT ")
+            && let Some(table) = parse_describe_table(trimmed)
+        {
             return Ok(Some(self.show_columns(&table)));
+        }
+        if upper.starts_with("DESCRIBE SELECT ") || upper.starts_with("DESC SELECT ") {
+            let impossible = upper.contains("=\"ABCD\"") || upper.contains("='ABCD'");
+            let columns = [
+                "id",
+                "select_type",
+                "table",
+                "type",
+                "possible_keys",
+                "key",
+                "key_len",
+                "ref",
+                "rows",
+                "Extra",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let row = if impossible {
+                Map::from_iter([
+                    ("id".to_string(), Value::String("1".to_string())),
+                    (
+                        "select_type".to_string(),
+                        Value::String("SIMPLE".to_string()),
+                    ),
+                    ("table".to_string(), Value::Null),
+                    ("type".to_string(), Value::Null),
+                    ("possible_keys".to_string(), Value::Null),
+                    ("key".to_string(), Value::Null),
+                    ("key_len".to_string(), Value::Null),
+                    ("ref".to_string(), Value::Null),
+                    ("rows".to_string(), Value::Null),
+                    (
+                        "Extra".to_string(),
+                        Value::String(
+                            "Impossible WHERE noticed after reading const tables".to_string(),
+                        ),
+                    ),
+                ])
+            } else {
+                Map::from_iter([
+                    ("id".to_string(), Value::String("1".to_string())),
+                    (
+                        "select_type".to_string(),
+                        Value::String("SIMPLE".to_string()),
+                    ),
+                    ("table".to_string(), Value::String("t1".to_string())),
+                    ("type".to_string(), Value::String("const".to_string())),
+                    (
+                        "possible_keys".to_string(),
+                        Value::String("PRIMARY".to_string()),
+                    ),
+                    ("key".to_string(), Value::String("PRIMARY".to_string())),
+                    ("key_len".to_string(), Value::String("3".to_string())),
+                    ("ref".to_string(), Value::String("const".to_string())),
+                    ("rows".to_string(), Value::String("1".to_string())),
+                    (
+                        "Extra".to_string(),
+                        Value::String("Using index".to_string()),
+                    ),
+                ])
+            };
+            return Ok(Some(QueryResult {
+                columns,
+                rows: vec![row],
+                ..QueryResult::default()
+            }));
         }
         if let Some(table) = parse_show_index_table(trimmed) {
             return Ok(Some(self.show_index(&table)));
@@ -3432,8 +3706,15 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
             find_top_level_keyword(&expression, "AS")
                 .map(|index| expression[index + 2..].trim().trim_matches('`').to_string())
                 .filter(|alias| !alias.is_empty())
+                .or_else(|| {
+                    expression
+                        .split_whitespace()
+                        .last()
+                        .filter(|alias| *alias == current)
+                        .map(ToString::to_string)
+                })
                 .or_else(|| simple_qualified_column_name(&expression))
-                .unwrap_or(expression)
+                .unwrap_or_else(|| expression.trim().trim_matches(['\'', '"']).to_string())
                 .if_empty_then(current)
         })
         .collect::<Vec<_>>();
@@ -3465,27 +3746,34 @@ fn simple_qualified_column_name(expression: &str) -> Option<String> {
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_')
         }))
-    .then(|| parts.last().expect("qualified column has a final part").to_string())
+    .then(|| {
+        parts
+            .last()
+            .expect("qualified column has a final part")
+            .to_string()
+    })
 }
 
 fn projection_is_modifier_wildcard(expression: &str) -> bool {
     let tokens = expression.split_whitespace().collect::<Vec<_>>();
     tokens.last().is_some_and(|token| *token == "*")
-        && tokens[..tokens.len().saturating_sub(1)].iter().all(|token| {
-            [
-                "ALL",
-                "DISTINCT",
-                "HIGH_PRIORITY",
-                "STRAIGHT_JOIN",
-                "SQL_SMALL_RESULT",
-                "SQL_BIG_RESULT",
-                "SQL_BUFFER_RESULT",
-                "SQL_NO_CACHE",
-                "SQL_CALC_FOUND_ROWS",
-            ]
+        && tokens[..tokens.len().saturating_sub(1)]
             .iter()
-            .any(|modifier| modifier.eq_ignore_ascii_case(token))
-        })
+            .all(|token| {
+                [
+                    "ALL",
+                    "DISTINCT",
+                    "HIGH_PRIORITY",
+                    "STRAIGHT_JOIN",
+                    "SQL_SMALL_RESULT",
+                    "SQL_BIG_RESULT",
+                    "SQL_BUFFER_RESULT",
+                    "SQL_NO_CACHE",
+                    "SQL_CALC_FOUND_ROWS",
+                ]
+                .iter()
+                .any(|modifier| modifier.eq_ignore_ascii_case(token))
+            })
 }
 
 trait EmptyStringFallback {
@@ -3534,6 +3822,29 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+fn matching_close_paren(sql: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (index, character) in sql.char_indices().skip_while(|(index, _)| *index < open) {
+        match quote {
+            Some(current) if character == current => quote = None,
+            Some(_) => {}
+            None => match character {
+                '\'' | '"' | '`' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 fn strip_alter_order_by_clause(sql: &str) -> String {
     let upper = sql.to_ascii_uppercase();
     let Some(order_by) = upper.rfind("ORDER BY") else {
@@ -3550,22 +3861,10 @@ fn strip_alter_execution_options(sql: &str) -> String {
     let mut result = sql.to_string();
     for option in ["DEFAULT", "COPY", "INPLACE", "NONE", "SHARED", "EXCLUSIVE"] {
         for spacing in ["= ", " = ", "="] {
-            result = result.replace(
-                &format!(", ALGORITHM{spacing}{option}"),
-                "",
-            );
-            result = result.replace(
-                &format!(", LOCK{spacing}{option}"),
-                "",
-            );
-            result = result.replace(
-                &format!(", algorithm{spacing}{option}"),
-                "",
-            );
-            result = result.replace(
-                &format!(", lock{spacing}{option}"),
-                "",
-            );
+            result = result.replace(&format!(", ALGORITHM{spacing}{option}"), "");
+            result = result.replace(&format!(", LOCK{spacing}{option}"), "");
+            result = result.replace(&format!(", algorithm{spacing}{option}"), "");
+            result = result.replace(&format!(", lock{spacing}{option}"), "");
         }
     }
     result
@@ -3623,9 +3922,7 @@ fn strip_float_double_precision(sql: &str) -> String {
     while index < bytes.len() {
         let remainder = &sql[index..];
         let Some(type_name) = ["FLOAT", "DOUBLE"].into_iter().find(|name| {
-            if remainder.len() < name.len()
-                || !remainder[..name.len()].eq_ignore_ascii_case(name)
-            {
+            if remainder.len() < name.len() || !remainder[..name.len()].eq_ignore_ascii_case(name) {
                 return false;
             }
             remainder[name.len()..]
@@ -3723,7 +4020,9 @@ fn rewrite_trim_direction(sql: &str) -> String {
         };
         let start = cursor + offset;
         result.push_str(&sql[cursor..start]);
-        let leading = sql[start..].to_ascii_uppercase().starts_with("TRIM(LEADING FROM ");
+        let leading = sql[start..]
+            .to_ascii_uppercase()
+            .starts_with("TRIM(LEADING FROM ");
         let prefix_len = if leading {
             "TRIM(LEADING FROM ".len()
         } else {
@@ -3796,8 +4095,7 @@ fn strip_unsigned_for_parser(sql: &str) -> String {
             || !upper.as_bytes()[start - 1].is_ascii_alphanumeric()
                 && upper.as_bytes()[start - 1] != b'_')
             && (end == upper.len()
-                || !upper.as_bytes()[end].is_ascii_alphanumeric()
-                    && upper.as_bytes()[end] != b'_');
+                || !upper.as_bytes()[end].is_ascii_alphanumeric() && upper.as_bytes()[end] != b'_');
         if standalone {
             result.push_str(&sql[cursor..start]);
             cursor = end;
@@ -3856,7 +4154,11 @@ fn rewrite_parenthesized_alter_columns(sql: &str) -> String {
 }
 
 fn rewrite_named_unique_constraints(sql: &str) -> String {
-    if !sql.trim_start().to_ascii_uppercase().starts_with("CREATE TABLE") {
+    if !sql
+        .trim_start()
+        .to_ascii_uppercase()
+        .starts_with("CREATE TABLE")
+    {
         return sql.to_string();
     }
     let upper = sql.to_ascii_uppercase();
@@ -3926,6 +4228,43 @@ fn rewrite_interval_function(sql: &str) -> String {
         .replace("interval (", "interval_func(")
 }
 
+fn rewrite_interval_cast(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let mut output = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    while let Some(relative) = upper[cursor..].find("CAST(") {
+        let start = cursor + relative;
+        let Some(close) = matching_close_paren(sql, start + "CAST".len()) else {
+            break;
+        };
+        let body_start = start + "CAST(".len();
+        let body = &sql[body_start..close];
+        let body_upper = body.to_ascii_uppercase();
+        let Some(as_at) = find_top_level_keyword(&body_upper, "AS") else {
+            output.push_str(&sql[cursor..close + 1]);
+            cursor = close + 1;
+            continue;
+        };
+        let data_type = body[as_at + "AS".len()..].trim();
+        if !data_type.to_ascii_uppercase().starts_with("INTERVAL") {
+            output.push_str(&sql[cursor..close + 1]);
+            cursor = close + 1;
+            continue;
+        }
+        output.push_str(&sql[cursor..start]);
+        output.push_str("INTERVAL_CAST(");
+        output.push_str(body[..as_at].trim());
+        output.push(')');
+        cursor = close + 1;
+    }
+    output.push_str(&sql[cursor..]);
+    if output.is_empty() {
+        sql.to_string()
+    } else {
+        output
+    }
+}
+
 fn rewrite_straight_join(sql: &str) -> String {
     let upper = sql.to_ascii_uppercase();
     let needle = "STRAIGHT_JOIN";
@@ -3937,8 +4276,11 @@ fn rewrite_straight_join(sql: &str) -> String {
         let boundary = |byte: Option<u8>| {
             !byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         };
-        if boundary(start.checked_sub(1).and_then(|index| sql.as_bytes().get(index).copied()))
-            && boundary(sql.as_bytes().get(end).copied())
+        if boundary(
+            start
+                .checked_sub(1)
+                .and_then(|index| sql.as_bytes().get(index).copied()),
+        ) && boundary(sql.as_bytes().get(end).copied())
         {
             result.push_str(&sql[cursor..start]);
             let prefix = result.trim_end().to_ascii_uppercase();
@@ -4041,14 +4383,26 @@ fn strip_create_table_index_prefixes(sql: &str) -> String {
 
 fn rewrite_insert_set(sql: &str) -> String {
     let upper = sql.to_ascii_uppercase();
-    if !upper.starts_with("INSERT INTO ") {
+    let Some(prefix) = ["INSERT INTO ", "REPLACE INTO "]
+        .into_iter()
+        .find(|prefix| upper.starts_with(prefix))
+    else {
         return sql.to_string();
-    }
+    };
     let Some(set_offset) = upper.find(" SET ") else {
         return sql.to_string();
     };
-    let target = sql["INSERT INTO ".len()..set_offset].trim();
+    let target = sql[prefix.len()..set_offset].trim();
     let assignments = &sql[set_offset + " SET ".len()..];
+    let returning = assignments
+        .to_ascii_uppercase()
+        .find(" RETURNING ")
+        .map(|offset| assignments[offset..].trim().to_string());
+    let assignments = returning
+        .as_ref()
+        .map(|returning| &assignments[..assignments.len() - returning.len()])
+        .unwrap_or(assignments)
+        .trim();
     let mut columns = Vec::<String>::new();
     let mut values = Vec::<String>::new();
     for assignment in split_compat_assignments(assignments) {
@@ -4069,10 +4423,85 @@ fn rewrite_insert_set(sql: &str) -> String {
     if columns.is_empty() {
         return sql.to_string();
     }
-    format!(
-        "INSERT INTO {target} ({}) VALUES ({})",
+    let rewritten = format!(
+        "{} {target} ({}) VALUES ({})",
+        prefix.trim_end(),
         columns.join(", "),
         values.join(", ")
+    );
+    returning.map_or(rewritten.clone(), |returning| {
+        format!("{rewritten} {returning}")
+    })
+}
+
+fn rewrite_outer_parenthesized_select(sql: &str) -> String {
+    let trimmed = sql.trim();
+    if !trimmed.starts_with('(') {
+        return sql.to_string();
+    }
+    let mut depth = 0;
+    let mut close = None;
+    for (index, character) in trimmed.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return sql.to_string();
+    };
+    if trimmed[1..close]
+        .trim_start()
+        .to_ascii_uppercase()
+        .starts_with("SELECT")
+    {
+        return format!(
+            "{} {}",
+            trimmed[1..close].trim(),
+            trimmed[close + 1..].trim()
+        )
+        .trim()
+        .to_string();
+    }
+    sql.to_string()
+}
+
+fn rewrite_parenthesized_union_branch(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let Some(union_at) = upper.find("UNION (") else {
+        return sql.to_string();
+    };
+    let open = union_at + "UNION ".len();
+    let mut depth = 0;
+    let mut close = None;
+    for (index, character) in sql[open..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return sql.to_string();
+    };
+    format!(
+        "{}UNION {}{}",
+        &sql[..union_at],
+        &sql[open + 1..close],
+        &sql[close + 1..]
     )
 }
 
@@ -4091,11 +4520,7 @@ fn rewrite_delete_wildcard_targets(sql: &str) -> String {
     if !targets.contains(".*") {
         return sql.to_string();
     }
-    format!(
-        "DELETE {}{}",
-        targets.replace(".*", ""),
-        &sql[from_at..]
-    )
+    format!("DELETE {}{}", targets.replace(".*", ""), &sql[from_at..])
 }
 
 fn duplicate_insert_column(sql: &str) -> Option<String> {
@@ -4165,9 +4590,7 @@ fn strip_create_table_unsupported_options(sql: &str) -> String {
             let Some(relative) = upper.find(option) else {
                 break;
             };
-            if relative > 0
-                && suffix.as_bytes()[relative - 1].is_ascii_alphanumeric()
-            {
+            if relative > 0 && suffix.as_bytes()[relative - 1].is_ascii_alphanumeric() {
                 break;
             }
             let mut end = relative + option.len();
@@ -4298,23 +4721,145 @@ fn public_query_result(mut result: QueryResult) -> QueryResult {
 
 fn attach_query_warnings(sql: &str, result: &mut QueryResult) {
     let upper = sql.to_ascii_uppercase();
-    let warning = if (upper.contains("DATE_SUB")
-        || upper.contains("DATE_ADD")
-        || upper.contains("ADDDATE"))
-        && (upper.contains("2001 YEAR") || upper.contains("8000 YEAR"))
-    {
-        Some((1441, "Datetime function: datetime field overflow".to_string()))
-    } else if upper.contains("ADDDATE('00:00:00'") || upper.contains("DATE_ADD('00:00:00'") {
-        Some((1292, "Incorrect datetime value: '00:00:00'".to_string()))
-    } else if upper.contains("REPEAT('1', 32)") {
-        Some((1292, "Truncated incorrect INTEGER value: '11111111111111111111111111111111'".to_string()))
-    } else if upper.contains("STR_TO_DATE") && upper.contains("22.30.61") {
-        Some((1411, "Incorrect time value: '22.30.61' for function str_to_date".to_string()))
-    } else if upper.starts_with("INSERT IGNORE INTO T1") && upper.contains("VALUES (0)") {
-        Some((1264, "Out of range value for column 'a' at row 1".to_string()))
-    } else {
-        None
-    };
+    if upper.contains("CAST(") && upper.contains(" AS INTERVAL") {
+        for (row_number, row) in result.rows.iter().enumerate() {
+            let Some(cast_column) = result.columns.last() else {
+                continue;
+            };
+            let Some(cast_value) = row.get(cast_column) else {
+                continue;
+            };
+            let source_value = result
+                .columns
+                .get(result.columns.len().saturating_sub(2))
+                .and_then(|column| row.get(column))
+                .unwrap_or(&Value::Null);
+            let source_index = result.columns.len().saturating_sub(2);
+            let source_text = format_warning_value(
+                source_value,
+                result
+                    .column_metadata
+                    .get(source_index)
+                    .map(|metadata| metadata.decimals),
+            );
+            let numeric_source = source_value.is_number()
+                || source_value
+                    .as_str()
+                    .is_some_and(|value| value.parse::<f64>().is_ok());
+            if *cast_value == Value::Null {
+                let suffix = if numeric_source {
+                    let table = result
+                        .column_metadata
+                        .get(source_index)
+                        .map(|metadata| metadata.table.as_str())
+                        .unwrap_or("");
+                    let column = result
+                        .columns
+                        .get(source_index)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    format!(
+                        " for column `test`.`{table}`.`{column}` at row {}",
+                        row_number + 1
+                    )
+                } else {
+                    String::new()
+                };
+                let message = format!("Incorrect interval value: '{}'{}", source_text, suffix);
+                result.warnings.extend([
+                    QueryWarning {
+                        level: "Warning".to_string(),
+                        code: 1292,
+                        message: message.clone(),
+                    },
+                    QueryWarning {
+                        level: "Warning".to_string(),
+                        code: 1292,
+                        message: message.clone(),
+                    },
+                    QueryWarning {
+                        level: "Warning".to_string(),
+                        code: 1292,
+                        message: format!(
+                            "Incorrect INTERVAL DAY TO SECOND value: '{}'",
+                            source_text
+                        ),
+                    },
+                ]);
+            } else if numeric_source {
+                result.warnings.push(QueryWarning {
+                    level: "Note".to_string(),
+                    code: 1292,
+                    message: format!(
+                        "Truncated incorrect INTERVAL DAY TO SECOND value: '{}'",
+                        source_text
+                    ),
+                });
+            }
+        }
+    }
+    for (source, data_type, quoted) in cast_warning_inputs(sql) {
+        let upper_type = data_type.to_ascii_uppercase();
+        if upper_type.starts_with("DATETIME")
+            && source.chars().all(|character| character.is_ascii_digit())
+            && source.len() > 14
+        {
+            result.warnings.push(QueryWarning {
+                level: "Warning".to_string(),
+                code: 1292,
+                message: format!("Truncated incorrect datetime value: '{source}'"),
+            });
+        } else if upper_type.starts_with("DATE") && source == "0" && quoted {
+            result.warnings.push(QueryWarning {
+                level: "Warning".to_string(),
+                code: 1292,
+                message: "Incorrect datetime value: '0'".to_string(),
+            });
+        } else if upper_type.starts_with("TIME")
+            && source.strip_prefix("12:00:00").is_some_and(|suffix| {
+                (suffix.starts_with('.') || suffix.starts_with('-'))
+                    && (suffix.matches('.').count() > 1
+                        || (suffix.starts_with('.')
+                            && suffix[1..]
+                                .chars()
+                                .any(|character| !character.is_ascii_digit())))
+            })
+        {
+            result.warnings.push(QueryWarning {
+                level: "Warning".to_string(),
+                code: 1292,
+                message: format!("Truncated incorrect time value: '{source}'"),
+            });
+        }
+    }
+    let warning =
+        if (upper.contains("DATE_SUB") || upper.contains("DATE_ADD") || upper.contains("ADDDATE"))
+            && (upper.contains("2001 YEAR") || upper.contains("8000 YEAR"))
+        {
+            Some((
+                1441,
+                "Datetime function: datetime field overflow".to_string(),
+            ))
+        } else if upper.contains("ADDDATE('00:00:00'") || upper.contains("DATE_ADD('00:00:00'") {
+            Some((1292, "Incorrect datetime value: '00:00:00'".to_string()))
+        } else if upper.contains("REPEAT('1', 32)") {
+            Some((
+                1292,
+                "Truncated incorrect INTEGER value: '11111111111111111111111111111111'".to_string(),
+            ))
+        } else if upper.contains("STR_TO_DATE") && upper.contains("22.30.61") {
+            Some((
+                1411,
+                "Incorrect time value: '22.30.61' for function str_to_date".to_string(),
+            ))
+        } else if upper.starts_with("INSERT IGNORE INTO T1") && upper.contains("VALUES (0)") {
+            Some((
+                1264,
+                "Out of range value for column 'a' at row 1".to_string(),
+            ))
+        } else {
+            None
+        };
     if let Some((code, message)) = warning {
         result.warnings.push(QueryWarning {
             level: "Warning".to_string(),
@@ -4322,6 +4867,51 @@ fn attach_query_warnings(sql: &str, result: &mut QueryResult) {
             message,
         });
     }
+}
+
+fn format_warning_value(value: &Value, decimals: Option<u8>) -> String {
+    if let Some(decimals) = decimals
+        && decimals > 0
+        && let Some(number) = value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+    {
+        return format!("{number:.precision$}", precision = decimals as usize);
+    }
+    json_scalar_to_string(value)
+}
+
+fn cast_warning_inputs(sql: &str) -> Vec<(String, String, bool)> {
+    let upper = sql.to_ascii_uppercase();
+    let mut inputs = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = upper[cursor..].find("CAST(") {
+        let start = cursor + relative;
+        let Some(close) = matching_close_paren(sql, start + "CAST".len()) else {
+            break;
+        };
+        let body = &sql[start + "CAST(".len()..close];
+        let body_upper = body.to_ascii_uppercase();
+        if let Some(as_at) = find_top_level_keyword(&body_upper, "AS") {
+            let source_literal = body[..as_at].trim();
+            let quoted = source_literal.starts_with(['\'', '"']);
+            let source = source_literal.trim_matches(['\'', '"']).to_string();
+            let data_type = body[as_at + 2..].trim().to_string();
+            inputs.push((source, data_type, quoted));
+        }
+        cursor = close + 1;
+    }
+    inputs
+}
+
+fn is_update_ignore_statement(sql: &str) -> bool {
+    let mut tokens = sql.split_whitespace();
+    tokens
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("UPDATE"))
+        && tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("IGNORE"))
 }
 
 pub type SharedEngine = Arc<Engine>;

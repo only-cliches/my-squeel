@@ -167,7 +167,6 @@ fn unsupported_or_unresolved_sql_fails_closed() {
 
     for sql in [
         "SELECT definitely_not_a_mysql_function(1)",
-        "WITH RECURSIVE cte AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM cte) SELECT id FROM cte",
         "SELECT * FROM missing_table",
         "SELECT missing_column FROM fail_closed_values",
         "SELECT * FROM fail_closed_values AS a FULL JOIN fail_closed_values AS b ON b.id = a.id",

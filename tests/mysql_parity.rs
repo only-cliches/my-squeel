@@ -1287,22 +1287,18 @@ fn parity_with_mysql_for_information_schema() {
 }
 
 #[test]
-fn unsupported_queries_return_mysql_errors() {
+fn recursive_ctes_return_mysql_rows() {
     let whatever_url = start_whatever_server();
     let whatever_pool =
         Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL")).expect("connect");
     let mut conn = whatever_pool.get_conn().expect("whatever conn");
 
-    let err = conn
-        .query_drop(
+    let rows: Vec<u32> = conn
+        .query(
             "WITH RECURSIVE sequence AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM sequence WHERE n < 3) SELECT n FROM sequence",
         )
-        .expect_err("unsupported recursive CTE should return a MySQL error");
-    let message = err.to_string();
-    assert!(
-        message.contains("unsupported") || message.contains("not supported"),
-        "unexpected error message: {message}"
-    );
+        .expect("recursive CTE should execute");
+    assert_eq!(rows, vec![1, 2, 3]);
 }
 
 #[test]
@@ -1348,6 +1344,43 @@ fn parity_with_mysql_for_json_expressions() {
             ('Ada', 10, '{ada_payload}'), \
             ('Bob', 20, '{bob_payload}'), \
             ('Eve', 30, NULL)"
+        ),
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT \
+            JSON_TYPE('{\"a\":[1,2]}') AS json_type, \
+            JSON_DEPTH('{\"a\":[1,2]}') AS json_depth, \
+            JSON_LENGTH('{\"a\":[1,2]}', '$.a') AS json_length, \
+            JSON_KEYS('{\"a\":1,\"b\":2}') AS json_keys, \
+            JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a', '$.missing') AS contains_one, \
+            JSON_CONTAINS_PATH('{\"a\":1}', 'all', '$.a', '$.missing') AS contains_all, \
+            JSON_OVERLAPS('[1,2]', '[2,3]') AS overlaps, \
+            JSON_VALID('{\"a\":1}') AS valid_json, \
+            JSON_VALID('{bad json}') AS invalid_json, \
+            JSON_QUOTE('Ada') AS quoted",
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        "SELECT \
+            JSON_UNQUOTE(JSON_EXTRACT(JSON_ARRAY_APPEND('[1,2]', '$', 3), '$[2]')) AS appended, \
+            JSON_EXTRACT(JSON_ARRAY_INSERT('[1,3]', '$[1]', 2), '$') AS inserted, \
+            JSON_EXTRACT(JSON_INSERT('{\"a\":1}', '$.a', 2, '$.b', 3), '$') AS inserted_object, \
+            JSON_EXTRACT(JSON_REPLACE('{\"a\":1}', '$.a', 2, '$.b', 3), '$') AS replaced_object, \
+            JSON_EXTRACT(JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"a\":9,\"b\":null}'), '$') AS merged_patch, \
+            JSON_EXTRACT(JSON_MERGE_PRESERVE('{\"a\":1}', '{\"a\":2}'), '$') AS merged_preserve, \
+            JSON_SEARCH('{\"name\":\"Ada\",\"other\":\"Bob\"}', 'one', 'A%') AS found_path",
+    );
+    assert_query_parity(
+        &mut mysql_conn,
+        &mut whatever_conn,
+        &format!(
+            "SELECT \
+                JSON_ARRAYAGG(score) AS scores, \
+                JSON_OBJECTAGG(username, score) AS score_map \
+             FROM {payloads}"
         ),
     );
 

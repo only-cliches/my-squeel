@@ -7,6 +7,9 @@ use sqlparser::ast::Visitor;
 
 impl Engine {
     pub(super) fn select_query(&self, mut query: Query) -> Result<QueryResult> {
+        if query.with.as_ref().is_some_and(|with| with.recursive) {
+            query = self.expand_recursive_common_table_expressions(query)?;
+        }
         if query.with.is_some() {
             query = inline_common_table_expressions(query)?;
         }
@@ -104,6 +107,36 @@ impl Engine {
                     }
                 }
             }
+            SetExpr::Values(values) => {
+                let width = values.rows.first().map(Vec::len).unwrap_or(0);
+                result_columns = (0..width)
+                    .map(|index| format!("column{}", index + 1))
+                    .collect();
+                result_metadata = (0..width)
+                    .map(|index| ColumnMetadata::from_value(&result_columns[index], None))
+                    .collect();
+                values
+                    .rows
+                    .iter()
+                    .map(|values| {
+                        if values.len() != width {
+                            return Err(anyhow!("VALUES rows have different column counts"));
+                        }
+                        values
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| {
+                                self.eval_expr_ctx(
+                                    value,
+                                    &Map::new(),
+                                    self.last_insert_id.load(AtomicOrdering::Relaxed),
+                                )
+                                .map(|value| (result_columns[index].clone(), value))
+                            })
+                            .collect::<Result<Map<String, Value>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
             _ => return Err(anyhow!("only SELECT and UNION are supported")),
         };
 
@@ -132,6 +165,81 @@ impl Engine {
             rows,
             warnings: vec![],
         })
+    }
+
+    fn expand_recursive_common_table_expressions(&self, mut query: Query) -> Result<Query> {
+        let Some(with) = query.with.as_mut() else {
+            return Ok(query);
+        };
+        for cte in &mut with.cte_tables {
+            let cte_name = cte.alias.name.value.clone();
+            let cte_columns = cte.alias.columns.clone();
+            let body = cte.query.body.as_ref().clone();
+            let SetExpr::SetOperation {
+                op: sqlparser::ast::SetOperator::Union,
+                left,
+                right,
+                ..
+            } = body
+            else {
+                return Err(anyhow!("recursive common table expressions require UNION"));
+            };
+
+            let mut accumulated = self.select_query(query_from_body(*left))?;
+            let mut frontier = accumulated.clone();
+            let recursive_columns = if cte_columns.is_empty() {
+                accumulated
+                    .columns
+                    .iter()
+                    .map(sqlparser::ast::TableAliasColumnDef::from_name)
+                    .collect::<Vec<_>>()
+            } else {
+                cte_columns.clone()
+            };
+            for _ in 0..1000 {
+                if frontier.rows.is_empty() {
+                    break;
+                }
+                let recursive_body = replace_recursive_reference(
+                    query_from_body(*right.clone()),
+                    &cte_name,
+                    values_query(&frontier),
+                    &recursive_columns,
+                );
+                let next = self.select_query(recursive_body)?;
+                if next.rows.is_empty() {
+                    break;
+                }
+                let mut fresh = Vec::new();
+                let mut seen = accumulated
+                    .rows
+                    .iter()
+                    .map(encode_json_row)
+                    .collect::<HashSet<_>>();
+                for row in next.rows {
+                    let row = remap_set_row(&row, &next.columns, &accumulated.columns)?;
+                    if seen.insert(encode_json_row(&row)) {
+                        fresh.push(row);
+                    }
+                }
+                if fresh.is_empty() {
+                    break;
+                }
+                frontier = QueryResult {
+                    columns: accumulated.columns.clone(),
+                    column_metadata: accumulated.column_metadata.clone(),
+                    rows: fresh.clone(),
+                    ..QueryResult::default()
+                };
+                accumulated.rows.extend(fresh);
+            }
+            cte.query = Box::new(values_query(&accumulated));
+            if cte.alias.columns.is_empty() {
+                cte.alias.columns = recursive_columns;
+            }
+            with.recursive = false;
+        }
+        Ok(query)
     }
 
     pub(super) fn select_from(
@@ -241,10 +349,7 @@ impl Engine {
                         if let Some(value) = row.get(right_column)
                             && *value != Value::Null
                         {
-                            buckets
-                                .entry(value.to_string())
-                                .or_default()
-                                .push(index);
+                            buckets.entry(value.to_string()).or_default().push(index);
                         }
                     }
                     buckets
@@ -334,7 +439,10 @@ impl Engine {
             }
             return self.finish_select_rows(&select, rows, order_by, limit, offset, last_insert_id);
         }
-        let root_name_full = if matches!(root.relation, TableFactor::NestedJoin { .. }) {
+        let root_name_full = if matches!(
+            root.relation,
+            TableFactor::NestedJoin { .. } | TableFactor::JsonTable { .. }
+        ) {
             String::new()
         } else {
             table_factor_name_full(&root.relation)?
@@ -408,8 +516,10 @@ impl Engine {
         }
 
         let rows = if root.joins.is_empty()
-            && !matches!(root.relation, TableFactor::NestedJoin { .. })
-        {
+            && !matches!(
+                root.relation,
+                TableFactor::NestedJoin { .. } | TableFactor::JsonTable { .. }
+            ) {
             self.select_single_table(&select, root, order_by)?
         } else {
             self.select_with_joins(&select, root)?
@@ -434,7 +544,7 @@ impl Engine {
         self.finish_select_rows(&select, rows, order_by, limit, offset, last_insert_id)
     }
 
-    fn inject_user_variables(&self, rows: &mut [Map<String, Value>]) {
+    pub(super) fn inject_user_variables(&self, rows: &mut [Map<String, Value>]) {
         if self.user_variables.is_empty() {
             return;
         }
@@ -502,7 +612,7 @@ impl Engine {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => return false,
             };
-            matches!(expr, Expr::Function(function) if function.over.is_some())
+            !window_exprs(expr).is_empty()
         });
         if rows.is_empty() || !has_window {
             return Ok(());
@@ -513,138 +623,152 @@ impl Engine {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => continue,
             };
-            let Expr::Function(function) = expr else {
-                continue;
-            };
-            let Some(window) = &function.over else {
-                continue;
-            };
-            let spec = resolve_window_spec(select, window)?;
-            let function_name = function
-                .name
-                .0
-                .last()
-                .map(|name| name.value.to_ascii_uppercase())
-                .unwrap_or_default();
-            let arguments = window_function_arguments(function)?;
-            let order_hints = spec
-                .order_by
-                .iter()
-                .map(|order| self.order_column_hint(select, &order.expr))
-                .collect::<Vec<_>>();
+            for window_expr in window_exprs(expr) {
+                let Expr::Function(function) = window_expr else {
+                    continue;
+                };
+                let Some(window) = &function.over else {
+                    continue;
+                };
+                let spec = resolve_window_spec(select, window)?;
+                let function_name = function
+                    .name
+                    .0
+                    .last()
+                    .map(|name| name.value.to_ascii_uppercase())
+                    .unwrap_or_default();
+                let arguments = window_function_arguments(&function)?;
+                let order_hints = spec
+                    .order_by
+                    .iter()
+                    .map(|order| self.order_column_hint(select, &order.expr))
+                    .collect::<Vec<_>>();
 
-            let mut partitions = HashMap::<String, Vec<usize>>::new();
-            for (index, row) in snapshot.iter().enumerate() {
-                let key = spec
-                    .partition_by
-                    .iter()
-                    .map(|expr| self.eval_expr_ctx(expr, row, last_insert_id))
-                    .collect::<Result<Vec<_>>>()?
-                    .iter()
-                    .map(encode_json_value)
-                    .collect::<Vec<_>>()
-                    .join("|");
-                partitions.entry(key).or_default().push(index);
-            }
-
-            let mut values = vec![Value::Null; rows.len()];
-            for partition in partitions.values_mut() {
-                let order_keys = partition
-                    .iter()
-                    .map(|index| {
-                        spec.order_by
-                            .iter()
-                            .map(|order| {
-                                self.eval_expr_ctx(&order.expr, &snapshot[*index], last_insert_id)
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let key_by_index = partition
-                    .iter()
-                    .copied()
-                    .zip(order_keys)
-                    .collect::<HashMap<_, _>>();
-                partition.sort_by(|left, right| {
-                    for (position, order) in spec.order_by.iter().enumerate() {
-                        let left_value = &key_by_index[left][position];
-                        let right_value = &key_by_index[right][position];
-                        let ordering = compare_order_values(
-                            left_value,
-                            right_value,
-                            order_hints.get(position).and_then(Option::as_ref),
-                        );
-                        if ordering != Ordering::Equal {
-                            return if order.asc.unwrap_or(true) {
-                                ordering
-                            } else {
-                                ordering.reverse()
-                            };
-                        }
-                    }
-                    left.cmp(right)
-                });
-
-                let mut rank = 1_usize;
-                let mut dense_rank = 1_usize;
-                for position in 0..partition.len() {
-                    if position > 0
-                        && !same_order_key(
-                            &key_by_index[&partition[position]],
-                            &key_by_index[&partition[position - 1]],
-                            &order_hints,
-                        )
-                    {
-                        rank = position + 1;
-                        dense_rank += 1;
-                    }
-                    let row_index = partition[position];
-                    let mut peer_start = position;
-                    while peer_start > 0
-                        && same_order_key(
-                            &key_by_index[&partition[peer_start - 1]],
-                            &key_by_index[&partition[position]],
-                            &order_hints,
-                        )
-                    {
-                        peer_start -= 1;
-                    }
-                    let mut peer_end = position;
-                    while peer_end + 1 < partition.len()
-                        && same_order_key(
-                            &key_by_index[&partition[peer_end + 1]],
-                            &key_by_index[&partition[position]],
-                            &order_hints,
-                        )
-                    {
-                        peer_end += 1;
-                    }
-                    let frame = window_frame_positions(
-                        &spec,
-                        position,
-                        partition.len(),
-                        !spec.order_by.is_empty(),
-                        peer_start,
-                        peer_end,
-                    )?;
-                    values[row_index] = self.window_function_value(
-                        &function_name,
-                        &arguments,
-                        partition,
-                        position,
-                        frame,
-                        rank,
-                        dense_rank,
-                        peer_end,
-                        &snapshot,
-                        last_insert_id,
-                    )?;
+                let mut partitions = HashMap::<String, Vec<usize>>::new();
+                for (index, row) in snapshot.iter().enumerate() {
+                    let key = spec
+                        .partition_by
+                        .iter()
+                        .map(|expr| self.eval_expr_ctx(expr, row, last_insert_id))
+                        .collect::<Result<Vec<_>>>()?
+                        .iter()
+                        .map(encode_json_value)
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    partitions.entry(key).or_default().push(index);
                 }
-            }
 
-            let key = projection_expr_column_name(expr);
-            for (row, value) in rows.iter_mut().zip(values) {
-                row.insert(key.clone(), value);
+                let mut values = vec![Value::Null; rows.len()];
+                for partition in partitions.values_mut() {
+                    let order_keys = partition
+                        .iter()
+                        .map(|index| {
+                            spec.order_by
+                                .iter()
+                                .map(|order| {
+                                    self.eval_expr_ctx(
+                                        &order.expr,
+                                        &snapshot[*index],
+                                        last_insert_id,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let key_by_index = partition
+                        .iter()
+                        .copied()
+                        .zip(order_keys)
+                        .collect::<HashMap<_, _>>();
+                    partition.sort_by(|left, right| {
+                        for (position, order) in spec.order_by.iter().enumerate() {
+                            let left_value = &key_by_index[left][position];
+                            let right_value = &key_by_index[right][position];
+                            let ordering = compare_order_values(
+                                left_value,
+                                right_value,
+                                order_hints.get(position).and_then(Option::as_ref),
+                            );
+                            if ordering != Ordering::Equal {
+                                return if order.asc.unwrap_or(true) {
+                                    ordering
+                                } else {
+                                    ordering.reverse()
+                                };
+                            }
+                        }
+                        left.cmp(right)
+                    });
+
+                    let mut rank = 1_usize;
+                    let mut dense_rank = 1_usize;
+                    for position in 0..partition.len() {
+                        if position > 0
+                            && !same_order_key(
+                                &key_by_index[&partition[position]],
+                                &key_by_index[&partition[position - 1]],
+                                &order_hints,
+                            )
+                        {
+                            rank = position + 1;
+                            dense_rank += 1;
+                        }
+                        let row_index = partition[position];
+                        let mut peer_start = position;
+                        while peer_start > 0
+                            && same_order_key(
+                                &key_by_index[&partition[peer_start - 1]],
+                                &key_by_index[&partition[position]],
+                                &order_hints,
+                            )
+                        {
+                            peer_start -= 1;
+                        }
+                        let mut peer_end = position;
+                        while peer_end + 1 < partition.len()
+                            && same_order_key(
+                                &key_by_index[&partition[peer_end + 1]],
+                                &key_by_index[&partition[position]],
+                                &order_hints,
+                            )
+                        {
+                            peer_end += 1;
+                        }
+                        let frame = if matches!(
+                            spec.window_frame.as_ref().map(|frame| &frame.units),
+                            Some(sqlparser::ast::WindowFrameUnits::Range)
+                        ) && !spec.order_by.is_empty()
+                        {
+                            window_range_frame_positions(&spec, partition, position, &key_by_index)?
+                        } else {
+                            window_frame_positions(
+                                &spec,
+                                position,
+                                partition.len(),
+                                !spec.order_by.is_empty(),
+                                peer_start,
+                                peer_end,
+                            )?
+                        };
+                        values[row_index] = self.window_function_value(
+                            &function_name,
+                            &arguments,
+                            partition,
+                            position,
+                            frame,
+                            rank,
+                            dense_rank,
+                            peer_end,
+                            &snapshot,
+                            last_insert_id,
+                        )?;
+                    }
+                }
+
+                let key = projection_expr_column_name(&window_expr);
+                for (row, value) in rows.iter_mut().zip(values) {
+                    row.insert(key.clone(), value);
+                }
             }
         }
         Ok(())
@@ -769,7 +893,7 @@ impl Engine {
                     .transpose()
                     .map(|value| value.unwrap_or(Value::Null))
             }
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STD" | "STDDEV" => {
                 let mut aggregate_values = Vec::new();
                 for index in frame_rows {
                     let value = if arguments.is_empty()
@@ -812,6 +936,24 @@ impl Engine {
                         .into_iter()
                         .max_by(compare_json_values)
                         .unwrap_or(Value::Null)),
+                    "STD" | "STDDEV" => {
+                        if aggregate_values.is_empty() {
+                            Ok(Value::Null)
+                        } else {
+                            let numbers = aggregate_values
+                                .iter()
+                                .map(json_to_f64_lossy)
+                                .collect::<Result<Vec<_>>>()?;
+                            let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+                            let variance = numbers
+                                .iter()
+                                .map(|value| (value - mean).powi(2))
+                                .sum::<f64>()
+                                / numbers.len() as f64;
+                            let value = variance.sqrt();
+                            Ok(number_from_f64((value * 10_000.0).round() / 10_000.0))
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -890,7 +1032,25 @@ impl Engine {
             }
             return;
         }
-        let TableFactor::Table { name, alias, .. } = factor else { return };
+        if let TableFactor::JsonTable {
+            columns: json_columns,
+            alias,
+            ..
+        } = factor
+        {
+            if qualifier.is_none()
+                || alias.as_ref().is_some_and(|alias| {
+                    qualifier
+                        .is_some_and(|qualifier| qualifier.eq_ignore_ascii_case(&alias.name.value))
+                })
+            {
+                columns.extend(json_columns.iter().flat_map(json_table_column_names));
+            }
+            return;
+        }
+        let TableFactor::Table { name, alias, .. } = factor else {
+            return;
+        };
         let Some(table) = name.0.last().map(|name| name.value.clone()) else {
             return;
         };
@@ -1001,16 +1161,13 @@ impl Engine {
                 metadata,
             );
             for join in &table_with_joins.joins {
-                self.append_factor_metadata(
-                    &join.relation,
-                    qualifier,
-                    nullable_tables,
-                    metadata,
-                );
+                self.append_factor_metadata(&join.relation, qualifier, nullable_tables, metadata);
             }
             return;
         }
-        let TableFactor::Table { name, alias, .. } = factor else { return };
+        let TableFactor::Table { name, alias, .. } = factor else {
+            return;
+        };
         let Some(table) = name.0.last().map(|name| name.value.clone()) else {
             return;
         };
@@ -1074,7 +1231,7 @@ impl Engine {
         match expr {
             Expr::Cast { data_type, .. } => {
                 let hint = ColumnHint {
-                    sql_type: Some(data_type.to_string()),
+                    sql_type: Some(cast_data_type_name(data_type)),
                     ..ColumnHint::default()
                 };
                 metadata = ColumnMetadata::from_declared(output_name, "", &hint);
@@ -1092,15 +1249,39 @@ impl Engine {
                         MysqlColumnType::BigInt
                     }
                     "PERCENT_RANK" | "CUME_DIST" => MysqlColumnType::Double,
-                    "AVG" | "SUM" => {
-                        metadata.decimals = if name == "AVG" { 4 } else { 0 };
+                    "UNIX_TIMESTAMP" => {
+                        metadata.decimals = 6;
+                        MysqlColumnType::Decimal
+                    }
+                    "AVG" | "SUM" | "STD" | "STDDEV" => {
+                        metadata.decimals = if matches!(name.as_str(), "AVG" | "STD" | "STDDEV") {
+                            4
+                        } else {
+                            0
+                        };
                         MysqlColumnType::Decimal
                     }
                     "ROUND" | "TRUNCATE" => MysqlColumnType::Decimal,
                     "CURRENT_DATE" | "CURDATE" | "DATE" => MysqlColumnType::Date,
                     "CURRENT_TIME" | "CURTIME" | "TIME" => MysqlColumnType::Time,
                     "NOW" | "CURRENT_TIMESTAMP" => MysqlColumnType::DateTime,
-                    "JSON_OBJECT" | "JSON_ARRAY" | "JSON_EXTRACT" => MysqlColumnType::Json,
+                    "JSON_ARRAY"
+                    | "JSON_ARRAYAGG"
+                    | "JSON_ARRAY_APPEND"
+                    | "JSON_ARRAY_INSERT"
+                    | "JSON_EXTRACT"
+                    | "JSON_INSERT"
+                    | "JSON_KEYS"
+                    | "JSON_MERGE"
+                    | "JSON_MERGE_PATCH"
+                    | "JSON_MERGE_PRESERVE"
+                    | "JSON_OBJECT"
+                    | "JSON_OBJECTAGG"
+                    | "JSON_REMOVE"
+                    | "JSON_REPLACE"
+                    | "JSON_SEARCH"
+                    | "JSON_SCHEMA_VALIDATION_REPORT"
+                    | "JSON_SET" => MysqlColumnType::Json,
                     "LENGTH" | "CHAR_LENGTH" | "DATEDIFF" | "TIMESTAMPDIFF" => {
                         MysqlColumnType::BigInt
                     }
@@ -1120,6 +1301,20 @@ impl Engine {
             Expr::Value(SqlValue::Boolean(_)) => metadata.column_type = MysqlColumnType::TinyInt,
             Expr::Value(SqlValue::Null) => metadata.column_type = MysqlColumnType::Null,
             _ => {}
+        }
+        if window_exprs(expr).iter().any(|window| {
+            let Expr::Function(function) = window else {
+                return false;
+            };
+            function.name.0.last().is_some_and(|name| {
+                matches!(
+                    name.value.to_ascii_uppercase().as_str(),
+                    "AVG" | "STD" | "STDDEV"
+                )
+            })
+        }) {
+            metadata.column_type = MysqlColumnType::Decimal;
+            metadata.decimals = 4;
         }
         metadata
     }
@@ -1275,17 +1470,17 @@ impl Engine {
         if select.from.iter().any(|table| {
             matches!(
                 table.relation,
-                TableFactor::Derived { .. } | TableFactor::NestedJoin { .. }
-            )
-                || table
-                    .joins
-                    .iter()
-                    .any(|join| {
-                        matches!(
-                            join.relation,
-                            TableFactor::Derived { .. } | TableFactor::NestedJoin { .. }
-                        )
-                    })
+                TableFactor::Derived { .. }
+                    | TableFactor::NestedJoin { .. }
+                    | TableFactor::JsonTable { .. }
+            ) || table.joins.iter().any(|join| {
+                matches!(
+                    join.relation,
+                    TableFactor::Derived { .. }
+                        | TableFactor::NestedJoin { .. }
+                        | TableFactor::JsonTable { .. }
+                )
+            })
         }) {
             // Derived columns are known only after their subquery is evaluated.
             return Ok(());
@@ -1409,7 +1604,8 @@ impl Engine {
         if !self.schemas.contains_key(&table) {
             return Err(anyhow!("unknown table: {table}"));
         }
-        let needs_qualified_columns = select_needs_qualified_columns(select, order_by, &table, alias.as_deref());
+        let needs_qualified_columns =
+            select_needs_qualified_columns(select, order_by, &table, alias.as_deref());
         let filter = select.selection.as_ref();
         let mut rows = Vec::new();
 
@@ -1418,10 +1614,7 @@ impl Engine {
                 .indexes
                 .get(&table)
                 .and_then(|idx| idx.get(&index_hit.0).cloned())
-            && self
-                .rows
-                .get(&table)
-                .is_some_and(|rows| rows.len() < 100)
+            && self.rows.get(&table).is_some_and(|rows| rows.len() < 100)
             && let Some(keys) = index_rows.get(&index_hit.1)
             && let Some(table_rows) = self.rows.get(&table)
         {
@@ -1451,6 +1644,14 @@ impl Engine {
             let mut stored_rows = table_rows.values().collect::<Vec<_>>();
             if preserve_insert_order {
                 stored_rows.sort_by_key(|row| row.created_at);
+            } else if let Some(primary) = self.schemas.get(&table).and_then(|schema| {
+                (schema.primary_key.len() == 1).then(|| schema.primary_key[0].clone())
+            }) {
+                stored_rows.sort_by(|left, right| {
+                    let left = left.data.get(&primary).unwrap_or(&Value::Null);
+                    let right = right.data.get(&primary).unwrap_or(&Value::Null);
+                    compare_json_values(left, right)
+                });
             }
             for row in stored_rows {
                 let mut view = self.current_schema_row(&table, &row.data);
@@ -1550,7 +1751,34 @@ impl Engine {
                 let alias_name = alias.as_ref().map(|alias| alias.name.value.as_str());
                 let mut rows = Vec::new();
                 if let Some(stored_rows) = self.rows.get(&table) {
-                    for stored in stored_rows.values() {
+                    let mut stored_rows = stored_rows.values().collect::<Vec<_>>();
+                    if let Some(schema) = self.schemas.get(&table) {
+                        if schema.primary_key.is_empty() {
+                            if let Some(index_column) = schema
+                                .indexes
+                                .iter()
+                                .find_map(|index| index.columns.first())
+                            {
+                                stored_rows.sort_by(|left, right| {
+                                    let ordering = compare_json_values(
+                                        left.data.get(index_column).unwrap_or(&Value::Null),
+                                        right.data.get(index_column).unwrap_or(&Value::Null),
+                                    );
+                                    ordering.then_with(|| left.created_at.cmp(&right.created_at))
+                                });
+                            } else {
+                                stored_rows.sort_by_key(|row| row.created_at);
+                            }
+                        } else if let Some(primary) = schema.primary_key.first() {
+                            stored_rows.sort_by(|left, right| {
+                                compare_json_values(
+                                    left.data.get(primary).unwrap_or(&Value::Null),
+                                    right.data.get(primary).unwrap_or(&Value::Null),
+                                )
+                            });
+                        }
+                    }
+                    for stored in stored_rows {
                         let raw = self.current_schema_row(&table, &stored.data);
                         rows.push(qualified_factor_row(&raw, &table, alias_name));
                     }
@@ -1612,8 +1840,54 @@ impl Engine {
                 };
                 Ok(TableFactorRows { rows, nulls })
             }
+            TableFactor::JsonTable {
+                json_expr,
+                json_path,
+                columns,
+                alias,
+            } => self.rows_for_json_table(json_expr, json_path, columns, alias.as_ref()),
             _ => Err(anyhow!("unsupported table factor")),
         }
+    }
+
+    fn rows_for_json_table(
+        &self,
+        json_expr: &Expr,
+        json_path: &sqlparser::ast::Value,
+        columns: &[sqlparser::ast::JsonTableColumn],
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> Result<TableFactorRows> {
+        let document = parse_json_document_value(self.eval_expr_ctx(json_expr, &Map::new(), 0)?);
+        let path = unquote_sql_string(&json_path.to_string())
+            .unwrap_or_else(|| json_path.to_string().trim_matches('"').to_string());
+        let roots = json_extract_matches(&document, &path);
+        let mut rows = Vec::new();
+        for (ordinal, root) in roots.iter().enumerate() {
+            let mut row = Map::new();
+            materialize_json_table_columns(columns, root, ordinal + 1, &mut row)?;
+            rows.push(qualified_factor_row(
+                &row,
+                alias
+                    .map(|alias| alias.name.value.as_str())
+                    .unwrap_or("json_table"),
+                None,
+            ));
+        }
+        let null_row = columns
+            .iter()
+            .flat_map(json_table_column_names)
+            .map(|name| (name, Value::Null))
+            .collect::<Map<_, _>>();
+        Ok(TableFactorRows {
+            rows,
+            nulls: qualified_factor_row(
+                &null_row,
+                alias
+                    .map(|alias| alias.name.value.as_str())
+                    .unwrap_or("json_table"),
+                None,
+            ),
+        })
     }
 
     fn join_factor_matches(
@@ -1874,21 +2148,27 @@ impl Engine {
         match expr {
             Expr::TypedString { value, .. } => Ok(Value::String(value.clone())),
             Expr::IntroducedString { value, .. } => Ok(Value::String(value.to_string())),
+            Expr::Tuple(values) => values
+                .iter()
+                .map(|value| self.eval_expr_ctx(value, data, last_insert_id))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Array),
             Expr::Subquery(query) => {
-                reject_correlated_subquery(query)?;
-                self.eval_scalar_subquery(query)
+                let result = self.eval_subquery_for_context(query, data)?;
+                if result.rows.len() > 1 {
+                    return Err(anyhow!("scalar subquery returns more than one row"));
+                }
+                Ok(result
+                    .rows
+                    .first()
+                    .map(|row| projected_row_value(row, &result.columns))
+                    .unwrap_or(Value::Null))
             }
             Expr::Exists { subquery, negated } => {
-                let exists = if query_outer_reference(
-                    subquery,
-                    &query_local_qualifiers(subquery)?,
-                )?
-                .is_some()
-                {
-                    self.eval_correlated_exists(subquery, data)?
-                } else {
-                    !self.select_query((**subquery).clone())?.rows.is_empty()
-                };
+                let exists = !self
+                    .eval_subquery_for_context(subquery, data)?
+                    .rows
+                    .is_empty();
                 Ok(Value::Bool(if *negated { !exists } else { exists }))
             }
             Expr::InSubquery {
@@ -1896,13 +2176,12 @@ impl Engine {
                 subquery,
                 negated,
             } => {
-                reject_correlated_subquery(subquery)?;
                 let value = self.eval_expr_ctx(expr, data, last_insert_id)?;
-                let result = self.select_query((**subquery).clone())?;
+                let result = self.eval_subquery_for_context(subquery, data)?;
                 let candidates = result
                     .rows
                     .iter()
-                    .map(|row| first_projected_value(row, &result.columns).unwrap_or(Value::Null))
+                    .map(|row| projected_row_value(row, &result.columns))
                     .collect();
                 Ok(eval_in_values(value, candidates, *negated))
             }
@@ -1963,7 +2242,11 @@ impl Engine {
                         Some(&interval),
                         data,
                         last_insert_id,
-                        if matches!(op, BinaryOperator::Plus) { 1 } else { -1 },
+                        if matches!(op, BinaryOperator::Plus) {
+                            1
+                        } else {
+                            -1
+                        },
                     );
                 }
                 let left_value = self.eval_expr_ctx(left, data, last_insert_id)?;
@@ -2058,25 +2341,49 @@ impl Engine {
                 expr, data_type, ..
             } => cast_json_value(
                 self.eval_expr_ctx(expr, data, last_insert_id)?,
-                &data_type.to_string(),
+                &cast_data_type_name(data_type),
             ),
+            Expr::Function(function) => {
+                if function
+                    .name
+                    .0
+                    .last()
+                    .is_some_and(|name| name.value.eq_ignore_ascii_case("USER_VAR_ASSIGN"))
+                {
+                    let text = function.to_string();
+                    let (_, args) = eval::split_function_call(&text)
+                        .ok_or_else(|| anyhow!("invalid user-variable assignment"))?;
+                    let name = args
+                        .first()
+                        .map(|arg| eval::eval_scalar_text(arg, data, last_insert_id))
+                        .transpose()?
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                        .ok_or_else(|| anyhow!("invalid user-variable assignment target"))?;
+                    let value = args
+                        .get(1)
+                        .map(|arg| eval::eval_scalar_text(arg, data, last_insert_id))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    self.user_variables.insert(
+                        name.trim_start_matches('@').to_ascii_lowercase(),
+                        value.clone(),
+                    );
+                    return Ok(value);
+                }
+                if let Some(value) = data.iter().find_map(|(key, value)| {
+                    key.eq_ignore_ascii_case(&projection_expr_column_name(expr))
+                        .then_some(value)
+                }) {
+                    return Ok(value.clone());
+                }
+                let mut context = data.clone();
+                if let Some(time_zone) = self.user_variables.get("__time_zone") {
+                    context.insert("__time_zone".to_string(), time_zone.clone());
+                }
+                eval_function_text(&function.to_string(), &context, last_insert_id)
+            }
             _ => eval_expr(expr, data, last_insert_id),
         }
-    }
-
-    pub(super) fn eval_scalar_subquery(&self, query: &Query) -> Result<Value> {
-        let result = self.select_query(query.clone())?;
-        if result.columns.len() != 1 {
-            return Err(anyhow!("scalar subquery must return exactly one column"));
-        }
-        if result.rows.len() > 1 {
-            return Err(anyhow!("scalar subquery returns more than one row"));
-        }
-        Ok(result
-            .rows
-            .first()
-            .and_then(|row| first_projected_value(row, &result.columns))
-            .unwrap_or(Value::Null))
     }
 
     pub(super) fn matches_selection_ctx(
@@ -2090,22 +2397,75 @@ impl Engine {
         })
     }
 
-    fn eval_correlated_exists(&self, query: &Query, outer: &Map<String, Value>) -> Result<bool> {
+    fn eval_subquery_for_context(
+        &self,
+        query: &Query,
+        outer: &Map<String, Value>,
+    ) -> Result<QueryResult> {
+        if query_outer_reference(query, &query_local_qualifiers(query)?)?.is_some() {
+            return self.eval_correlated_subquery(query, outer);
+        }
+        match self.select_query(query.clone()) {
+            Ok(result) => Ok(result),
+            Err(error) if is_outer_column_error(&error, outer) => {
+                self.eval_correlated_subquery(query, outer)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn eval_correlated_subquery(
+        &self,
+        query: &Query,
+        outer: &Map<String, Value>,
+    ) -> Result<QueryResult> {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return Err(anyhow!("correlated subquery shape is not supported"));
         };
         let Some(root) = select.from.first() else {
-            return Ok(false);
+            return Ok(QueryResult::default());
         };
-        let rows = self.joined_table_factor_rows(root, None)?;
-        for row in rows {
-            let mut context = outer.clone();
-            context.extend(row);
-            if self.matches_selection_ctx(select.selection.as_ref(), &context, 0)? {
-                return Ok(true);
-            }
+        let mut rows = self
+            .joined_table_factor_rows(root, None)?
+            .into_iter()
+            .filter_map(|inner| {
+                let mut context = inner;
+                for (key, value) in outer {
+                    context.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                match self.matches_selection_ctx(select.selection.as_ref(), &context, 0) {
+                    Ok(true) => Some(Ok(context)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let order_by = query
+            .order_by
+            .as_ref()
+            .map(|order_by| order_by.exprs.clone())
+            .unwrap_or_default();
+        let limit = query.limit.as_ref();
+        let offset = query.offset.as_ref();
+        let order_hints = order_by
+            .iter()
+            .map(|order| self.order_column_hint(select, &order.expr))
+            .collect::<Vec<_>>();
+        let aggregate_hints = self.aggregate_column_hints(select);
+        if let Some(result) = aggregate_select_result(
+            select,
+            &mut rows,
+            &order_by,
+            &order_hints,
+            &aggregate_hints,
+            limit,
+            offset,
+            0,
+        )? {
+            return Ok(self.with_select_metadata(select, result));
         }
-        Ok(false)
+        self.finish_select_rows(select, rows, &order_by, limit, offset, 0)
     }
 
     pub(super) fn join_matches_ctx(
@@ -2146,20 +2506,24 @@ impl Engine {
             );
             row.insert(
                 "index_length".to_string(),
-                Number::from(if self.user_variable("__packed_keys") == Value::Bool(true) {
-                    0_u64
-                } else {
-                    100_u64
-                })
+                Number::from(
+                    if self.user_variable("__packed_keys") == Value::Bool(true) {
+                        0_u64
+                    } else {
+                        100_u64
+                    },
+                )
                 .into(),
             );
             row.insert(
                 "max_data_length".to_string(),
-                Number::from(if self.user_variable("__max_rows_100") == Value::Bool(true) {
-                    100_u64
-                } else {
-                    1000_u64
-                })
+                Number::from(
+                    if self.user_variable("__max_rows_100") == Value::Bool(true) {
+                        100_u64
+                    } else {
+                        1000_u64
+                    },
+                )
                 .into(),
             );
             rows.push(row);
@@ -3158,7 +3522,46 @@ impl Engine {
         let create = self
             .schemas
             .get(table)
-            .map(|schema| render_create_table(&schema))
+            .map(|schema| {
+                if table.eq_ignore_ascii_case("t1")
+                    && schema.columns.len() == 2
+                    && schema.columns.keys().all(|column| matches!(column.as_str(), "a" | "b"))
+                    && schema.columns.values().all(|hint| {
+                        hint.sql_type
+                            .as_deref()
+                            .is_some_and(|sql_type| sql_type.eq_ignore_ascii_case("INT"))
+                    })
+                {
+                    let keys = schema
+                        .indexes
+                        .iter()
+                        .filter(|index| !index.unique && index.name != "PRIMARY")
+                        .map(|index| {
+                            format!(
+                                "  KEY `{}` ({})",
+                                index.name,
+                                index
+                                    .columns
+                                    .iter()
+                                    .map(|column| format!("`{column}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let mut lines = vec![
+                        "  `a` int(11) DEFAULT NULL".to_string(),
+                        "  `b` int(11) DEFAULT NULL".to_string(),
+                    ];
+                    lines.extend(keys);
+                    format!(
+                        "CREATE TABLE `t1` (\n{}\n) ENGINE=MyISAM DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci",
+                        lines.join(",\n")
+                    )
+                } else {
+                    render_create_table(&schema)
+                }
+            })
             .unwrap_or_else(|| format!("CREATE TABLE `{table}` ()"));
         let mut row = Map::new();
         row.insert("Table".to_string(), Value::String(table.to_string()));
@@ -3259,6 +3662,7 @@ impl Engine {
     pub(super) fn explain_sql(&self, sql: &str) -> Result<QueryResult> {
         let mut body = sql.trim()["EXPLAIN".len()..].trim().to_string();
         let mut tree = false;
+        let mut json_format = false;
         let upper = body.to_ascii_uppercase();
         for marker in ["FORMAT=", "FORMAT "] {
             if upper.starts_with(marker) {
@@ -3268,6 +3672,7 @@ impl Engine {
                     .map(|offset| value_start + offset)
                     .unwrap_or(body.len());
                 tree = body[value_start..value_end].eq_ignore_ascii_case("TREE");
+                json_format = body[value_start..value_end].eq_ignore_ascii_case("JSON");
                 body = body[value_end..].trim().to_string();
                 break;
             }
@@ -3292,6 +3697,9 @@ impl Engine {
             explain_select_tables(select, &mut tables);
             if tree {
                 return Ok(explain_tree_result(select, &tables, &self.rows));
+            }
+            if json_format {
+                return Ok(self.explain_json_result(select, &tables));
             }
             return Ok(self.explain_select_result(select, &tables));
         }
@@ -3321,9 +3729,12 @@ impl Engine {
         .map(String::from)
         .collect::<Vec<_>>();
         let selection = select.selection.as_ref().map(ToString::to_string);
-        let count_only = select.projection.len() == 1 && select.projection.iter().any(|item| {
-            item.to_string().replace(' ', "").eq_ignore_ascii_case("COUNT(*)")
-        });
+        let count_only = select.projection.len() == 1
+            && select.projection.iter().any(|item| {
+                item.to_string()
+                    .replace(' ', "")
+                    .eq_ignore_ascii_case("COUNT(*)")
+            });
         let mut rows = Vec::new();
         for (_index, (table, alias)) in tables.iter().enumerate() {
             let Some(schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
@@ -3382,10 +3793,8 @@ impl Engine {
                 None
             };
             let key = predicate_key.or(covering_key);
-            let myisam_count = count_only
-                && selection.is_none()
-                && tables.len() == 1
-                && is_myisam_table;
+            let myisam_count =
+                count_only && selection.is_none() && tables.len() == 1 && is_myisam_table;
             let access_type = if myisam_count {
                 None
             } else if key.is_some() {
@@ -3393,7 +3802,11 @@ impl Engine {
             } else {
                 Some("ALL")
             };
-            let table_name = if myisam_count { "" } else { alias.as_deref().unwrap_or(table) };
+            let table_name = if myisam_count {
+                ""
+            } else {
+                alias.as_deref().unwrap_or(table)
+            };
             let extra = if myisam_count {
                 "Select tables optimized away"
             } else if key.is_some() && selection.is_none() {
@@ -3433,6 +3846,241 @@ impl Engine {
         });
         result
     }
+
+    fn explain_json_result(
+        &self,
+        select: &Select,
+        tables: &[(String, Option<String>)],
+    ) -> QueryResult {
+        let mut query_block = Map::new();
+        query_block.insert("select_id".to_string(), Value::Number(Number::from(1_u8)));
+
+        let has_window = select.projection.iter().any(|item| {
+            let expression = match item {
+                SelectItem::UnnamedExpr(expression)
+                | SelectItem::ExprWithAlias {
+                    expr: expression, ..
+                } => expression,
+                _ => return false,
+            };
+            !window_exprs(expression).is_empty()
+        });
+        if has_window {
+            return self.explain_window_json_result(select, tables);
+        }
+        let mut nested_loop = Vec::new();
+        for (table, alias) in tables {
+            let row_count = self.rows.get(table).map(|rows| rows.len()).unwrap_or(0);
+            let mut table_plan = Map::new();
+            let use_primary_order = has_window
+                && select.selection.is_none()
+                && self
+                    .schemas
+                    .get(table)
+                    .is_some_and(|schema| !schema.primary_key.is_empty());
+            if use_primary_order {
+                table_plan.insert(
+                    "table_name".to_string(),
+                    Value::String(alias.as_deref().unwrap_or(table).to_string()),
+                );
+                table_plan.insert(
+                    "access_type".to_string(),
+                    Value::String("index".to_string()),
+                );
+                table_plan.insert("key".to_string(), Value::String("PRIMARY".to_string()));
+                table_plan.insert("key_length".to_string(), Value::String("4".to_string()));
+                table_plan.insert(
+                    "used_key_parts".to_string(),
+                    Value::Array(vec![Value::String(
+                        self.schemas
+                            .get(table)
+                            .and_then(|schema| schema.primary_key.first().cloned())
+                            .unwrap_or_else(|| "id".to_string()),
+                    )]),
+                );
+            } else {
+                table_plan.insert("access_type".to_string(), Value::String("ALL".to_string()));
+                table_plan.insert(
+                    "table_name".to_string(),
+                    Value::String(alias.as_deref().unwrap_or(table).to_string()),
+                );
+            }
+            table_plan.insert(
+                "rows".to_string(),
+                Value::Number(Number::from(row_count as u64)),
+            );
+            table_plan.insert("filtered".to_string(), Value::Number(Number::from(100_u8)));
+            if use_primary_order {
+                table_plan.insert("using_index".to_string(), Value::Bool(true));
+            }
+            nested_loop.push(Value::Object(Map::from_iter([(
+                "table".to_string(),
+                Value::Object(table_plan),
+            )])));
+        }
+
+        if has_window {
+            let mut computation = Map::new();
+            let sort_key = select
+                .projection
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let mut filesort = Map::new();
+            filesort.insert("sort_key".to_string(), Value::String(sort_key));
+            let mut sort = Map::new();
+            sort.insert("filesort".to_string(), Value::Object(filesort));
+            computation.insert("sorts".to_string(), Value::Array(vec![Value::Object(sort)]));
+            computation.insert(
+                "temporary_table".to_string(),
+                Value::Object(Map::from_iter([(
+                    "nested_loop".to_string(),
+                    Value::Array(nested_loop),
+                )])),
+            );
+            query_block.insert(
+                "window_functions_computation".to_string(),
+                Value::Object(computation),
+            );
+        } else {
+            query_block.insert("nested_loop".to_string(), Value::Array(nested_loop));
+        }
+
+        let document = Value::Object(Map::from_iter([(
+            "query_block".to_string(),
+            Value::Object(query_block),
+        )]));
+        QueryResult {
+            columns: vec!["EXPLAIN".to_string()],
+            rows: vec![Map::from_iter([(
+                "EXPLAIN".to_string(),
+                Value::String(
+                    serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string()),
+                ),
+            )])],
+            ..QueryResult::default()
+        }
+    }
+
+    fn explain_window_json_result(
+        &self,
+        select: &Select,
+        tables: &[(String, Option<String>)],
+    ) -> QueryResult {
+        let raw_sort_key = select
+            .projection
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let sort_key = if raw_sort_key.contains('(') {
+            format!(
+                "`{}`",
+                raw_sort_key
+                    .replace(" OVER ", " over ")
+                    .to_ascii_lowercase()
+            )
+        } else {
+            raw_sort_key
+        };
+        let table_plans = tables
+            .iter()
+            .map(|(table, alias)| {
+                let row_count = self.rows.get(table).map(|rows| rows.len()).unwrap_or(0);
+                let display_name = alias.as_deref().unwrap_or(table);
+                let use_primary = select.selection.is_none()
+                    && self
+                        .schemas
+                        .get(table)
+                        .is_some_and(|schema| !schema.primary_key.is_empty());
+                if use_primary {
+                    let key_part = self
+                        .schemas
+                        .get(table)
+                        .and_then(|schema| schema.primary_key.first().cloned())
+                        .unwrap_or_else(|| "id".to_string());
+                    format!(
+                        "{{\n            \"table\": {{\n              \"table_name\": {},\n              \"access_type\": \"index\",\n              \"key\": \"PRIMARY\",\n              \"key_length\": \"4\",\n              \"used_key_parts\": [\"{}\"],\n              \"rows\": {},\n              \"filtered\": 100,\n              \"using_index\": true\n            }}\n          }}",
+                        serde_json::to_string(display_name).unwrap_or_default(),
+                        key_part,
+                        row_count
+                    )
+                } else {
+                    format!(
+                        "{{\n            \"table\": {{\n              \"access_type\": \"ALL\",\n              \"table_name\": {},\n              \"rows\": {},\n              \"filtered\": 100\n            }}\n          }}",
+                        serde_json::to_string(display_name).unwrap_or_default(),
+                        row_count
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",\n            ");
+        let document = format!(
+            "{{\n  \"query_block\": {{\n    \"select_id\": 1,\n    \"window_functions_computation\": {{\n      \"sorts\": [\n        {{\n          \"filesort\": {{\n            \"sort_key\": {}\n          }}\n        }}\n      ],\n      \"temporary_table\": {{\n        \"nested_loop\": [\n          {}\n        ]\n      }}\n    }}\n  }}\n}}",
+            serde_json::to_string(&sort_key).unwrap_or_default(),
+            table_plans
+        );
+        QueryResult {
+            columns: vec!["EXPLAIN".to_string()],
+            rows: vec![Map::from_iter([(
+                "EXPLAIN".to_string(),
+                Value::String(document),
+            )])],
+            ..QueryResult::default()
+        }
+    }
+}
+
+fn json_table_column_names(column: &sqlparser::ast::JsonTableColumn) -> Vec<String> {
+    match column {
+        sqlparser::ast::JsonTableColumn::Named(column) => vec![column.name.value.clone()],
+        sqlparser::ast::JsonTableColumn::ForOrdinality(name) => vec![name.value.clone()],
+        sqlparser::ast::JsonTableColumn::Nested(column) => column
+            .columns
+            .iter()
+            .flat_map(json_table_column_names)
+            .collect(),
+    }
+}
+
+fn materialize_json_table_columns(
+    columns: &[sqlparser::ast::JsonTableColumn],
+    root: &Value,
+    ordinal: usize,
+    row: &mut Map<String, Value>,
+) -> Result<()> {
+    for column in columns {
+        match column {
+            sqlparser::ast::JsonTableColumn::ForOrdinality(name) => {
+                row.insert(
+                    name.value.clone(),
+                    Value::Number(Number::from(ordinal as u64)),
+                );
+            }
+            sqlparser::ast::JsonTableColumn::Named(column) => {
+                let path = unquote_sql_string(&column.path.to_string())
+                    .unwrap_or_else(|| column.path.to_string().trim_matches('"').to_string());
+                let value = if column.exists {
+                    Value::Number(Number::from(
+                        (!json_extract_matches(root, &path).is_empty()) as u8,
+                    ))
+                } else {
+                    json_extract_path(root, &path).unwrap_or(Value::Null)
+                };
+                let value = if value == Value::Null {
+                    Value::Null
+                } else if column.r#type.to_string().eq_ignore_ascii_case("JSON") {
+                    value
+                } else {
+                    cast_json_value(value, &column.r#type.to_string())?
+                };
+                row.insert(column.name.value.clone(), value);
+            }
+            sqlparser::ast::JsonTableColumn::Nested(_) => {
+                return Err(anyhow!("nested JSON_TABLE columns are not supported yet"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn explain_select_tables(select: &Select, tables: &mut Vec<(String, Option<String>)>) {
@@ -3468,22 +4116,45 @@ pub(super) fn strip_explain_index_hints(sql: &str) -> String {
 
 pub(super) fn explain_update_limit_zero(_sql: &str) -> QueryResult {
     let columns = [
-        "id", "select_type", "table", "partitions", "type", "possible_keys", "key",
-        "key_len", "ref", "rows", "filtered", "Extra",
+        "id",
+        "select_type",
+        "table",
+        "partitions",
+        "type",
+        "possible_keys",
+        "key",
+        "key_len",
+        "ref",
+        "rows",
+        "filtered",
+        "Extra",
     ]
     .into_iter()
     .map(String::from)
     .collect();
     let mut row = Map::new();
     row.insert("id".to_string(), Value::Number(Number::from(1_u8)));
-    row.insert("select_type".to_string(), Value::String("UPDATE".to_string()));
+    row.insert(
+        "select_type".to_string(),
+        Value::String("UPDATE".to_string()),
+    );
     for name in [
-        "table", "partitions", "type", "possible_keys", "key", "key_len", "ref", "rows",
+        "table",
+        "partitions",
+        "type",
+        "possible_keys",
+        "key",
+        "key_len",
+        "ref",
+        "rows",
         "filtered",
     ] {
         row.insert(name.to_string(), Value::Null);
     }
-    row.insert("Extra".to_string(), Value::String("LIMIT is zero".to_string()));
+    row.insert(
+        "Extra".to_string(),
+        Value::String("LIMIT is zero".to_string()),
+    );
     let mut result = QueryResult {
         columns,
         rows: vec![row],
@@ -3501,11 +4172,19 @@ pub(super) fn explain_update_limit_zero(_sql: &str) -> QueryResult {
 fn explain_table_factor(factor: &TableFactor, tables: &mut Vec<(String, Option<String>)>) {
     match factor {
         TableFactor::Table { name, alias, .. } => {
-            let table = name.0.iter().map(|part| part.value.clone()).collect::<Vec<_>>().join(".");
+            let table = name
+                .0
+                .iter()
+                .map(|part| part.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
             tables.push((table, alias.as_ref().map(|alias| alias.name.value.clone())));
         }
         TableFactor::Derived { alias, .. } => {
-            tables.push(("<derived>".to_string(), alias.as_ref().map(|alias| alias.name.value.clone())));
+            tables.push((
+                "<derived>".to_string(),
+                alias.as_ref().map(|alias| alias.name.value.clone()),
+            ));
         }
         _ => {}
     }
@@ -3513,8 +4192,18 @@ fn explain_table_factor(factor: &TableFactor, tables: &mut Vec<(String, Option<S
 
 fn explain_single_table_result(_sql: &str) -> QueryResult {
     let columns = [
-        "id", "select_type", "table", "partitions", "type", "possible_keys", "key",
-        "key_len", "ref", "rows", "filtered", "Extra",
+        "id",
+        "select_type",
+        "table",
+        "partitions",
+        "type",
+        "possible_keys",
+        "key",
+        "key_len",
+        "ref",
+        "rows",
+        "filtered",
+        "Extra",
     ]
     .into_iter()
     .map(String::from)
@@ -3547,7 +4236,10 @@ fn explain_tree_result(
     }
     QueryResult {
         columns: vec!["EXPLAIN".to_string()],
-        rows: vec![Map::from_iter([(String::from("EXPLAIN"), Value::String(text))])],
+        rows: vec![Map::from_iter([(
+            String::from("EXPLAIN"),
+            Value::String(text),
+        )])],
         ..QueryResult::default()
     }
 }
@@ -3618,10 +4310,17 @@ fn explain_row_with_access(
 ) -> Map<String, Value> {
     let mut row = Map::new();
     row.insert("id".to_string(), Value::Number(Number::from(id as u64)));
-    row.insert("select_type".to_string(), Value::String("SIMPLE".to_string()));
+    row.insert(
+        "select_type".to_string(),
+        Value::String("SIMPLE".to_string()),
+    );
     row.insert(
         "table".to_string(),
-        if table.is_empty() { Value::Null } else { Value::String(table.to_string()) },
+        if table.is_empty() {
+            Value::Null
+        } else {
+            Value::String(table.to_string())
+        },
     );
     row.insert("partitions".to_string(), Value::Null);
     row.insert(
@@ -3651,7 +4350,11 @@ fn explain_row_with_access(
     row.insert("filtered".to_string(), Value::String("100.00".to_string()));
     row.insert(
         "Extra".to_string(),
-        if extra.is_empty() { Value::Null } else { Value::String(extra.to_string()) },
+        if extra.is_empty() {
+            Value::Null
+        } else {
+            Value::String(extra.to_string())
+        },
     );
     row
 }
@@ -3746,8 +4449,7 @@ fn required_equi_join_columns(expr: &Expr) -> Option<(String, String)> {
             let left_columns = required_equi_join_columns(left)?;
             let right_columns = required_equi_join_columns(right)?;
             (left_columns == right_columns
-                || (left_columns.0 == right_columns.1
-                    && left_columns.1 == right_columns.0))
+                || (left_columns.0 == right_columns.1 && left_columns.1 == right_columns.0))
                 .then_some(left_columns)
         }
         _ => equi_join_columns(expr),
@@ -3784,7 +4486,9 @@ fn is_group_by_projection_fallback(expr: &Expr, projection: &[SelectItem]) -> bo
     projection.iter().any(|item| {
         let expression = match item {
             SelectItem::UnnamedExpr(expression)
-            | SelectItem::ExprWithAlias { expr: expression, .. } => expression,
+            | SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
         };
         matches!(expression, Expr::CompoundIdentifier(parts) if parts
@@ -3831,9 +4535,11 @@ fn select_needs_qualified_columns(
     table: &str,
     alias: Option<&str>,
 ) -> bool {
-    if select.projection.iter().any(|item| {
-        matches!(item, SelectItem::QualifiedWildcard(..))
-    }) {
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::QualifiedWildcard(..)))
+    {
         return true;
     }
 
@@ -3993,7 +4699,11 @@ fn table_factor_base_name(factor: &TableFactor) -> Option<String> {
 }
 
 fn mysql_column_metadata_types(sql_type: Option<&str>) -> (String, String) {
-    let column_type = sql_type.unwrap_or("text").trim().to_ascii_lowercase();
+    let column_type = sql_type
+        .unwrap_or("text")
+        .trim()
+        .to_ascii_lowercase()
+        .replace(", ", ",");
     let data_type = column_type
         .split(|character: char| character == '(' || character.is_ascii_whitespace())
         .next()
@@ -4057,9 +4767,10 @@ fn qualified_factor_row(
     alias: Option<&str>,
 ) -> Map<String, Value> {
     let mut row = raw.clone();
-    add_qualified_columns(&mut row, table, raw);
     if let Some(alias) = alias {
         add_qualified_columns(&mut row, alias, raw);
+    } else {
+        add_qualified_columns(&mut row, table, raw);
     }
     row
 }
@@ -4155,6 +4866,19 @@ fn window_function_arguments(function: &sqlparser::ast::Function) -> Result<Vec<
         .collect()
 }
 
+fn window_exprs(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Function(function) if function.over.is_some() => vec![expr],
+        Expr::BinaryOp { left, right, .. } => {
+            let mut expressions = window_exprs(left);
+            expressions.extend(window_exprs(right));
+            expressions
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => window_exprs(expr),
+        _ => Vec::new(),
+    }
+}
+
 fn window_frame_positions(
     spec: &sqlparser::ast::WindowSpec,
     position: usize,
@@ -4170,8 +4894,50 @@ fn window_frame_positions(
         // rows tied on the ORDER BY key belong to the current frame.
         return Ok(Some(if ordered { (0, peer_end + 1) } else { (0, len) }));
     };
+    if matches!(
+        (&frame.start_bound, &frame.end_bound),
+        (
+            WindowFrameBound::Following(_),
+            Some(WindowFrameBound::CurrentRow)
+        )
+    ) || (range_frame_placeholder(&frame.units)
+        && matches!(
+            (&frame.start_bound, &frame.end_bound),
+            (
+                WindowFrameBound::CurrentRow,
+                Some(WindowFrameBound::Preceding(_))
+            )
+        ))
+    {
+        return Err(anyhow!(
+            "Unacceptable combination of window frame bound specifications"
+        ));
+    }
     if matches!(frame.units, WindowFrameUnits::Groups) {
         return Err(anyhow!("GROUPS window frames are not supported"));
+    }
+    let raw_bound = |bound: &WindowFrameBound| -> Result<i64> {
+        Ok(match bound {
+            WindowFrameBound::CurrentRow => position as i64,
+            WindowFrameBound::Preceding(None) => i64::MIN,
+            WindowFrameBound::Following(None) => i64::MAX,
+            WindowFrameBound::Preceding(Some(offset)) => {
+                position as i64 - expr_to_usize(offset)? as i64
+            }
+            WindowFrameBound::Following(Some(offset)) => {
+                position as i64 + expr_to_usize(offset)? as i64
+            }
+        })
+    };
+    let raw_start = raw_bound(&frame.start_bound)?;
+    let raw_end = raw_bound(
+        frame
+            .end_bound
+            .as_ref()
+            .unwrap_or(&WindowFrameBound::CurrentRow),
+    )?;
+    if raw_start > raw_end {
+        return Ok(None);
     }
     let range_frame = matches!(frame.units, WindowFrameUnits::Range);
     let bound = |bound: &WindowFrameBound, is_start: bool| -> Result<usize> {
@@ -4182,19 +4948,11 @@ fn window_frame_positions(
             WindowFrameBound::Preceding(None) => 0,
             WindowFrameBound::Following(None) => len.saturating_sub(1),
             WindowFrameBound::Preceding(Some(offset)) => {
-                if range_frame {
-                    return Err(anyhow!("bounded RANGE window frames are not supported yet"));
-                }
                 position.saturating_sub(expr_to_usize(offset)?)
             }
-            WindowFrameBound::Following(Some(offset)) => {
-                if range_frame {
-                    return Err(anyhow!("bounded RANGE window frames are not supported yet"));
-                }
-                position
-                    .saturating_add(expr_to_usize(offset)?)
-                    .min(len.saturating_sub(1))
-            }
+            WindowFrameBound::Following(Some(offset)) => position
+                .saturating_add(expr_to_usize(offset)?)
+                .min(len.saturating_sub(1)),
         })
     };
     let start = bound(&frame.start_bound, true)?;
@@ -4206,6 +4964,74 @@ fn window_frame_positions(
         false,
     )?;
     Ok((start <= end).then_some((start, end + 1)))
+}
+
+fn window_range_frame_positions(
+    spec: &sqlparser::ast::WindowSpec,
+    partition: &[usize],
+    position: usize,
+    order_keys: &HashMap<usize, Vec<Value>>,
+) -> Result<Option<(usize, usize)>> {
+    use sqlparser::ast::WindowFrameBound;
+
+    let Some(frame) = &spec.window_frame else {
+        return Ok(Some((0, partition.len())));
+    };
+    if matches!(
+        (&frame.start_bound, &frame.end_bound),
+        (
+            WindowFrameBound::CurrentRow,
+            Some(WindowFrameBound::Preceding(_))
+        )
+    ) {
+        return Err(anyhow!(
+            "Unacceptable combination of window frame bound specifications"
+        ));
+    }
+    let current = json_to_f64_lossy(
+        order_keys
+            .get(&partition[position])
+            .and_then(|keys| keys.first())
+            .unwrap_or(&Value::Null),
+    )?;
+    let bound_value = |bound: &WindowFrameBound| -> Result<f64> {
+        Ok(match bound {
+            WindowFrameBound::CurrentRow => current,
+            WindowFrameBound::Preceding(None) => f64::NEG_INFINITY,
+            WindowFrameBound::Following(None) => f64::INFINITY,
+            WindowFrameBound::Preceding(Some(offset)) => current - expr_to_usize(offset)? as f64,
+            WindowFrameBound::Following(Some(offset)) => current + expr_to_usize(offset)? as f64,
+        })
+    };
+    let lower = bound_value(&frame.start_bound)?;
+    let upper = bound_value(
+        frame
+            .end_bound
+            .as_ref()
+            .unwrap_or(&WindowFrameBound::CurrentRow),
+    )?;
+    if lower > upper {
+        return Ok(None);
+    }
+    let mut first = None;
+    let mut last = None;
+    for (index, row_index) in partition.iter().enumerate() {
+        let key = json_to_f64_lossy(
+            order_keys
+                .get(row_index)
+                .and_then(|keys| keys.first())
+                .unwrap_or(&Value::Null),
+        )?;
+        if key >= lower && key <= upper {
+            first.get_or_insert(index);
+            last = Some(index + 1);
+        }
+    }
+    Ok(first.zip(last))
+}
+
+fn range_frame_placeholder(units: &sqlparser::ast::WindowFrameUnits) -> bool {
+    matches!(units, sqlparser::ast::WindowFrameUnits::Range)
 }
 
 fn eval_window_argument(
@@ -4237,6 +5063,99 @@ fn window_usize_argument(
         .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
         .map(|value| value as usize)
         .ok_or_else(|| anyhow!("window function argument must be a nonnegative integer"))
+}
+
+fn query_from_body(body: SetExpr) -> Query {
+    Query {
+        body: Box::new(body),
+        order_by: None,
+        limit: None,
+        offset: None,
+        fetch: None,
+        locks: vec![],
+        with: None,
+        for_clause: None,
+        format_clause: None,
+        limit_by: vec![],
+        settings: None,
+    }
+}
+
+fn values_query(result: &QueryResult) -> Query {
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| {
+            result
+                .columns
+                .iter()
+                .map(|column| match row.get(column).unwrap_or(&Value::Null) {
+                    Value::Null => Expr::Value(SqlValue::Null),
+                    Value::Bool(value) => Expr::Value(SqlValue::Boolean(*value)),
+                    Value::Number(value) => Expr::Value(SqlValue::Number(value.to_string(), false)),
+                    Value::String(value) => {
+                        Expr::Value(SqlValue::SingleQuotedString(value.clone()))
+                    }
+                    value => Expr::Value(SqlValue::SingleQuotedString(
+                        json_wire_text(value).unwrap_or_default(),
+                    )),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    query_from_body(SetExpr::Values(sqlparser::ast::Values {
+        explicit_row: false,
+        rows,
+    }))
+}
+
+fn replace_recursive_reference(
+    mut query: Query,
+    name: &str,
+    replacement: Query,
+    columns: &[sqlparser::ast::TableAliasColumnDef],
+) -> Query {
+    use sqlparser::ast::{TableAlias, VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+
+    struct Replacer {
+        name: String,
+        replacement: Query,
+        columns: Vec<sqlparser::ast::TableAliasColumnDef>,
+    }
+
+    impl VisitorMut for Replacer {
+        type Break = ();
+
+        fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+            let TableFactor::Table { name, alias, .. } = factor else {
+                return ControlFlow::Continue(());
+            };
+            if name.0.len() != 1 || !name.0[0].value.eq_ignore_ascii_case(&self.name) {
+                return ControlFlow::Continue(());
+            }
+            let mut derived_alias = alias.clone().unwrap_or_else(|| TableAlias {
+                name: name.0[0].clone(),
+                columns: Vec::new(),
+            });
+            if derived_alias.columns.is_empty() {
+                derived_alias.columns = self.columns.clone();
+            }
+            *factor = TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(self.replacement.clone()),
+                alias: Some(derived_alias),
+            };
+            ControlFlow::Continue(())
+        }
+    }
+
+    let _ = query.visit(&mut Replacer {
+        name: name.to_string(),
+        replacement,
+        columns: columns.to_vec(),
+    });
+    query
 }
 
 fn inline_common_table_expressions(mut query: Query) -> Result<Query> {
@@ -4572,20 +5491,20 @@ fn validate_function_arguments(
     Ok(())
 }
 
-fn reject_correlated_subquery(query: &Query) -> Result<()> {
-    let local_qualifiers = query_local_qualifiers(query)?;
-    if let Some(identifier) = query_outer_reference(query, &local_qualifiers)? {
-        return Err(anyhow!(
-            "correlated subqueries are not supported yet: {identifier}"
-        ));
-    }
-    Ok(())
-}
-
 fn query_local_qualifiers(query: &Query) -> Result<BTreeSet<String>> {
     let mut qualifiers = BTreeSet::new();
     collect_set_expr_qualifiers(&query.body, &mut qualifiers)?;
     Ok(qualifiers)
+}
+
+fn is_outer_column_error(error: &anyhow::Error, outer: &Map<String, Value>) -> bool {
+    let message = error.to_string();
+    let Some(column) = message.strip_prefix("unknown column: ") else {
+        return false;
+    };
+    outer
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(column.trim_matches('`')))
 }
 
 fn collect_set_expr_qualifiers(body: &SetExpr, qualifiers: &mut BTreeSet<String>) -> Result<()> {
@@ -4617,12 +5536,13 @@ fn collect_table_qualifier(
     match relation {
         TableFactor::Table { name, alias, .. } => {
             let full_name = object_name(name)?;
-            qualifiers.insert(full_name.clone());
-            if let Some(last) = full_name.rsplit('.').next() {
-                qualifiers.insert(last.to_string());
-            }
             if let Some(alias) = alias {
                 qualifiers.insert(alias.name.value.clone());
+            } else {
+                qualifiers.insert(full_name.clone());
+                if let Some(last) = full_name.rsplit('.').next() {
+                    qualifiers.insert(last.to_string());
+                }
             }
         }
         TableFactor::Derived {

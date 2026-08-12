@@ -34,7 +34,8 @@ Meilisearch-shaped search surface.
 | Debug and search HTTP | `127.0.0.1:3407` | Drift inspection, seeding, snapshots, and local search |
 | Storage | In memory | Disposable state; optional locked Lux-backed directory persistence |
 | Compatibility profiles | Drift tolerant / MySQL strict | Choose convenience or fail-fast schema behavior |
-| MySQL verification | MySQL 8.0.43 | Differential corpus, exact parity suites, and a pinned MTR surface |
+| MySQL verification | MySQL 8.0.43 | Differential corpus and exact parity suites |
+| Upstream MariaDB MTR verification | MariaDB 10.11.7 | 2 gated files / 21 scoped files / 305 SQL statements on ARM64 |
 
 ## Where it fits
 
@@ -366,21 +367,25 @@ instead of being silently evaluated as `NULL`, `FALSE`, or a partial result.
 
 - A deterministic 2,500-query corpus compares column names and normalized values with MySQL 8.0.43.
 - The current corpus result is 2,500/2,500 exact matches; CI requires 100%.
-- A separate upstream gate runs unmodified, hash-pinned MySQL 8.0.43 MTR files against both
-  external MySQL and MySqweel servers. Every allowlisted file must pass in full on both targets.
 - Broader parity tests require exact results for every claimed DDL, DML, metadata, and query shape.
 - Wire tests verify common MySQL error numbers and typed prepared-statement behavior.
 - ORM-shaped tests cover migration, CRUD, relation, and introspection patterns used by Diesel,
   Drizzle/Knex, Prisma, and SeaORM.
+- The [MariaDB MTR workflow](.github/workflows/mariadb-mtr-discovery.yml) inventories the ARM64
+  MariaDB 10.11.7 MTR distribution, filters complete external-server candidates, and rotates
+  100-file batches through MariaDB and MySqweel. It also audits the focused
+  [`tests/mariadb-mtr-scope.txt`](tests/mariadb-mtr-scope.txt) set covering 21 files and 305 SQL
+  statements across DDL, DML, aggregates, subqueries, date/time, windows, and JSON.
 
 The percentage describes this versioned corpus, not the entire MySQL grammar. Every reported edge
 case should become a regression case before its implementation is changed.
 
-The upstream MTR count is reported separately. It includes only complete upstream files whose
-entire behavior is inside MySqweel's compatibility boundary and which pass in external-server mode
-against MySQL itself. The manifest records the exact upstream test and expected-result hashes; see
-[`tests/mysql-mtr-exclusions.md`](tests/mysql-mtr-exclusions.md) for admission rules and current
-coverage.
+The MariaDB MTR inventory is not itself a compatibility score: static candidates still have to
+pass against both MariaDB and MySqweel. A discovered file becomes eligible for the strict CI gate
+only after that dual-engine pass and a compatibility-boundary review. The strict manifest records
+the exact upstream test and expected-result hashes in
+[`tests/mariadb-mtr-allowlist.txt`](tests/mariadb-mtr-allowlist.txt). The broader focused scope
+is intentionally non-gating until its complete files pass against both engines.
 
 ### Schema, DDL, and metadata
 
@@ -409,6 +414,7 @@ coverage.
 - `SELECT`, `DISTINCT`, aliases, qualified wildcards, and expression projections
 - `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`
 - aggregate, scalar, date/time, JSON, string, numeric, and conversion functions
+- broad JSON document functions, JSON aggregates, wildcard paths, arrow extraction, and basic `JSON_TABLE` projections
 - `INNER`, `LEFT`, `RIGHT`, `CROSS`, `NATURAL`, `ON`, and `USING` joins
 - derived tables and nonrecursive CTEs with column aliases
 - scalar and `EXISTS`/`IN` subqueries
@@ -441,6 +447,9 @@ The following are outside the supported compatibility surface:
 - replication, users, grants, and production authentication
 - exact optimizer, index-planning, collation, and locking behavior
 - the remainder of the MySQL grammar not listed above
+- `JSON_VALUE` optional `RETURNING`/`ON EMPTY`/`ON ERROR` clauses (the pinned sqlparser version rejects those forms before execution)
+- nested `JSON_TABLE` column expansion and MySQL binary-JSON storage byte-for-byte accounting
+- the complete JSON Schema keyword vocabulary; the embedded validator currently covers the common structural/type constraints
 
 Use real MySQL for tests that depend on any of these behaviors.
 
@@ -558,7 +567,7 @@ Run the complete local suite:
 cargo test --all-targets --locked
 ```
 
-When Docker and a local `mysql:8.0.43` image are available, compatibility tests provision and
+When Docker and a local MySQL-compatible image are available, compatibility tests provision and
 remove their own comparison server. To require comparison or use an existing MySQL instance:
 
 ```sh
@@ -567,21 +576,28 @@ MYSQL_PARITY_REQUIRED=1 \
 cargo test --all-targets --locked
 ```
 
-On Ubuntu 24.04 amd64, reproduce the upstream MTR comparison with the pinned Oracle packages:
+On an Ubuntu 24.04 ARM64 runner, reproduce the upstream MariaDB MTR comparison with the pinned
+Ubuntu MariaDB packages:
 
 ```sh
-eval "$(tools/prepare_mysql_mtr.sh .cache/mysql-mtr --print-env)"
+eval "$(tools/prepare_mariadb_mtr.sh .cache/mariadb-mtr --print-env)"
+export MARIADB_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test
 cargo build --locked --bin sqwl
-python3 tools/mysql_mtr_compat.py \
+python3 tools/mariadb_mtr_compat.py \
   --target both \
-  --suite-root "$MYSQL_MTR_ROOT" \
-  --allowlist tests/mysql-mtr-allowlist.txt \
-  --mysql-url "$MYSQL_COMPARE_URL" \
+  --suite-root "$MARIADB_MTR_ROOT" \
+  --allowlist tests/mariadb-mtr-allowlist.txt \
+  --baseline-url "$MARIADB_COMPARE_URL" \
   --mysqltest-bin "$MYSQLTEST_BIN" \
   --client-bindir "$MYSQL_CLIENT_BINDIR" \
+  --mtr-runner "$MTR_RUNNER" \
+  --safe-process-bin "$MTR_SAFE_PROCESS" \
+  --mtr-layout mariadb \
+  --baseline-label MariaDB \
   --mysqweel-bin target/debug/sqwl \
-  --report-dir artifacts/mysql-mtr \
-  --source-revision 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7 \
+  --report-dir artifacts/mariadb-mtr \
+  --baseline-version 10.11.7 \
+  --source-revision 10.11.7-2ubuntu2 \
   --minimum-percent 100
 ```
 

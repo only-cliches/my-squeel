@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 env:
-  MYSQL_MTR_CACHE_KEY: mysql-mtr-ubuntu24-amd64-8.0.43-v1
-  MYSQL_MTR_REVISION: 2d6d5e10436a8f2b58d37af737c2a3e45855d0b7
+  MARIADB_MTR_CACHE_KEY: mariadb-mtr-ubuntu24-arm64-10.11.7-v1
+  MARIADB_MTR_REVISION: 10.11.7-2ubuntu2
 
 jobs:
   feature-parity:
@@ -42,163 +42,171 @@ jobs:
         run: cargo test --all-targets --locked
 
   mtr-baseline:
-    name: Upstream MTR baseline
-    runs-on: ubuntu-24.04
+    name: MariaDB MTR baseline
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     services:
-      mysql:
-        image: mysql:8.0.43
+      mariadb:
+        image: mariadb:10.11.7
         env:
-          MYSQL_ROOT_PASSWORD: my-sqweel
-          MYSQL_DATABASE: test
+          MARIADB_ROOT_PASSWORD: my-sqweel
+          MARIADB_DATABASE: test
         ports:
-          - 3306:3306
+          - 3307:3306
         options: >-
-          --health-cmd="mysqladmin ping --silent -h 127.0.0.1 -pmy-sqweel"
+          --health-cmd="mariadb-admin ping --silent -h 127.0.0.1 -pmy-sqweel"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=30
     env:
-      MYSQL_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3306/test
+      MARIADB_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3307/test
     steps:
       - uses: actions/checkout@v4
-      - name: Install MySQL MTR runtime dependencies
+      - name: Install MariaDB MTR runtime dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates \
             curl \
-            libaio1t64 \
-            libjson-perl \
-            libmecab2 \
             libnuma1 \
+            libpcre2-8-0 \
+            libpcre2-posix3 \
+            libpmem1 \
             libssl3t64 \
-            libtirpc3t64 \
-            mecab-ipadic-utf8 \
+            liburing2 \
+            perl \
             zlib1g
-      - name: Restore pinned MySQL MTR packages
-        id: mysql-mtr-package-cache
+      - name: Restore pinned MariaDB MTR packages
+        id: mariadb-mtr-package-cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/mysql-mtr-packages
-          key: ${{ env.MYSQL_MTR_CACHE_KEY }}
-      - name: Prepare pinned MySQL upstream MTR binaries and suite
+          path: ${{ runner.temp }}/mariadb-mtr-packages
+          key: ${{ env.MARIADB_MTR_CACHE_KEY }}
+      - name: Prepare pinned MariaDB upstream MTR binaries and suite
         run: |
           set -euo pipefail
-          MYSQL_MTR_CACHE_DIR="$RUNNER_TEMP/mysql-mtr-packages" \
-            tools/prepare_mysql_mtr.sh \
-            "$RUNNER_TEMP/mysql-mtr" \
-            --print-env > "$RUNNER_TEMP/mysql-mtr.env"
-          source "$RUNNER_TEMP/mysql-mtr.env"
-          test -f "$MYSQL_MTR_ROOT/mysql-test/t/ctype_filename.test"
+          MARIADB_MTR_CACHE_DIR="$RUNNER_TEMP/mariadb-mtr-packages" \
+            tools/prepare_mariadb_mtr.sh \
+            "$RUNNER_TEMP/mariadb-mtr" \
+            --print-env > "$RUNNER_TEMP/mariadb-mtr.env"
+          source "$RUNNER_TEMP/mariadb-mtr.env"
+          test -f "$MARIADB_MTR_ROOT/mysql-test/main/1st.test"
           test -x "$MYSQLTEST_BIN"
-          test -x "$MYSQL_CLIENT_BINDIR/mysqltest_safe_process"
-      - name: Save pinned MySQL MTR packages
-        if: steps.mysql-mtr-package-cache.outputs.cache-hit != 'true'
+          test -x "$MTR_SAFE_PROCESS"
+      - name: Save pinned MariaDB MTR packages
+        if: steps.mariadb-mtr-package-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/mysql-mtr-packages
-          key: ${{ steps.mysql-mtr-package-cache.outputs.cache-primary-key }}
-      - name: Validate unmodified upstream tests against MySQL
+          path: ${{ runner.temp }}/mariadb-mtr-packages
+          key: ${{ steps.mariadb-mtr-package-cache.outputs.cache-primary-key }}
+      - name: Validate unmodified upstream tests against MariaDB
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/mysql-mtr.env"
-          python3 tools/mysql_mtr_compat.py \
-            --target mysql \
-            --suite-root "$MYSQL_MTR_ROOT" \
-            --allowlist tests/mysql-mtr-allowlist.txt \
-            --mysql-url "$MYSQL_COMPARE_URL" \
+          source "$RUNNER_TEMP/mariadb-mtr.env"
+          python3 tools/mariadb_mtr_compat.py \
+            --target baseline \
+            --suite-root "$MARIADB_MTR_ROOT" \
+            --allowlist tests/mariadb-mtr-allowlist.txt \
+            --baseline-url "$MARIADB_COMPARE_URL" \
             --mysqltest-bin "$MYSQLTEST_BIN" \
             --client-bindir "$MYSQL_CLIENT_BINDIR" \
-            --report-dir artifacts/mysql-mtr-baseline \
-            --mysql-version 8.0.43 \
-            --source-revision "$MYSQL_MTR_REVISION" \
+            --mtr-runner "$MTR_RUNNER" \
+            --safe-process-bin "$MTR_SAFE_PROCESS" \
+            --mtr-layout mariadb \
+            --baseline-label MariaDB \
+            --report-dir artifacts/mariadb-mtr-baseline \
+            --baseline-version 10.11.7 \
+            --source-revision "$MARIADB_MTR_REVISION" \
             --minimum-percent 100
-      - name: Upload MySQL baseline report
+      - name: Upload MariaDB baseline report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mysql-mtr-baseline-report
+          name: mariadb-mtr-baseline-report
           path: |
-            artifacts/mysql-mtr-baseline/mysql-mtr-report.json
-            artifacts/mysql-mtr-baseline/mysql-mtr-report.md
-            artifacts/mysql-mtr-baseline/**/stdout.log
-            artifacts/mysql-mtr-baseline/**/stderr.log
-            artifacts/mysql-mtr-baseline/**/log/**/*.log
-            artifacts/mysql-mtr-baseline/**/*.reject
-            artifacts/mysql-mtr-baseline/**/my.cnf
+            artifacts/mariadb-mtr-baseline/mtr-report.json
+            artifacts/mariadb-mtr-baseline/mtr-report.md
+            artifacts/mariadb-mtr-baseline/**/stdout.log
+            artifacts/mariadb-mtr-baseline/**/stderr.log
+            artifacts/mariadb-mtr-baseline/**/log/**/*.log
+            artifacts/mariadb-mtr-baseline/**/*.reject
+            artifacts/mariadb-mtr-baseline/**/my.cnf
           if-no-files-found: warn
 
   mtr-mysqweel:
-    name: Upstream MTR compatibility
+    name: MariaDB MTR compatibility
     needs: mtr-baseline
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install MySQL MTR runtime dependencies
+      - name: Install MariaDB MTR runtime dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates \
             curl \
-            libaio1t64 \
-            libjson-perl \
-            libmecab2 \
             libnuma1 \
+            libpcre2-8-0 \
+            libpcre2-posix3 \
+            libpmem1 \
             libssl3t64 \
-            libtirpc3t64 \
-            mecab-ipadic-utf8 \
+            liburing2 \
+            perl \
             zlib1g
-      - name: Restore pinned MySQL MTR packages
+      - name: Restore pinned MariaDB MTR packages
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/mysql-mtr-packages
-          key: ${{ env.MYSQL_MTR_CACHE_KEY }}
+          path: ${{ runner.temp }}/mariadb-mtr-packages
+          key: ${{ env.MARIADB_MTR_CACHE_KEY }}
           fail-on-cache-miss: true
-      - name: Prepare pinned MySQL upstream MTR binaries and suite
+      - name: Prepare pinned MariaDB upstream MTR binaries and suite
         run: |
           set -euo pipefail
-          MYSQL_MTR_CACHE_DIR="$RUNNER_TEMP/mysql-mtr-packages" \
-            tools/prepare_mysql_mtr.sh \
-            "$RUNNER_TEMP/mysql-mtr" \
-            --print-env > "$RUNNER_TEMP/mysql-mtr.env"
-          source "$RUNNER_TEMP/mysql-mtr.env"
-          test -f "$MYSQL_MTR_ROOT/mysql-test/t/ctype_filename.test"
+          MARIADB_MTR_CACHE_DIR="$RUNNER_TEMP/mariadb-mtr-packages" \
+            tools/prepare_mariadb_mtr.sh \
+            "$RUNNER_TEMP/mariadb-mtr" \
+            --print-env > "$RUNNER_TEMP/mariadb-mtr.env"
+          source "$RUNNER_TEMP/mariadb-mtr.env"
+          test -f "$MARIADB_MTR_ROOT/mysql-test/main/1st.test"
           test -x "$MYSQLTEST_BIN"
-          test -x "$MYSQL_CLIENT_BINDIR/mysqltest_safe_process"
+          test -x "$MTR_SAFE_PROCESS"
       - name: Build MySqweel binary for MTR
         run: cargo build --locked --bin sqwl
       - name: Run unmodified upstream tests against MySqweel
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/mysql-mtr.env"
-          python3 tools/mysql_mtr_compat.py \
+          source "$RUNNER_TEMP/mariadb-mtr.env"
+          python3 tools/mariadb_mtr_compat.py \
             --target mysqweel \
-            --suite-root "$MYSQL_MTR_ROOT" \
-            --allowlist tests/mysql-mtr-allowlist.txt \
+            --suite-root "$MARIADB_MTR_ROOT" \
+            --allowlist tests/mariadb-mtr-allowlist.txt \
             --mysqltest-bin "$MYSQLTEST_BIN" \
             --client-bindir "$MYSQL_CLIENT_BINDIR" \
             --mysqweel-bin target/debug/sqwl \
-            --report-dir artifacts/mysql-mtr-mysqweel \
-            --mysql-version 8.0.43 \
-            --source-revision "$MYSQL_MTR_REVISION" \
+            --mtr-runner "$MTR_RUNNER" \
+            --safe-process-bin "$MTR_SAFE_PROCESS" \
+            --mtr-layout mariadb \
+            --baseline-label MariaDB \
+            --report-dir artifacts/mariadb-mtr-mysqweel \
+            --baseline-version 10.11.7 \
+            --source-revision "$MARIADB_MTR_REVISION" \
             --minimum-percent 100
       - name: Upload MySqweel MTR report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mysqweel-mtr-compatibility-report
+          name: mysqweel-mariadb-mtr-compatibility-report
           path: |
-            artifacts/mysql-mtr-mysqweel/mysql-mtr-report.json
-            artifacts/mysql-mtr-mysqweel/mysql-mtr-report.md
-            artifacts/mysql-mtr-mysqweel/**/stdout.log
-            artifacts/mysql-mtr-mysqweel/**/stderr.log
-            artifacts/mysql-mtr-mysqweel/**/log/**/*.log
-            artifacts/mysql-mtr-mysqweel/**/*.reject
-            artifacts/mysql-mtr-mysqweel/**/mysqweel.log
-            artifacts/mysql-mtr-mysqweel/**/my.cnf
+            artifacts/mariadb-mtr-mysqweel/mtr-report.json
+            artifacts/mariadb-mtr-mysqweel/mtr-report.md
+            artifacts/mariadb-mtr-mysqweel/**/stdout.log
+            artifacts/mariadb-mtr-mysqweel/**/stderr.log
+            artifacts/mariadb-mtr-mysqweel/**/log/**/*.log
+            artifacts/mariadb-mtr-mysqweel/**/*.reject
+            artifacts/mariadb-mtr-mysqweel/**/mysqweel.log
+            artifacts/mariadb-mtr-mysqweel/**/my.cnf
           if-no-files-found: warn

@@ -288,13 +288,80 @@ pub(super) fn eval_extract_datetime_component(field: &str, value: &Value) -> Res
         return Ok(Value::Null);
     }
     let normalized = normalize_datetime_field(field);
+    if let Some((days, hours, minutes, seconds)) = compact_interval_parts(value) {
+        return Ok(Value::Number(Number::from(match normalized.as_str() {
+            "DAY" => days,
+            "HOUR" => hours,
+            "MINUTE" => minutes,
+            "SECOND" => seconds,
+            _ => return Ok(Value::Null),
+        })));
+    }
+    let raw = json_scalar_to_string(value);
+    // A full date-time also contains whitespace, but it must be parsed as a
+    // date-time before the interval parser gets a chance to interpret it as
+    // an interval.
     if let Some(datetime) = parse_mysql_datetime_value(value) {
         return extract_datetime_component(&normalized, datetime);
+    }
+    let interval_like = raw.contains(':')
+        || raw.contains(char::is_whitespace)
+        || raw
+            .trim_start_matches(['+', '-'])
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.');
+    if interval_like {
+        if let Some(duration) = parse_mysql_time_duration(value) {
+            let total_hours = duration
+                .num_seconds()
+                .unsigned_abs()
+                .checked_div(3_600)
+                .unwrap_or(u64::MAX);
+            if total_hours >= 87_649_416 {
+                return Ok(Value::Null);
+            }
+            return extract_duration_component(&normalized, duration);
+        }
+        return Ok(Value::Null);
     }
     if let Some(duration) = parse_mysql_time_duration(value) {
         return extract_duration_component(&normalized, duration);
     }
     Ok(Value::Null)
+}
+
+fn compact_interval_parts(value: &Value) -> Option<(i64, i64, i64, i64)> {
+    let raw = json_scalar_to_string(value).trim().to_string();
+    let negative = raw.starts_with('-');
+    let unsigned = raw.trim_start_matches(['+', '-']);
+    let whole = unsigned
+        .split_once('.')
+        .map_or(unsigned, |(whole, _)| whole);
+    let digits = whole.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let padded = format!("{digits:0>4}");
+    let split = padded.len().saturating_sub(4);
+    let hours = if split == 0 {
+        0
+    } else {
+        padded[..split].parse::<i64>().ok()?
+    };
+    let minutes = padded[split..split + 2].parse::<i64>().ok()?;
+    let seconds = padded[split + 2..].parse::<i64>().ok()?;
+    if minutes > 59 || seconds > 59 {
+        return None;
+    }
+    let total_hours = hours;
+    if total_hours >= 87_649_416 {
+        return None;
+    }
+    let sign = if negative { -1 } else { 1 };
+    Some((
+        (total_hours / 24) * sign,
+        (total_hours % 24) * sign,
+        minutes * sign,
+        seconds * sign,
+    ))
 }
 
 fn extract_datetime_component(field: &str, datetime: NaiveDateTime) -> Result<Value> {
@@ -330,7 +397,8 @@ fn extract_duration_component(field: &str, duration: Duration) -> Result<Value> 
     let abs = total_micros.unsigned_abs();
     let total_seconds = abs / 1_000_000;
     let number = match field {
-        "HOUR" => sign * (total_seconds / 3_600) as i64,
+        "DAY" => sign * (total_seconds / 86_400) as i64,
+        "HOUR" => sign * ((total_seconds / 3_600) % 24) as i64,
         "MINUTE" => sign * ((total_seconds / 60) % 60) as i64,
         "SECOND" => sign * (total_seconds % 60) as i64,
         "MICROSECOND" => sign * (abs % 1_000_000) as i64,
@@ -417,17 +485,29 @@ pub(super) fn eval_time_format(
         .trim_start_matches(['-', '+'])
         .split(':')
         .collect::<Vec<_>>();
-    let hours = pieces.first().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
-    let minutes = pieces.get(1).and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let hours = pieces
+        .first()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    let minutes = pieces
+        .get(1)
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
     let seconds_text = pieces.get(2).copied().unwrap_or("0");
     let seconds = seconds_text
-        .split('.').next()
+        .split('.')
+        .next()
         .and_then(|part| part.parse::<u32>().ok())
         .unwrap_or(0);
     let micros = seconds_text
         .split_once('.')
         .map(|(_, fraction)| {
-            let mut value = fraction.chars().take(6).collect::<String>().parse().unwrap_or(0);
+            let mut value = fraction
+                .chars()
+                .take(6)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
             for _ in fraction.chars().take(6).count()..6 {
                 value *= 10;
             }
@@ -448,20 +528,23 @@ pub(super) fn eval_time_format(
             continue;
         }
         let Some(specifier) = chars.next() else { break };
-        output.push_str(match specifier {
-            'H' => format!("{hours:02}"),
-            'k' => hours.to_string(),
-            'h' | 'I' => format!("{hour12:02}"),
-            'l' => hour12.to_string(),
-            'i' => format!("{minutes:02}"),
-            's' | 'S' => format!("{seconds:02}"),
-            'f' => format!("{micros:06}"),
-            'p' => meridiem.to_string(),
-            'r' => format!("{hour12:02}:{minutes:02}:{seconds:02} {meridiem}"),
-            'T' => format!("{hours:02}:{minutes:02}:{seconds:02}"),
-            '%' => "%".to_string(),
-            other => format!("%{other}"),
-        }.as_str());
+        output.push_str(
+            match specifier {
+                'H' => format!("{hours:02}"),
+                'k' => hours.to_string(),
+                'h' | 'I' => format!("{hour12:02}"),
+                'l' => hour12.to_string(),
+                'i' => format!("{minutes:02}"),
+                's' | 'S' => format!("{seconds:02}"),
+                'f' => format!("{micros:06}"),
+                'p' => meridiem.to_string(),
+                'r' => format!("{hour12:02}:{minutes:02}:{seconds:02} {meridiem}"),
+                'T' => format!("{hours:02}:{minutes:02}:{seconds:02}"),
+                '%' => "%".to_string(),
+                other => format!("%{other}"),
+            }
+            .as_str(),
+        );
     }
     Ok(Value::String(output))
 }
@@ -492,6 +575,9 @@ pub(crate) fn eval_date_add_sub(
     let Some(result) = apply_mysql_interval(date, interval, direction) else {
         return Ok(Value::Null);
     };
+    if !(0..=9999).contains(&result.year()) {
+        return Ok(Value::Null);
+    }
     let date_only = !json_scalar_to_string(&date_value).contains(' ')
         && matches!(
             interval.unit,

@@ -396,7 +396,9 @@ pub(super) fn eval_insert_string(
 }
 
 pub(crate) fn mysql_soundex(value: &str) -> String {
-    let mut letters = value.chars().filter(|character| character.is_ascii_alphabetic());
+    let mut letters = value
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic());
     let Some(first) = letters.next() else {
         return String::new();
     };

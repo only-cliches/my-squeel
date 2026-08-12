@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 from tools.mysql_mtr_compat import (
@@ -12,9 +14,15 @@ from tools.mysql_mtr_compat import (
     mtr_command,
     parse_manifest,
     render_markdown,
+    sql_statement_count,
     validate_cases,
     validate_distinct_servers,
     validate_mtr_runtime,
+)
+from tools.mysql_mtr_discover import (
+    discover_cases,
+    rotating_selection,
+    write_promotion_manifest,
 )
 
 DIGEST_A = "a" * 64
@@ -95,6 +103,106 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("--suite=json", command)
         self.assertEqual(command[-1], "functions")
 
+    def test_sql_statement_count_ignores_directives_comments_and_quoted_semicolons(self):
+        source = """
+--disable_warnings
+# comment;
+CREATE TABLE t1 (value VARCHAR(20));
+INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
+/* ignored; */ SELECT * FROM t1;
+"""
+        self.assertEqual(sql_statement_count(source), 3)
+
+    def test_discovery_separates_static_candidates_from_harness_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "t"
+            result_dir = root / "mysql-test" / "r"
+            test_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            (test_dir / "plain.test").write_text("SELECT 1;\n")
+            (result_dir / "plain.result").write_text("SELECT 1;\n1\n1\n")
+            (test_dir / "sourced.test").write_text("-- source include/have_innodb.inc\nSELECT 1;\n")
+            (result_dir / "sourced.result").write_text("SELECT 1;\n1\n1\n")
+            cases = {case.name: case for case in discover_cases(root, "main", 200)}
+            self.assertIsNone(cases["plain"].exclusion)
+            self.assertEqual(cases["plain"].statements, 1)
+            self.assertEqual(cases["sourced"].exclusion, "harness-dependency")
+
+    def test_mariadb_layout_uses_main_for_top_level_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "main"
+            test_dir.mkdir(parents=True)
+            (test_dir / "simple.test").write_text("SELECT 1;\n")
+            (test_dir / "simple.result").write_text("SELECT 1;\n1\n")
+            cases = discover_cases(root, "main", 200, layout="mariadb")
+            self.assertEqual([case.name for case in cases], ["simple"])
+            validate_cases(
+                root,
+                [
+                    TestCase(
+                        "simple",
+                        "query",
+                        hashlib.sha256((test_dir / "simple.test").read_bytes()).hexdigest(),
+                        hashlib.sha256((test_dir / "simple.result").read_bytes()).hexdigest(),
+                        "test",
+                    )
+                ],
+                layout="mariadb",
+            )
+
+    def test_rotating_discovery_selection_wraps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "t"
+            result_dir = root / "mysql-test" / "r"
+            test_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            for name in ("alpha", "bravo", "charlie"):
+                (test_dir / f"{name}.test").write_text("SELECT 1;\n")
+                (result_dir / f"{name}.result").write_text("SELECT 1;\n1\n1\n")
+            cases = discover_cases(root, "main", 200)
+            selected = rotating_selection(cases, offset=2, limit=2)
+            self.assertEqual([case.name for case in selected], ["charlie", "alpha"])
+
+    def test_promotion_manifest_contains_only_dual_engine_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "report.json"
+            manifest = root / "promoted.txt"
+            report.write_text(
+                json.dumps(
+                    {
+                        "source_revision": "abc123",
+                        "results": [
+                            {
+                                "test": "passing",
+                                "feature": "query",
+                                "test_sha256": DIGEST_A,
+                                "result_sha256": DIGEST_B,
+                                "mysql": "pass",
+                                "mysqweel": "pass",
+                            },
+                            {
+                                "test": "failing",
+                                "feature": "query",
+                                "test_sha256": DIGEST_B,
+                                "result_sha256": DIGEST_A,
+                                "mysql": "pass",
+                                "mysqweel": "fail",
+                            },
+                        ],
+                    }
+                )
+            )
+            write_promotion_manifest(
+                Namespace(compat_report=report, promote_manifest=manifest)
+            )
+            promoted = manifest.read_text()
+            self.assertIn("passing query", promoted)
+            self.assertNotIn("failing query", promoted)
+
 
 class ReportTests(unittest.TestCase):
     def test_report_contains_score_and_test_statuses(self):
@@ -111,7 +219,7 @@ class ReportTests(unittest.TestCase):
         }
         markdown = render_markdown(report)
         self.assertIn("Score: 50.0%", markdown)
-        self.assertIn("`join` | `join` | pass | fail", markdown)
+        self.assertIn("`join` | `join` | 0 | pass | fail", markdown)
 
     def test_report_includes_threshold(self):
         report = {

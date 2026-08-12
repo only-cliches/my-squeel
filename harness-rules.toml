@@ -90,8 +90,8 @@
 # - raw CONNECT to other ports requires an explicit `port=...` allow rule
 
 version = 1
-template = "rust"
 mirror_cwd = true
+template = "my-sqweel"
 
 [hostdo]
 default_policy = "prompt"
@@ -141,5 +141,8 @@ allowlist = [
     "domain=cdn.mysql.com",
     "domain=deb.debian.org",
     "domain=downloads.mysql.com",
+    "domain=ports.ubuntu.com",
+    "domain=archive.ubuntu.com",
+    "domain=packages.ubuntu.com",
 ]
 denylist = ["domain=sdmntprsouthcentralus.oaiusercontent.com"]

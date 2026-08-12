@@ -255,12 +255,25 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         if sql_type.contains("double") || sql_type.contains("real") {
             return coerce_double(value.clone()).unwrap_or(value);
         }
-        return coerce_float(value.clone()).unwrap_or(value);
+        let coerced = coerce_float(value.clone()).unwrap_or(value);
+        if let (Value::Number(number), Some((_, scale))) =
+            (&coerced, decimal_precision_scale(&sql_type))
+            && let Some(number) = number.as_f64()
+            && let Some(number) = Number::from_f64(
+                (number * 10_f64.powi(scale as i32)).round() / 10_f64.powi(scale as i32),
+            )
+        {
+            return Value::Number(number);
+        }
+        return coerced;
     }
 
     if sql_type.starts_with("date") && !sql_type.starts_with("datetime") {
         return match value {
             Value::String(value) if value.len() >= 10 => Value::String(value[..10].to_string()),
+            Value::String(value) => compact_mysql_date(&value)
+                .map(Value::String)
+                .unwrap_or(Value::String(value)),
             Value::Number(value) => compact_mysql_date(&value.to_string())
                 .map(Value::String)
                 .unwrap_or_else(|| Value::String(value.to_string())),
@@ -281,6 +294,19 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
             {
                 Value::String(format!("{value} 00:00:00"))
             }
+            Value::String(value)
+                if (sql_type.starts_with("datetime") || sql_type.starts_with("timestamp"))
+                    && value.contains(' ') =>
+            {
+                let (date, time) = value.split_once(' ').unwrap_or((&value, "00:00:00"));
+                let parts = time
+                    .split(':')
+                    .chain(std::iter::repeat("00"))
+                    .take(3)
+                    .map(|part| format!("{part:0>2}"))
+                    .collect::<Vec<_>>();
+                Value::String(format!("{date} {}:{}:{}", parts[0], parts[1], parts[2]))
+            }
             Value::String(_) => value,
             Value::Number(value)
                 if sql_type.contains("datetime") || sql_type.contains("timestamp") =>
@@ -291,6 +317,21 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
             }
             other => Value::String(json_scalar_to_string(&other)),
         };
+    }
+
+    if sql_type.starts_with("bit") {
+        if let Value::String(value) = value {
+            let bits = value
+                .strip_prefix("B'")
+                .or_else(|| value.strip_prefix("b'"))
+                .and_then(|bits| bits.strip_suffix('\''));
+            if let Some(bits) = bits
+                && let Ok(number) = u8::from_str_radix(bits, 2)
+            {
+                return Value::String(char::from(number).to_string());
+            }
+            return Value::String(value);
+        }
     }
 
     if sql_type.starts_with("binary") {
@@ -311,9 +352,14 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
 
     if sql_type.contains("json") {
         return match value {
-            Value::String(s) => serde_json::from_str::<Value>(&s)
-                .map(mark_json_nulls)
-                .unwrap_or(Value::String(s)),
+            Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                // Preserve the serialized form of JSON strings. Otherwise a
+                // JSON document such as `"text"` becomes the indistinguishable
+                // SQL string `text` and fails validation on the next step.
+                Ok(Value::String(_)) => Value::String(s),
+                Ok(value) => mark_json_nulls(value),
+                Err(_) => Value::String(s),
+            },
             other => other,
         };
     }
@@ -356,9 +402,17 @@ pub(super) fn validate_mysql_column_value(
             Value::String(value) => value.clone(),
             _ => return Err(anyhow!("incorrect integer value for column '{column}'")),
         };
-        let number = text
-            .parse::<i128>()
-            .map_err(|_| anyhow!("incorrect integer value for column '{column}'"))?;
+        let number = match value {
+            Value::Number(value) => value
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| value.as_u64().map(i128::from))
+                .or_else(|| value.as_f64().map(|value| value as i128))
+                .ok_or_else(|| anyhow!("incorrect integer value for column '{column}'"))?,
+            _ => text
+                .parse::<i128>()
+                .map_err(|_| anyhow!("incorrect integer value for column '{column}'"))?,
+        };
         let unsigned = declared.contains("UNSIGNED") || declared == "SERIAL";
         let (minimum, maximum) = if declared.starts_with("TINYINT") {
             if unsigned { (0, 255) } else { (-128, 127) }
@@ -422,6 +476,15 @@ pub(super) fn validate_mysql_column_value(
         if text == "0000-00-00" {
             return Ok(());
         }
+        if text.len() == 10
+            && text.as_bytes()[4] == b'-'
+            && text.as_bytes()[7] == b'-'
+            && text[..4].chars().all(|c| c.is_ascii_digit())
+            && text[5..7].chars().all(|c| c.is_ascii_digit())
+            && text[8..].chars().all(|c| c.is_ascii_digit())
+        {
+            return Ok(());
+        }
         let valid = NaiveDate::parse_from_str(&text, "%Y-%m-%d").is_ok()
             || NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S").is_ok()
             || NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f").is_ok()
@@ -437,6 +500,13 @@ pub(super) fn validate_mysql_column_value(
             .or_else(|| value.as_i64().map(|value| value.to_string()))
             .ok_or_else(|| anyhow!("incorrect datetime value for column '{column}'"))?;
         if text == "0000-00-00 00:00:00" {
+            return Ok(());
+        }
+        if text.len() >= 19
+            && text.as_bytes()[4] == b'-'
+            && text.as_bytes()[7] == b'-'
+            && text.as_bytes()[10] == b' '
+        {
             return Ok(());
         }
         let valid = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S")
@@ -457,6 +527,7 @@ pub(super) fn validate_mysql_column_value(
     }
     if declared.starts_with("JSON")
         && let Value::String(value) = value
+        && !is_json_null(value)
         && serde_json::from_str::<Value>(value).is_err()
     {
         return Err(anyhow!("invalid JSON text for column '{column}'"));
@@ -466,6 +537,7 @@ pub(super) fn validate_mysql_column_value(
 
 fn compact_mysql_date(value: &str) -> Option<String> {
     NaiveDate::parse_from_str(value, "%Y%m%d")
+        .or_else(|_| NaiveDate::parse_from_str(value, "%y%m%d"))
         .ok()
         .map(|value| value.format("%Y-%m-%d").to_string())
 }
@@ -526,7 +598,14 @@ fn decimal_precision_scale(declared: &str) -> Option<(usize, usize)> {
 
 pub(super) fn coerce_number(value: Value) -> Option<Value> {
     match value {
-        Value::Number(_) => Some(value),
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| Value::Number(Number::from(value)))
+            .or_else(|| {
+                number
+                    .as_f64()
+                    .map(|value| Value::Number(Number::from(value.round() as i64)))
+            }),
         Value::Bool(value) => Some(Value::Number(Number::from(i64::from(value)))),
         Value::String(value) => value
             .parse::<i64>()

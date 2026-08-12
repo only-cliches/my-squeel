@@ -1908,6 +1908,8 @@ pub enum ErrorKind {
     ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER = 1885,
     /// Cannot convert a binary string to the requested character set.
     ER_CANNOT_CONVERT_STRING = 3854,
+    /// Window frame bounds are in an invalid combination.
+    ER_BAD_COMBINATION_OF_WINDOW_FRAME_BOUND_SPECS = 4014,
 }
 
 impl From<u16> for ErrorKind {
@@ -3704,7 +3706,8 @@ impl ErrorKind {
             | ErrorKind::ER_CANNOT_CONVERT_STRING
             | ErrorKind::ER_CANNOT_DISCARD_TEMPORARY_TABLE
             | ErrorKind::ER_SPATIAL_UNIQUE_INDEX
-            | ErrorKind::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN => b"HY000",
+            | ErrorKind::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN
+            | ErrorKind::ER_BAD_COMBINATION_OF_WINDOW_FRAME_BOUND_SPECS => b"HY000",
             ErrorKind::ER_XAER_NOTA => b"XAE04",
             ErrorKind::ER_XA_RBROLLBACK => b"XA100",
             ErrorKind::ER_DATA_TOO_LONG => b"22001",
