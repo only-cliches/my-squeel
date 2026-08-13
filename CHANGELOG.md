@@ -8,11 +8,15 @@ All notable changes to MySqweel will be documented in this file.
 
 - Fixed `JSON_SET` so it replaces existing values correctly, including values addressed by nested array indexes; previously those paths behaved like insert-only updates.
 - Fixed `JSON_SEARCH(..., 'one', ...)` to recursively search scalar values when no explicit JSON path is supplied, returning matching nested paths such as `$.name`.
+- Fixed `JSON_SEARCH` result encoding so matching paths retain their JSON string representation over the MySQL wire protocol.
+- Fixed `SET GLOBAL time_zone` and `SET SESSION time_zone` variable-name normalization, and aligned whole-second `UNIX_TIMESTAMP` wire metadata with MariaDB's integer output.
 
 ### Compatibility and CI
 
 - Fixed the ARM64 MariaDB MTR preparation flow by extracting the pinned `mariadb-server` package for its required `myisamlog` test utility without installing or starting a second database server.
 - Bumped the MariaDB MTR package cache key so CI refreshes stale package archives and runs the corrected upstream baseline checks.
+- Added external-server timezone handling to the MTR compatibility runner. Hash-pinned tests with fixed POSIX `GMT` offsets now apply the equivalent SQL timezone to both MariaDB and MySqweel before each case.
+- Preserved upstream warning checks in source builds by sending MySqweel query warning counts through the vendored MySQL protocol writer, while retaining compatibility with the published dependency during package verification.
 - Added regression coverage for JSON array-index mutation and recursive JSON path search.
 
 ## 0.4.0 Aug 12, 2026

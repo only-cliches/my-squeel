@@ -593,6 +593,7 @@ fn write_result<W: io::Read + io::Write>(
     out: QueryResult,
     query: Option<&str>,
 ) -> io::Result<()> {
+    #[cfg(msql_srv_warning_counts)]
     let warning_count = u16::try_from(out.warnings.len()).unwrap_or(u16::MAX);
     let mut columns = out.columns;
     if columns.is_empty()
