@@ -2100,7 +2100,11 @@ pub(super) fn eval_expr(
     {
         return Ok(value);
     }
-    if let Some(value) = data.get(&projection_expr_column_name(expr)) {
+    if !matches!(
+        expr,
+        Expr::Value(_) | Expr::TypedString { .. } | Expr::IntroducedString { .. }
+    ) && let Some(value) = data.get(&projection_expr_column_name(expr))
+    {
         return Ok(value.clone());
     }
     if let Some(value) = system_variable_expr_value(expr) {

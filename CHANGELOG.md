@@ -10,6 +10,7 @@ All notable changes to MySqweel will be documented in this file.
 - Fixed `JSON_SEARCH(..., 'one', ...)` to recursively search scalar values when no explicit JSON path is supplied, returning matching nested paths such as `$.name`.
 - Fixed `JSON_SEARCH` result encoding so matching paths retain their JSON string representation over the MySQL wire protocol.
 - Fixed `SET GLOBAL time_zone` and `SET SESSION time_zone` variable-name normalization, and aligned whole-second `UNIX_TIMESTAMP` wire metadata with MariaDB's integer output.
+- Fixed expression lookup precedence so SQL string literals that match column names remain literals, preserving typed column values and keys in nested `JSON_OBJECT` expressions.
 
 ### Compatibility and CI
 
@@ -17,6 +18,9 @@ All notable changes to MySqweel will be documented in this file.
 - Bumped the MariaDB MTR package cache key so CI refreshes stale package archives and runs the corrected upstream baseline checks.
 - Added external-server timezone handling to the MTR compatibility runner. Hash-pinned tests with fixed POSIX `GMT` offsets now apply the equivalent SQL timezone to both MariaDB and MySqweel before each case.
 - Preserved upstream warning checks in source builds by sending MySqweel query warning counts through the vendored MySQL protocol writer, while retaining compatibility with the published dependency during package verification.
+- Added a fail-closed `tools/prepush.sh` check and opt-in Git pre-push hook, and made CI use that same entry point for its real-MySQL differential suite; local checks refuse to report success when neither MySQL nor Docker is available.
+- Made the pre-push check raise low host file-descriptor limits before running parallel Lux-backed tests, preventing macOS defaults from causing unrelated `Too many open files` failures.
+- Removed a timing-dependent port rebind from the parity harness so parallel local checks connect to the already-bound MySqweel listener reliably.
 - Added regression coverage for JSON array-index mutation and recursive JSON path search.
 
 ## 0.4.0 Aug 12, 2026

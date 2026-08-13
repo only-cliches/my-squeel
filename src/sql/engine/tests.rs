@@ -303,6 +303,50 @@ fn evaluates_json_string_math_and_conversion_functions() {
 }
 
 #[test]
+fn json_constructors_preserve_typed_column_values_when_nested() {
+    let engine = Engine::new(EngineConfig::mysql_strict());
+    engine
+        .execute_sql(
+            "CREATE TABLE json_constructor_values (\
+                id BIGINT PRIMARY KEY, username TEXT, score BIGINT, payload TEXT\
+             ); \
+             INSERT INTO json_constructor_values VALUES \
+                (1, 'Ada', 10, '{\"tier\":\"pro\"}')",
+        )
+        .unwrap();
+
+    let out = engine
+        .execute_sql(
+            "SELECT \
+                JSON_OBJECT(\
+                    'name', username, \
+                    'score', score, \
+                    'tier', JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tier'))\
+                ) AS object_value, \
+                JSON_EXTRACT(\
+                    JSON_OBJECT(\
+                        'name', username, \
+                        'score', score, \
+                        'tier', JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tier'))\
+                    ), \
+                    '$.score'\
+                ) AS object_score, \
+                JSON_EXTRACT(JSON_ARRAY(username, score), '$[1]') AS array_score, \
+                'score' AS literal_value \
+             FROM json_constructor_values",
+        )
+        .unwrap();
+
+    assert_eq!(
+        out[0].rows[0].get("object_value"),
+        Some(&json!({"name": "Ada", "score": 10, "tier": "pro"}))
+    );
+    assert_eq!(out[0].rows[0].get("object_score"), Some(&json!("10")));
+    assert_eq!(out[0].rows[0].get("array_score"), Some(&json!("10")));
+    assert_eq!(out[0].rows[0].get("literal_value"), Some(&json!("score")));
+}
+
+#[test]
 fn evaluates_extended_json_functions() {
     let engine = Engine::new(EngineConfig::mysql_strict());
     let result = engine

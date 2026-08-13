@@ -2,7 +2,6 @@ mod common;
 
 use std::net::TcpListener;
 use std::thread;
-use std::time::Duration;
 
 use my_sqweel::server::WireServer;
 use my_sqweel::sql::engine::{Engine, EngineConfig};
@@ -14,16 +13,14 @@ use common::{MYSQL_DOCKER_DATABASE, mysql_compare_target};
 fn start_whatever_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local port");
     let addr = listener.local_addr().expect("local addr");
-    drop(listener);
 
-    let bind_addr = addr;
     thread::spawn(move || {
         let engine = std::sync::Arc::new(Engine::new(EngineConfig::mysql_strict()));
         let wire = WireServer::new(engine);
-        wire.serve(bind_addr).expect("wire server should run");
+        wire.serve_listener(listener)
+            .expect("wire server should run");
     });
 
-    thread::sleep(Duration::from_millis(120));
     format!("mysql://root@127.0.0.1:{}/test", addr.port())
 }
 

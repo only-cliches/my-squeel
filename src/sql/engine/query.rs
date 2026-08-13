@@ -2138,7 +2138,11 @@ impl Engine {
         if let Some(name) = user_variable_name(expr) {
             return Ok(self.user_variable(name));
         }
-        if let Some(value) = data.get(&projection_expr_column_name(expr)) {
+        if !matches!(
+            expr,
+            Expr::Value(_) | Expr::TypedString { .. } | Expr::IntroducedString { .. }
+        ) && let Some(value) = data.get(&projection_expr_column_name(expr))
+        {
             return Ok(value.clone());
         }
         if let Some(value) = system_variable_expr_value(expr) {

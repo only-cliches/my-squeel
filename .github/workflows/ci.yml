@@ -36,10 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Test compatibility report tooling
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
-      - name: Test all targets against real MySQL
-        run: cargo test --all-targets --locked
+      - name: Run pre-push checks against real MySQL
+        run: tools/prepush.sh
 
   mtr-baseline:
     name: MariaDB MTR baseline

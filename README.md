@@ -567,6 +567,23 @@ Run the complete local suite:
 cargo test --all-targets --locked
 ```
 
+Before pushing, run the same fail-closed entry point used by CI's real-MySQL feature job:
+
+```sh
+tools/prepush.sh
+```
+
+The pre-push check requires either `MYSQL_COMPARE_URL` or a working Docker daemon. When Docker is
+used, it pulls and provisions the pinned `mysql:8.0.43` image, shares that server across the suite,
+and removes it afterward. Unlike the default local suite, this command fails instead of silently
+skipping differential tests when real MySQL is unavailable.
+
+Enable the checked-in Git hook once per clone to run it automatically before every push:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 When Docker and a local MySQL-compatible image are available, compatibility tests provision and
 remove their own comparison server. To require comparison or use an existing MySQL instance:
 
