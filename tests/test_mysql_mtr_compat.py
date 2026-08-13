@@ -11,6 +11,7 @@ from pathlib import Path
 from tools.mysql_mtr_compat import (
     Server,
     TestCase,
+    mtr_case_timezone,
     mtr_command,
     parse_manifest,
     render_markdown,
@@ -151,6 +152,36 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
                 ],
                 layout="mariadb",
             )
+
+    def test_mtr_case_timezone_translates_posix_gmt_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "main"
+            test_dir.mkdir(parents=True)
+            (test_dir / "timezone4.test").write_text("SELECT FROM_UNIXTIME(0);\n")
+            (test_dir / "timezone4-master.opt").write_text("--timezone=GMT+10\n")
+            case = TestCase("timezone4", "date-time", DIGEST_A, DIGEST_B, "test")
+            self.assertEqual(mtr_case_timezone(root, case, "mariadb"), "-10:00")
+
+    def test_mtr_case_timezone_defaults_to_utc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "main"
+            test_dir.mkdir(parents=True)
+            (test_dir / "simple.test").write_text("SELECT 1;\n")
+            case = TestCase("simple", "query", DIGEST_A, DIGEST_B, "test")
+            self.assertEqual(mtr_case_timezone(root, case, "mariadb"), "+00:00")
+
+    def test_mtr_case_timezone_rejects_nonportable_server_timezone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "main"
+            test_dir.mkdir(parents=True)
+            (test_dir / "timezone.test").write_text("SELECT NOW();\n")
+            (test_dir / "timezone-master.opt").write_text("--timezone=MET\n")
+            case = TestCase("timezone", "date-time", DIGEST_A, DIGEST_B, "test")
+            with self.assertRaisesRegex(RuntimeError, "fixed GMT offset"):
+                mtr_case_timezone(root, case, "mariadb")
 
     def test_rotating_discovery_selection_wraps(self):
         with tempfile.TemporaryDirectory() as directory:

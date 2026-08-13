@@ -593,6 +593,7 @@ fn write_result<W: io::Read + io::Write>(
     out: QueryResult,
     query: Option<&str>,
 ) -> io::Result<()> {
+    let warning_count = u16::try_from(out.warnings.len()).unwrap_or(u16::MAX);
     let mut columns = out.columns;
     if columns.is_empty()
         && let Some(row) = out.rows.first()
@@ -601,6 +602,13 @@ fn write_result<W: io::Read + io::Write>(
     }
 
     if columns.is_empty() {
+        #[cfg(msql_srv_warning_counts)]
+        return results.completed_with_warnings(
+            out.rows_affected,
+            out.last_insert_id,
+            warning_count,
+        );
+        #[cfg(not(msql_srv_warning_counts))]
         return results.completed(out.rows_affected, out.last_insert_id);
     }
 
@@ -663,6 +671,9 @@ fn write_result<W: io::Read + io::Write>(
         return results.error(mysql_error_kind(&message), message.as_bytes());
     }
 
+    #[cfg(msql_srv_warning_counts)]
+    let mut rw = results.start_with_warnings(&defs, warning_count)?;
+    #[cfg(not(msql_srv_warning_counts))]
     let mut rw = results.start(&defs)?;
     for row in out.rows {
         write_row(
@@ -770,14 +781,17 @@ fn default_session_vars() -> HashMap<String, Value> {
 }
 
 fn normalize_session_var_name(name: &str) -> String {
-    name.trim()
-        .trim_start_matches("@@")
-        .trim_start_matches("SESSION.")
-        .trim_start_matches("session.")
-        .trim_start_matches("GLOBAL.")
-        .trim_start_matches("global.")
-        .trim_matches('`')
-        .to_ascii_lowercase()
+    let mut name = name.trim().trim_start_matches("@@").trim();
+    for prefix in ["SESSION.", "GLOBAL.", "SESSION ", "GLOBAL "] {
+        if name
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        {
+            name = name[prefix.len()..].trim();
+            break;
+        }
+    }
+    name.trim_matches('`').to_ascii_lowercase()
 }
 
 fn parse_session_value(value: &str) -> Value {
@@ -1663,7 +1677,9 @@ mod tests {
     use msql_srv::{Column, ColumnFlags, ColumnType};
     use serde_json::{Map, json};
 
-    use super::{Backend, parse_mysql_datetime_value, validate_wire_rows};
+    use super::{
+        Backend, normalize_session_var_name, parse_mysql_datetime_value, validate_wire_rows,
+    };
     use crate::sql::engine::Engine;
 
     #[test]
@@ -1692,6 +1708,16 @@ mod tests {
         assert!(parse_mysql_datetime_value("2026-07-15 12:34:56.123456").is_some());
         assert!(parse_mysql_datetime_value("2026-07-15T12:34:56.123Z").is_some());
         assert!(parse_mysql_datetime_value("\"2026-07-15T12:34:56.123Z\"").is_some());
+    }
+
+    #[test]
+    fn session_variable_names_accept_global_and_session_sql_forms() {
+        assert_eq!(normalize_session_var_name("GLOBAL time_zone"), "time_zone");
+        assert_eq!(
+            normalize_session_var_name("@@global.time_zone"),
+            "time_zone"
+        );
+        assert_eq!(normalize_session_var_name("SESSION time_zone"), "time_zone");
     }
 
     #[test]

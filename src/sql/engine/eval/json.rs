@@ -678,7 +678,7 @@ pub(super) fn eval_json_search(
         return Ok(Value::Null);
     }
     if mode.eq_ignore_ascii_case("ONE") {
-        Ok(matches.remove(0))
+        json_text_value(matches.remove(0))
     } else {
         json_text_value(Value::Array(matches))
     }

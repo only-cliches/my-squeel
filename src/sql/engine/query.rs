@@ -1250,7 +1250,7 @@ impl Engine {
                     }
                     "PERCENT_RANK" | "CUME_DIST" => MysqlColumnType::Double,
                     "UNIX_TIMESTAMP" => {
-                        metadata.decimals = 6;
+                        metadata.decimals = 0;
                         MysqlColumnType::Decimal
                     }
                     "AVG" | "SUM" | "STD" | "STDDEV" => {

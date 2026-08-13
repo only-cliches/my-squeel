@@ -334,7 +334,7 @@ fn evaluates_extended_json_functions() {
     assert_eq!(row["overlaps"], 1);
     assert_eq!(row["invalid_json"], 0);
     assert_eq!(row["quoted"], "\"Ada\"");
-    assert_eq!(row["found_path"], "$.name");
+    assert_eq!(row["found_path"], "\"$.name\"");
     assert_eq!(row["json_value"], "42");
     assert_eq!(row["schema_valid"], 1);
     assert_eq!(row["storage_size"], 7);

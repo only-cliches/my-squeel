@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -427,6 +428,93 @@ def mtr_command(
     return command
 
 
+def mtr_case_timezone(
+    suite_root: Path,
+    case: TestCase,
+    layout: str = "mysql",
+) -> str:
+    """Return the SQL timezone equivalent of an upstream MTR server option.
+
+    MTR normally applies ``--timezone`` by restarting the server with a TZ
+    environment variable. In ``--extern`` mode it cannot restart the server,
+    so fixed POSIX GMT offsets must be applied through SQL instead. POSIX GMT
+    signs are reversed: ``GMT+10`` means UTC-10.
+    """
+    test_file = mysql_test_file(suite_root, case.name, layout)
+    option_file = test_file.with_name(f"{test_file.stem}-master.opt")
+    if not option_file.is_file():
+        return "+00:00"
+
+    tokens = shlex.split(option_file.read_text(encoding="utf-8", errors="replace"))
+    timezone: str | None = None
+    for index, token in enumerate(tokens):
+        if token.startswith("--timezone="):
+            timezone = token.split("=", 1)[1]
+            break
+        if token == "--timezone" and index + 1 < len(tokens):
+            timezone = tokens[index + 1]
+            break
+    if timezone is None:
+        return "+00:00"
+
+    if timezone in ("UTC", "GMT", "GMT0"):
+        return "+00:00"
+    if re.fullmatch(r"[+-]\d{1,2}:\d{2}", timezone):
+        sign = timezone[0]
+        hours, minutes = timezone[1:].split(":", 1)
+    else:
+        match = re.fullmatch(r"GMT([+-])(\d{1,2})(?::(\d{2}))?", timezone)
+        if not match:
+            raise RuntimeError(
+                f"{case.name}: external-server MTR cannot reproduce timezone "
+                f"option {timezone!r}; use a fixed GMT offset"
+            )
+        sign = "-" if match.group(1) == "+" else "+"
+        hours = match.group(2)
+        minutes = match.group(3) or "00"
+
+    hour = int(hours)
+    minute = int(minutes)
+    if hour > 13 or minute > 59:
+        raise RuntimeError(f"{case.name}: invalid MTR timezone offset {timezone!r}")
+    return f"{sign}{hour:02d}:{minute:02d}"
+
+
+def configure_case_timezone(
+    server: Server,
+    client_bindir: Path,
+    suite_root: Path,
+    case: TestCase,
+    layout: str = "mysql",
+) -> str:
+    timezone = mtr_case_timezone(suite_root, case, layout)
+    connection = parse_server_url(server.url)
+    command = [
+        str(client_bindir / "mysql"),
+        "--no-defaults",
+        f"--user={connection['user']}",
+        f"--password={connection['password']}",
+        f"--host={connection['host']}",
+        f"--port={connection['port']}",
+        "--protocol=TCP",
+        f"--execute=SET GLOBAL time_zone = '{timezone}'",
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"could not configure {server.name} timezone for {case.name}: "
+            f"{completed.stderr.strip()}"
+        )
+    return timezone
+
+
 def run_case(
     suite_root: Path,
     mysqltest_runner: Path,
@@ -680,6 +768,13 @@ def run(args: argparse.Namespace) -> int:
                 client_bindir,
                 mariadb=args.mtr_layout == "mariadb",
             )
+            configure_case_timezone(
+                baseline_server,
+                client_bindir,
+                suite_root,
+                case,
+                args.mtr_layout,
+            )
             baseline_result = run_case(
                 suite_root,
                 runner,
@@ -711,6 +806,13 @@ def run(args: argparse.Namespace) -> int:
                     mysqweel_server,
                     client_bindir,
                     mariadb=args.mtr_layout == "mariadb",
+                )
+                configure_case_timezone(
+                    mysqweel_server,
+                    client_bindir,
+                    suite_root,
+                    case,
+                    args.mtr_layout,
                 )
                 mysqweel_result = run_case(
                     suite_root,

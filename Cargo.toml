@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/only-cliches/my-sqweel"
 readme = "README.md"
 include = [
+    "/build.rs",
     "/Cargo.lock",
     "/Cargo.toml",
     "/CHANGELOG.md",
