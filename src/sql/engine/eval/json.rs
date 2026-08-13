@@ -663,7 +663,7 @@ pub(super) fn eval_json_search(
             .flat_map(|path| json_extract_matches_with_paths(&document, &path))
             .collect::<Vec<_>>()
     } else {
-        vec![("$".to_string(), document.clone())]
+        json_extract_matches_with_paths(&document, "$.**")
     };
     let mut matches = Vec::new();
     for (path, value) in paths {
@@ -984,7 +984,7 @@ pub(super) fn eval_json_mutation(
                 };
                 let path = json_scalar_to_string(&path);
                 let exists = json_extract_path(&document, &path).is_some();
-                if (matches!(mutation, JsonMutation::Set) && !exists)
+                if matches!(mutation, JsonMutation::Set)
                     || (matches!(mutation, JsonMutation::Insert) && !exists)
                     || (matches!(mutation, JsonMutation::Replace) && exists)
                 {

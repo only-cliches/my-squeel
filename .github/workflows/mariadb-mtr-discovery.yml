@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 env:
-  MARIADB_MTR_CACHE_KEY: mariadb-mtr-ubuntu24-arm64-10.11.7-v1
+  MARIADB_MTR_CACHE_KEY: mariadb-mtr-ubuntu24-arm64-10.11.7-v2
   MARIADB_MTR_REVISION: 10.11.7-2ubuntu2
 
 jobs:

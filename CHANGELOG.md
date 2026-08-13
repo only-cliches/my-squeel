@@ -2,6 +2,19 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.4.1 future
+
+### Fixed
+
+- Fixed `JSON_SET` so it replaces existing values correctly, including values addressed by nested array indexes; previously those paths behaved like insert-only updates.
+- Fixed `JSON_SEARCH(..., 'one', ...)` to recursively search scalar values when no explicit JSON path is supplied, returning matching nested paths such as `$.name`.
+
+### Compatibility and CI
+
+- Fixed the ARM64 MariaDB MTR preparation flow by extracting the pinned `mariadb-server` package for its required `myisamlog` test utility without installing or starting a second database server.
+- Bumped the MariaDB MTR package cache key so CI refreshes stale package archives and runs the corrected upstream baseline checks.
+- Added regression coverage for JSON array-index mutation and recursive JSON path search.
+
 ## 0.4.0 Aug 12, 2026
 
 - Repositioned MySqweel as streamlined, embeddable MySQL for applications, testing, and QA, with a prominent in-process `Engine` workflow and an explicit transactions/atomicity compatibility boundary.

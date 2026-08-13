@@ -32,6 +32,7 @@ for package_spec in \
   "mariadb-client=$PACKAGE_VERSION" \
   "mariadb-client-core=$PACKAGE_VERSION" \
   "mariadb-common=$PACKAGE_VERSION" \
+  "mariadb-server=$PACKAGE_VERSION" \
   "mariadb-server-core=$PACKAGE_VERSION" \
   "libmariadb3=$PACKAGE_VERSION"; do
   package_name="${package_spec%%=*}"

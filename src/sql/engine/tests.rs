@@ -246,7 +246,8 @@ fn evaluates_json_string_math_and_conversion_functions() {
                 CAST('2026-04-05 06:07:08' AS DATE) AS cast_date, \
                 CAST('2026-04-05 06:07:08' AS TIME) AS cast_time, \
                 CAST('{\"a\":1}' AS JSON) AS cast_json, \
-                CONVERT('42', SIGNED) AS convert_signed;",
+                CONVERT('42', SIGNED) AS convert_signed, \
+                JSON_SET('{\"a\":[1,2]}', '$.a[1]', 99) AS json_set_array;",
         )
         .unwrap();
     let row = &out[0].rows[0];
@@ -260,6 +261,7 @@ fn evaluates_json_string_math_and_conversion_functions() {
     assert_eq!(row.get("json_array"), Some(&json!([1, "two", null])));
     assert_eq!(row.get("json_contains").and_then(|v| v.as_i64()), Some(1));
     assert_eq!(row.get("json_set"), Some(&json!({"a": 1, "b": 2})));
+    assert_eq!(row.get("json_set_array"), Some(&json!({"a": [1, 99]})));
     assert_eq!(row.get("json_remove"), Some(&json!({"b": 2})));
     assert_eq!(row.get("left_part").and_then(|v| v.as_str()), Some("abc"));
     assert_eq!(row.get("right_part").and_then(|v| v.as_str()), Some("ef"));
@@ -314,6 +316,7 @@ fn evaluates_extended_json_functions() {
                 JSON_OVERLAPS('[1,2]', '[2,3]') AS overlaps, \
                 JSON_VALID('{bad json}') AS invalid_json, \
                 JSON_QUOTE('Ada') AS quoted, \
+                JSON_SEARCH('{\"name\":\"Ada\",\"other\":\"Bob\"}', 'one', 'A%') AS found_path, \
                 JSON_VALUE('{\"score\":42}', '$.score') AS json_value, \
                 JSON_SCHEMA_VALID('{\"type\":\"object\",\"required\":[\"a\"]}', '{\"a\":1}') AS schema_valid, \
                 JSON_STORAGE_SIZE('{\"a\":1}') AS storage_size, \
@@ -331,6 +334,7 @@ fn evaluates_extended_json_functions() {
     assert_eq!(row["overlaps"], 1);
     assert_eq!(row["invalid_json"], 0);
     assert_eq!(row["quoted"], "\"Ada\"");
+    assert_eq!(row["found_path"], "$.name");
     assert_eq!(row["json_value"], "42");
     assert_eq!(row["schema_valid"], 1);
     assert_eq!(row["storage_size"], 7);
