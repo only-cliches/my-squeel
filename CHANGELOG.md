@@ -30,6 +30,7 @@ All notable changes to MySqweel will be documented in this file.
 - Recorded the exhaustive audit as non-gating: 31 candidates pass, while 277 fail and 140 encounter infrastructure failures; unsupported or infrastructure-bound cases remain outside the strict promotion gate.
 - Fixed persistent single-table deletes so removed rows, primary-key membership, and secondary indexes are updated in Lux storage before the engine is reopened.
 - Fixed `ALTER TABLE ... ADD COLUMN ... AUTO_INCREMENT` metadata so the new column remains visible in `information_schema.columns` and `key_column_usage`; parity helpers now also assert `last_insert_id` for write statements.
+- Fixed MySQL wire prepared-statement metadata probing so INSERT, UPDATE, and DELETE statements execute only once, during `COM_STMT_EXECUTE`, preserving auto-increment and affected-row semantics.
 
 ## 0.4.1 future
 

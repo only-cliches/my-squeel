@@ -1449,6 +1449,16 @@ fn parameter_columns(count: usize) -> Vec<Column> {
 }
 
 fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> Vec<Column> {
+    // COM_STMT_PREPARE must not execute mutating statements.  The engine call
+    // below substitutes zero-valued parameters to derive result metadata, so
+    // restrict it to parsed query statements; otherwise INSERT/UPDATE/DELETE
+    // statements would run once during prepare and again during execute.
+    let Ok(statements) = crate::sql::parse(query) else {
+        return Vec::new();
+    };
+    if !matches!(statements.first(), Some(sqlparser::ast::Statement::Query(_))) {
+        return Vec::new();
+    }
     let decimal_columns = mysql_decimal_columns(query);
     // Zero is accepted by LIMIT/OFFSET placeholders and generally produces an
     // empty SELECT while still allowing the engine to derive schema metadata.
@@ -1484,10 +1494,6 @@ fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> 
             })
             .collect();
     }
-
-    let Ok(statements) = crate::sql::parse(query) else {
-        return Vec::new();
-    };
 
     let Some(sqlparser::ast::Statement::Query(parsed_query)) = statements.into_iter().next() else {
         return Vec::new();
@@ -1702,9 +1708,10 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        Backend, normalize_session_var_name, parse_mysql_datetime_value, validate_wire_rows,
+        Backend, normalize_session_var_name, parse_mysql_datetime_value, prepared_result_columns,
+        validate_wire_rows,
     };
-    use crate::sql::engine::Engine;
+    use crate::sql::engine::{Engine, EngineConfig};
 
     #[test]
     fn session_select_shortcut_does_not_capture_table_queries() {
@@ -1758,5 +1765,25 @@ mod tests {
 
         let error = validate_wire_rows(&[row], &columns, &definitions).unwrap_err();
         assert!(error.to_string().contains("incorrect datetime"));
+    }
+
+    #[test]
+    fn preparing_a_write_does_not_execute_it_for_metadata() {
+        let engine = Engine::open_with_data_dir(EngineConfig::mysql_strict(), None).unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE users (id BIGINT PRIMARY KEY AUTO_INCREMENT, email TEXT UNIQUE)",
+            )
+            .unwrap();
+
+        let columns = prepared_result_columns(
+            &engine,
+            "INSERT INTO users (email) VALUES (?)",
+            1,
+        );
+        assert!(columns.is_empty());
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.rows.get("users").map(|rows| rows.len()), Some(0));
+        assert!(snapshot.auto_inc.is_empty());
     }
 }
