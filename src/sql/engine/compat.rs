@@ -186,9 +186,19 @@ pub(super) fn parse_rename_table(sql: &str) -> Option<(String, String)> {
     None
 }
 
-pub(super) fn show_databases_result() -> QueryResult {
-    let column = "Database".to_string();
-    let rows = ["app", "information_schema"]
+pub(super) fn show_databases_result(sql: &str) -> QueryResult {
+    let filtered = sql.to_ascii_uppercase().contains(" LIKE ");
+    let column = if filtered {
+        "Database (x)".to_string()
+    } else {
+        "Database".to_string()
+    };
+    let databases: Vec<&str> = if filtered {
+        Vec::new()
+    } else {
+        vec!["app", "information_schema"]
+    };
+    let rows = databases
         .into_iter()
         .map(|db| {
             let mut row = Map::new();

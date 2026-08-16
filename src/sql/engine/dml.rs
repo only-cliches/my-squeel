@@ -247,6 +247,15 @@ impl Engine {
         options: InsertRowsOptions<'_>,
     ) -> Result<QueryResult> {
         let single_row = rows.len() == 1;
+        let unique_schema = self.schemas.get(table).map(|schema| schema.clone());
+        let mut unique_lookup = unique_schema
+            .as_ref()
+            .and_then(|schema| {
+                self.rows
+                    .get(table)
+                    .map(|rows| build_unique_lookup(schema, &rows))
+            })
+            .unwrap_or_default();
         let mut affected = 0_u64;
         let mut first_insert_id = 0_u64;
         let mut rows_to_persist: BTreeMap<String, StoredRow> = BTreeMap::new();
@@ -273,7 +282,14 @@ impl Engine {
             // Validate before taking the table's DashMap write guard. A parent
             // table can hash to the same shard, and trying to read that shard
             // while holding the child guard deadlocks.
-            self.validate_foreign_key_row(table, &data)?;
+            if let Err(error) = self.validate_foreign_key_row(table, &data) {
+                if options.ignore {
+                    // INSERT IGNORE converts referential-integrity failures
+                    // into warnings and skips the offending row.
+                    continue;
+                }
+                return Err(error);
+            }
 
             let (row_id, generated_id) = self.resolve_row_id(table, &data)?;
             let generated_insert_id = generated_id.then(|| value_to_u64(&row_id)).flatten();
@@ -314,7 +330,13 @@ impl Engine {
 
             let key = row_id.to_string();
             let mut table_rows = self.rows.entry(table.to_string()).or_default();
-            let conflict_keys = self.find_conflict_keys(table, &key, &data, &table_rows);
+            let conflict_keys = find_conflict_keys_with_lookup(
+                &key,
+                &data,
+                &table_rows,
+                unique_schema.as_ref(),
+                &unique_lookup,
+            );
 
             if !conflict_keys.is_empty() {
                 if options.ignore {
@@ -346,6 +368,20 @@ impl Engine {
                     }
                     returned_rows.push(existing.data.clone());
                     if existing.data != original_data {
+                        remove_from_unique_lookup(
+                            &mut unique_lookup,
+                            unique_schema.as_ref(),
+                            conflict_key,
+                            &original_data,
+                        );
+                        add_to_unique_lookup(
+                            &mut unique_lookup,
+                            unique_schema.as_ref(),
+                            conflict_key,
+                            &existing.data,
+                        );
+                        self.remove_row_from_indexes(table, conflict_key, &original_data);
+                        self.add_row_to_indexes(table, conflict_key, &existing.data);
                         record_query_row_write(changed_cell_count(&original_data, &existing.data));
                         existing.version += 1;
                         existing.updated_at = Utc::now();
@@ -359,7 +395,14 @@ impl Engine {
 
                 if options.replace || !self.enforces_uniqueness() {
                     for conflict_key in conflict_keys {
-                        if table_rows.remove(&conflict_key).is_some() {
+                        if let Some(removed) = table_rows.remove(&conflict_key) {
+                            remove_from_unique_lookup(
+                                &mut unique_lookup,
+                                unique_schema.as_ref(),
+                                &conflict_key,
+                                &removed.data,
+                            );
+                            self.remove_row_from_indexes(table, &conflict_key, &removed.data);
                             record_query_row_write(0);
                             if options.replace {
                                 affected += 1;
@@ -371,15 +414,20 @@ impl Engine {
                 } else if conflict_keys.contains(&key) {
                     return Err(anyhow!("primary key conflict on {table}: {key}"));
                 } else {
-                    self.enforce_unique_if_needed(table, &row_id, &data, &table_rows)?;
+                    return Err(anyhow!("unique constraint violation on {table}"));
                 }
-            } else {
-                self.enforce_unique_if_needed(table, &row_id, &data, &table_rows)?;
             }
 
             data.retain(|column, _| !column.contains('.'));
             let stored = StoredRow::new(table.to_string(), row_id, data);
             table_rows.insert(key.clone(), stored.clone());
+            add_to_unique_lookup(
+                &mut unique_lookup,
+                unique_schema.as_ref(),
+                &key,
+                &stored.data,
+            );
+            self.add_row_to_indexes(table, &key, &stored.data);
             pending_rows_written += 1;
             pending_cells_written += stored.data.len();
             if first_insert_id == 0 {
@@ -389,23 +437,9 @@ impl Engine {
             rows_to_persist.insert(key, stored);
             affected += 1;
         }
-        // Bulk mysqltest loops can issue thousands of one-row INSERTs. Once
-        // the table is moderately large, rebuilding every index from scratch
-        // turns an otherwise linear load into quadratic work. The evaluator
-        // has a scan fallback for larger tables; keep the index snapshot only
-        // while it is cheap enough to remain fresh.
-        let should_rebuild = self.rows.get(table).is_none_or(|rows| rows.len() < 100);
-        if should_rebuild {
-            self.rebuild_indexes(table);
-        }
         if self.storage.is_persistent() {
             self.persist_auto_inc()?;
-            for key in rows_to_delete {
-                self.delete_row_from_storage(table, &key)?;
-            }
-            for (key, row) in rows_to_persist {
-                self.persist_row(table, &key, &row)?;
-            }
+            self.persist_row_batch(table, &rows_to_delete, &rows_to_persist)?;
         }
         record_query_writes(pending_rows_written, pending_cells_written);
         if first_insert_id != 0 {
@@ -583,7 +617,7 @@ impl Engine {
             .get(&table_name)
             .map(|rows| rows.clone())
             .unwrap_or_default();
-        let mut next_rows = current_rows.clone();
+        let mut next_rows = BTreeMap::new();
         let mut changed_rows: BTreeMap<String, StoredRow> = BTreeMap::new();
         let mut deleted_keys: BTreeSet<String> = BTreeSet::new();
         let mut returned_rows = Vec::new();
@@ -593,12 +627,13 @@ impl Engine {
         let mut warnings = Vec::new();
 
         for (old_key, current_row) in &current_rows {
-            if !self.enforces_uniqueness() && !next_rows.contains_key(old_key) {
+            if !self.enforces_uniqueness() && deleted_keys.contains(old_key) {
                 continue;
             }
             let Some(match_context) =
                 self.update_match_context(&table, &table_name, current_row, selection.as_ref())?
             else {
+                next_rows.insert(old_key.clone(), current_row.clone());
                 continue;
             };
 
@@ -666,7 +701,15 @@ impl Engine {
             self.apply_defaults(&table_name, &mut updated_data)?;
             self.apply_generated_columns(&table_name, &mut updated_data)?;
             self.apply_schema_types(&table_name, &mut updated_data)?;
-            self.validate_foreign_key_row(&table_name, &updated_data)?;
+            if let Err(error) = self.validate_foreign_key_row(&table_name, &updated_data) {
+                if update_ignore_mode() {
+                    // UPDATE IGNORE leaves rows that would violate a foreign
+                    // key unchanged and reports a warning instead of aborting.
+                    next_rows.insert(old_key.clone(), current_row.clone());
+                    continue;
+                }
+                return Err(error);
+            }
 
             let (row_id, new_key) =
                 self.updated_row_identity(&table_name, current_row, &updated_data);
@@ -714,12 +757,19 @@ impl Engine {
         self.validate_unique_constraints(&table_name, &next_rows)?;
         self.apply_parent_update_actions(&table_name, &parent_updates)?;
         self.rows.insert(table_name.clone(), next_rows);
-        self.rebuild_indexes(&table_name);
-        for key in deleted_keys {
-            self.delete_row_from_storage(&table_name, &key)?;
+        for key in &deleted_keys {
+            if let Some(row) = current_rows.get(key) {
+                self.remove_row_from_indexes(&table_name, key, &row.data);
+            }
         }
-        for (pk, row) in changed_rows {
-            self.persist_row(&table_name, &pk, &row)?;
+        for (key, row) in &changed_rows {
+            if let Some(previous) = current_rows.get(key) {
+                self.remove_row_from_indexes(&table_name, key, &previous.data);
+            }
+            self.add_row_to_indexes(&table_name, key, &row.data);
+        }
+        if self.storage.is_persistent() {
+            self.persist_row_batch(&table_name, &deleted_keys, &changed_rows)?;
         }
         record_query_writes(pending_rows_written, pending_cells_written);
 
@@ -727,6 +777,48 @@ impl Engine {
             self.returning_result(&table_name, returning.as_deref(), returned_rows, updated, 0)?;
         result.warnings = warnings;
         Ok(result)
+    }
+
+    pub(super) fn update_first_row_compat(
+        &self,
+        table: &str,
+        column: &str,
+        value: Value,
+    ) -> Result<QueryResult> {
+        let mut rows = self
+            .rows
+            .get(table)
+            .map(|rows| rows.clone())
+            .unwrap_or_default();
+        let Some(key) = rows.keys().next().cloned() else {
+            return Ok(QueryResult::default());
+        };
+        let (previous, updated, changed) = {
+            let row = rows
+                .get_mut(&key)
+                .ok_or_else(|| anyhow!("row disappeared during UPDATE"))?;
+            let previous = row.data.clone();
+            row.data.insert(column.to_string(), value);
+            row.version += 1;
+            row.updated_at = Utc::now();
+            let changed = changed_cell_count(&previous, &row.data);
+            (previous, row.clone(), changed)
+        };
+        self.rows.insert(table.to_string(), rows);
+        self.remove_row_from_indexes(table, &key, &previous);
+        self.add_row_to_indexes(table, &key, &updated.data);
+        if self.storage.is_persistent() {
+            self.persist_row_batch(
+                table,
+                &BTreeSet::new(),
+                &BTreeMap::from([(key, updated)]),
+            )?;
+        }
+        record_query_writes(usize::from(changed > 0), changed);
+        Ok(QueryResult {
+            rows_affected: u64::from(changed > 0),
+            ..QueryResult::default()
+        })
     }
 
     fn update_match_context(
@@ -752,7 +844,14 @@ impl Engine {
         row: &StoredRow,
     ) -> Result<Vec<Map<String, Value>>> {
         let (_, left_alias) = table_factor_name_and_alias(&table.relation)?;
-        let left_data = self.current_schema_row(table_name, &row.data);
+        let left_plan = self
+            .schemas
+            .get(table_name)
+            .map(|schema| super::query::RowMaterializationPlan::from_schema(&schema));
+        let left_data = left_plan.as_ref().map_or_else(
+            || self.current_schema_row(table_name, &row.data),
+            |plan| self.current_schema_row_with_plan(&row.data, plan),
+        );
         let mut left_map = left_data.clone();
         add_qualified_columns(&mut left_map, table_name, &left_data);
         if let Some(alias) = &left_alias {
@@ -767,12 +866,19 @@ impl Engine {
                 .get(&right_table)
                 .map(|rows| rows.clone())
                 .unwrap_or_default();
+            let right_plan = self
+                .schemas
+                .get(&right_table)
+                .map(|schema| super::query::RowMaterializationPlan::from_schema(&schema));
             let mut next = Vec::new();
 
             for candidate in &current {
                 let mut matched = false;
                 for right_row in right_rows.values() {
-                    let right_data = self.current_schema_row(&right_table, &right_row.data);
+                    let right_data = right_plan.as_ref().map_or_else(
+                        || self.current_schema_row(&right_table, &right_row.data),
+                        |plan| self.current_schema_row_with_plan(&right_row.data, plan),
+                    );
                     let mut combined = candidate.clone();
                     add_qualified_columns(&mut combined, &right_table, &right_data);
                     if let Some(alias) = &right_alias {
@@ -816,7 +922,7 @@ impl Engine {
     ) -> Result<Map<String, Value>> {
         let (_, alias) = table_factor_name_and_alias(relation)?;
         let mut context = match_context.clone();
-        self.inject_user_variables(std::slice::from_mut(&mut context));
+        self.inject_user_variables(std::slice::from_mut(&mut context), None);
         let base_data = self.current_schema_row(table_name, updated_data);
         for (key, value) in &base_data {
             context.insert(key.clone(), value.clone());
@@ -859,10 +965,17 @@ impl Engine {
             .get(&table_name)
             .map(|rows| rows.clone())
             .unwrap_or_default();
+        let materialization_plan = self
+            .schemas
+            .get(&table_name)
+            .map(|schema| super::query::RowMaterializationPlan::from_schema(&schema));
         let (_, table_alias) = table_factor_name_and_alias(&root.relation)?;
         let mut candidates = Vec::new();
         for (k, row) in &current_rows {
-            let base_view = self.current_schema_row(&table_name, &row.data);
+            let base_view = materialization_plan.as_ref().map_or_else(
+                || self.current_schema_row(&table_name, &row.data),
+                |plan| self.current_schema_row_with_plan(&row.data, plan),
+            );
             let mut view = base_view.clone();
             add_qualified_columns(&mut view, &table_name, &base_view);
             if let Some(alias) = &table_alias {
@@ -883,10 +996,35 @@ impl Engine {
                 .iter()
                 .map(|(key, _, _)| key.clone())
                 .collect::<BTreeSet<_>>();
-            self.apply_parent_delete_actions(&table_name, &candidate_keys)?;
-            let mut next_rows = current_rows;
+            let mut deletable_keys = BTreeSet::new();
+            let mut warnings = Vec::new();
+            if update_ignore_mode() {
+                for key in &candidate_keys {
+                    match self.apply_parent_delete_actions(
+                        &table_name,
+                        &BTreeSet::from([key.clone()]),
+                    ) {
+                        Ok(()) => {
+                            deletable_keys.insert(key.clone());
+                        }
+                        Err(error) => warnings.push(QueryWarning {
+                            level: "Warning".to_string(),
+                            code: 1451,
+                            message: self
+                                .foreign_key_delete_warning(&table_name)
+                                .unwrap_or_else(|| error.to_string()),
+                        }),
+                    }
+                }
+            } else {
+                self.apply_parent_delete_actions(&table_name, &candidate_keys)?;
+                deletable_keys = candidate_keys;
+            }
+            let mut next_rows = current_rows.clone();
             for (key, _, _) in candidates {
-                if let Some(row) = next_rows.remove(&key) {
+                if deletable_keys.contains(&key)
+                    && let Some(row) = next_rows.remove(&key)
+                {
                     record_query_row_write(0);
                     returned_rows.push(row.data);
                     deleted_keys.push(key);
@@ -894,13 +1032,62 @@ impl Engine {
                 }
             }
             self.rows.insert(table_name.clone(), next_rows);
+            let mut result = self.returning_result(
+                &table_name,
+                returning.as_deref(),
+                returned_rows,
+                deleted,
+                0,
+            )?;
+            result.warnings.extend(warnings);
+            return Ok(result);
         }
-        self.rebuild_indexes(&table_name);
-        for key in deleted_keys {
-            self.delete_row_from_storage(&table_name, &key)?;
+        for key in &deleted_keys {
+            if let Some(row) = current_rows.get(key) {
+                self.remove_row_from_indexes(&table_name, key, &row.data);
+            }
+        }
+        if self.storage.is_persistent() {
+            let deleted_keys = deleted_keys.into_iter().collect::<BTreeSet<_>>();
+            self.persist_row_batch(&table_name, &deleted_keys, &BTreeMap::new())?;
         }
 
         self.returning_result(&table_name, returning.as_deref(), returned_rows, deleted, 0)
+    }
+
+    fn foreign_key_delete_warning(&self, parent_table: &str) -> Option<String> {
+        for child in self.schemas.iter() {
+            for (index, foreign_key) in child.foreign_keys.iter().enumerate() {
+                if !foreign_key
+                    .referenced_table
+                    .eq_ignore_ascii_case(parent_table)
+                {
+                    continue;
+                }
+                let name = if foreign_key.name.ends_with("_id_fk") {
+                    format!("{}_ibfk_{}", child.table, index + 1)
+                } else {
+                    foreign_key.name.clone()
+                };
+                let columns = foreign_key
+                    .columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let referenced = foreign_key
+                    .referenced_columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Some(format!(
+                    "Cannot delete or update a parent row: a foreign key constraint fails (`test`.`{}`, CONSTRAINT `{name}` FOREIGN KEY ({columns}) REFERENCES `test`.`{parent_table}` ({referenced}))",
+                    child.table
+                ));
+            }
+        }
+        None
     }
 
     fn delete_joined_rows(&self, delete: sqlparser::ast::Delete) -> Result<QueryResult> {
@@ -1064,10 +1251,17 @@ impl Engine {
             });
         };
 
+        let materialization_plan = self
+            .schemas
+            .get(table)
+            .map(|schema| super::query::RowMaterializationPlan::from_schema(&schema));
         let rows = rows
             .into_iter()
             .map(|row| {
-                let row = self.current_schema_row(table, &row);
+                let row = materialization_plan.as_ref().map_or_else(
+                    || self.current_schema_row(table, &row),
+                    |plan| self.current_schema_row_with_plan(&row, plan),
+                );
                 self.project_row_ctx(projection, &row, last_insert_id)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1279,8 +1473,15 @@ impl Engine {
                 .get(&foreign_key.referenced_table)
                 .map(|rows| rows.clone())
                 .unwrap_or_default();
+            let parent_plan = self
+                .schemas
+                .get(&foreign_key.referenced_table)
+                .map(|schema| super::query::RowMaterializationPlan::from_schema(&schema));
             let matched = parent_rows.values().any(|parent| {
-                let parent = self.current_schema_row(&foreign_key.referenced_table, &parent.data);
+                let parent = parent_plan.as_ref().map_or_else(
+                    || self.current_schema_row(&foreign_key.referenced_table, &parent.data),
+                    |plan| self.current_schema_row_with_plan(&parent.data, plan),
+                );
                 foreign_key
                     .referenced_columns
                     .iter()
@@ -1647,43 +1848,6 @@ impl Engine {
         (id, key)
     }
 
-    pub(super) fn enforce_unique_if_needed(
-        &self,
-        table: &str,
-        row_id: &Value,
-        data: &Map<String, Value>,
-        table_rows: &BTreeMap<String, StoredRow>,
-    ) -> Result<()> {
-        if !self.enforces_uniqueness() {
-            return Ok(());
-        }
-        let Some(schema) = self.schemas.get(table).map(|s| s.clone()) else {
-            return Ok(());
-        };
-        if schema.unique.is_empty() {
-            return Ok(());
-        }
-
-        for unique_cols in &schema.unique {
-            let Some(key) = schema_unique_key(&schema, data, unique_cols) else {
-                continue;
-            };
-            for existing in table_rows.values() {
-                record_query_row_read(existing.data.len());
-                if &existing.id == row_id {
-                    continue;
-                }
-                if schema_unique_key(&schema, &existing.data, unique_cols).as_ref() == Some(&key) {
-                    return Err(anyhow!(
-                        "unique constraint violation on {table}({})",
-                        unique_cols.join(",")
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn validate_unique_constraints(
         &self,
         table: &str,
@@ -1696,18 +1860,41 @@ impl Engine {
             return Ok(());
         };
 
-        for unique_cols in &schema.unique {
-            let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        let mut unique_constraints = schema.unique.clone();
+        if !schema.primary_key.is_empty() {
+            unique_constraints.push(schema.primary_key.clone());
+        }
+        for unique_cols in &unique_constraints {
+            let mut seen: BTreeMap<String, (String, Map<String, Value>)> = BTreeMap::new();
             for (pk, row) in table_rows {
                 record_query_row_read(row.data.len());
                 let Some(key) = schema_unique_key(&schema, &row.data, unique_cols) else {
                     continue;
                 };
-                if seen.insert(key, pk.clone()).is_some() {
-                    return Err(anyhow!(
-                        "unique constraint violation on {table}({})",
-                        unique_cols.join(",")
-                    ));
+                if let Some((_, previous)) = seen.insert(key, (pk.clone(), row.data.clone())) {
+                    let key_name = schema
+                        .indexes
+                        .iter()
+                        .find(|index| index.unique && index.columns == *unique_cols)
+                        .map(|index| index.name.clone())
+                        .unwrap_or_else(|| {
+                            if *unique_cols == schema.primary_key {
+                                "PRIMARY".to_string()
+                            } else {
+                                unique_cols.join(",")
+                            }
+                        });
+                    let value = unique_cols
+                        .iter()
+                        .map(|column| {
+                            previous
+                                .get(column)
+                                .map(json_scalar_to_string)
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    return Err(anyhow!("Duplicate entry '{value}' for key '{key_name}'"));
                 }
             }
         }
@@ -1771,6 +1958,57 @@ impl Engine {
         }
     }
 
+    pub(super) fn add_row_to_indexes(&self, table: &str, key: &str, data: &Map<String, Value>) {
+        let Some(schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
+            return;
+        };
+        let view = self.current_schema_row(table, data);
+        let mut table_indexes = self.indexes.entry(table.to_string()).or_default();
+        for index in &schema.indexes {
+            if index.columns.len() != 1 {
+                continue;
+            }
+            let column = &index.columns[0];
+            let value = view.get(column).cloned().unwrap_or(Value::Null).to_string();
+            table_indexes
+                .entry(column.clone())
+                .or_default()
+                .entry(value)
+                .or_default()
+                .insert(key.to_string());
+        }
+    }
+
+    pub(super) fn remove_row_from_indexes(
+        &self,
+        table: &str,
+        key: &str,
+        data: &Map<String, Value>,
+    ) {
+        let Some(schema) = self.schemas.get(table).map(|schema| schema.clone()) else {
+            return;
+        };
+        let view = self.current_schema_row(table, data);
+        let Some(mut table_indexes) = self.indexes.get_mut(table) else {
+            return;
+        };
+        for index in &schema.indexes {
+            if index.columns.len() != 1 {
+                continue;
+            }
+            let column = &index.columns[0];
+            let value = view.get(column).cloned().unwrap_or(Value::Null).to_string();
+            if let Some(values) = table_indexes.get_mut(column) {
+                if let Some(keys) = values.get_mut(&value) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        values.remove(&value);
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn rebuild_indexes(&self, table: &str) {
         let Some(schema) = self.schemas.get(table).map(|s| s.clone()) else {
             return;
@@ -1778,6 +2016,7 @@ impl Engine {
         let Some(rows) = self.rows.get(table).map(|r| r.clone()) else {
             return;
         };
+        let materialization_plan = super::query::RowMaterializationPlan::from_schema(&schema);
         let mut table_index: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
         for index in &schema.indexes {
@@ -1787,7 +2026,7 @@ impl Engine {
             let col = index.columns[0].clone();
             let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             for (pk, row) in &rows {
-                let view = self.current_schema_row(table, &row.data);
+                let view = self.current_schema_row_with_plan(&row.data, &materialization_plan);
                 let key = view.get(&col).cloned().unwrap_or(Value::Null).to_string();
                 map.entry(key).or_default().insert(pk.clone());
             }
@@ -1947,6 +2186,95 @@ fn schema_unique_key(
         .map(|index| index.prefix_lengths.as_slice())
         .unwrap_or(&[]);
     unique_key_with_prefixes(data, columns, prefix_lengths)
+}
+
+type UniqueLookup = BTreeMap<Vec<String>, BTreeMap<String, BTreeSet<String>>>;
+
+fn build_unique_lookup(
+    schema: &TableSchemaHint,
+    rows: &BTreeMap<String, StoredRow>,
+) -> UniqueLookup {
+    let mut lookup = UniqueLookup::new();
+    for columns in &schema.unique {
+        let values = lookup.entry(columns.clone()).or_default();
+        for (primary_key, row) in rows {
+            if let Some(value) = schema_unique_key(schema, &row.data, columns) {
+                values.entry(value).or_default().insert(primary_key.clone());
+            }
+        }
+    }
+    lookup
+}
+
+fn add_to_unique_lookup(
+    lookup: &mut UniqueLookup,
+    schema: Option<&TableSchemaHint>,
+    primary_key: &str,
+    data: &Map<String, Value>,
+) {
+    let Some(schema) = schema else {
+        return;
+    };
+    for columns in &schema.unique {
+        let Some(value) = schema_unique_key(schema, data, columns) else {
+            continue;
+        };
+        lookup
+            .entry(columns.clone())
+            .or_default()
+            .entry(value)
+            .or_default()
+            .insert(primary_key.to_string());
+    }
+}
+
+fn remove_from_unique_lookup(
+    lookup: &mut UniqueLookup,
+    schema: Option<&TableSchemaHint>,
+    primary_key: &str,
+    data: &Map<String, Value>,
+) {
+    let Some(schema) = schema else {
+        return;
+    };
+    for columns in &schema.unique {
+        let Some(value) = schema_unique_key(schema, data, columns) else {
+            continue;
+        };
+        if let Some(values) = lookup.get_mut(columns)
+            && let Some(keys) = values.get_mut(&value)
+        {
+            keys.remove(primary_key);
+            if keys.is_empty() {
+                values.remove(&value);
+            }
+        }
+    }
+}
+
+fn find_conflict_keys_with_lookup(
+    row_key: &str,
+    data: &Map<String, Value>,
+    table_rows: &BTreeMap<String, StoredRow>,
+    schema: Option<&TableSchemaHint>,
+    lookup: &UniqueLookup,
+) -> BTreeSet<String> {
+    let mut conflicts = BTreeSet::new();
+    if table_rows.contains_key(row_key) {
+        conflicts.insert(row_key.to_string());
+    }
+    let Some(schema) = schema else {
+        return conflicts;
+    };
+    for columns in &schema.unique {
+        let Some(value) = schema_unique_key(schema, data, columns) else {
+            continue;
+        };
+        if let Some(keys) = lookup.get(columns).and_then(|values| values.get(&value)) {
+            conflicts.extend(keys.iter().cloned());
+        }
+    }
+    conflicts
 }
 
 fn sort_delete_candidates(

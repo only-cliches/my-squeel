@@ -4,6 +4,27 @@ use serde_json::json;
 use std::time::Duration as StdDuration;
 
 #[test]
+fn ordinary_selects_use_the_direct_parser_path() {
+    let engine = Engine::default();
+    assert!(engine.can_parse_without_compat_rewrites("SELECT 1 AS value"));
+    assert!(engine.can_parse_without_compat_rewrites(
+        "select id from users where id = 1 order by id limit 1"
+    ));
+    assert!(!engine.can_parse_without_compat_rewrites("SELECT SQL_NO_CACHE id FROM users"));
+    assert!(
+        !engine.can_parse_without_compat_rewrites("SELECT id FROM users FORCE INDEX (PRIMARY)")
+    );
+    assert!(!engine.can_parse_without_compat_rewrites("CREATE TABLE users (id INT)"));
+
+    // If an otherwise ordinary SELECT fails direct parsing, retain the old
+    // compatibility rewrite fallback rather than surfacing a new parser error.
+    let duplicate_distinct = engine
+        .execute_sql("SELECT DISTINCT   DISTINCT 1 AS value")
+        .unwrap();
+    assert_eq!(duplicate_distinct[0].rows[0]["value"], 1);
+}
+
+#[test]
 fn supports_mysql_user_variables_and_server_prepared_statements() {
     let engine = Engine::new(EngineConfig::mysql_strict());
     let result = engine

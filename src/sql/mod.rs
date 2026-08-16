@@ -90,6 +90,12 @@ fn rewrite_user_variable_assignments(sql: &str) -> Option<String> {
                             depth -= 1;
                         } else if rhs_byte == b',' && depth == 0 {
                             break;
+                        } else if depth == 0
+                            && bytes
+                                .get(index..index + 4)
+                                .is_some_and(|slice| slice.eq_ignore_ascii_case(b" AS "))
+                        {
+                            break;
                         }
                     }
                     output.push(rhs_byte as char);

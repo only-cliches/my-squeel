@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inventory pinned MariaDB MTR tests and build rotating audit manifests.
+"""Inventory pinned MariaDB MTR tests and build exhaustive or batched audit manifests.
 
 Discovery is intentionally non-gating. It identifies complete upstream files
 that are plausible external-server compatibility candidates, while the strict
@@ -30,6 +30,13 @@ DEPENDENT_DIRECTIVE = re.compile(
     r"send|reap|sleep|real_sleep|shutdown|restart|write_file|append_file|remove_file|"
     r"copy_file|move_file|chmod|mkdir|rmdir|cat_file)\b"
 )
+UNSAFE_HARNESS_DIRECTIVE = re.compile(
+    r"(?im)^\s*(?:--\s*)?(?:exec|system|perl|shutdown|restart|write_file|append_file|"
+    r"remove_file|copy_file|move_file|chmod|mkdir|rmdir|cat_file)\b"
+)
+SOURCE_DIRECTIVE = re.compile(
+    r"(?im)^\s*(?:--\s*)?(?:source|include)\s+['\"]?([^'\"\s;]+)"
+)
 DELIMITER_DIRECTIVE = re.compile(r"(?im)^\s*(?:--\s*)?delimiter\b")
 UNSUPPORTED_SQL = re.compile(
     r"(?is)\b(?:START\s+TRANSACTION|BEGIN\s+WORK|COMMIT|ROLLBACK|SAVEPOINT|"
@@ -38,19 +45,22 @@ UNSUPPORTED_SQL = re.compile(
     r"(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)|DROP\s+(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)|"
     r"CHANGE\s+(?:MASTER|REPLICATION\s+SOURCE)|START\s+(?:SLAVE|REPLICA)|"
     r"STOP\s+(?:SLAVE|REPLICA)|RESET\s+(?:MASTER|REPLICA|SLAVE)|"
+    r"CREATE\s+SERVER|ALTER\s+SERVER|DROP\s+SERVER|"
     r"INSTALL\s+(?:PLUGIN|COMPONENT)|UNINSTALL\s+(?:PLUGIN|COMPONENT)|"
     r"CREATE\s+RESOURCE\s+GROUP|ALTER\s+RESOURCE\s+GROUP|CLONE\s+INSTANCE)\b"
 )
 SPECIALIZED_SQL = re.compile(
     r"(?is)\b(?:PARTITION(?:ING)?|FULLTEXT|SPATIAL)\b|"
-    r"\bENGINE\s*=\s*(?:ARCHIVE|CSV|MEMORY|HEAP|MYISAM|FEDERATED|NDB)\b"
+    r"\bENGINE\s*=\s*(?:ARCHIVE|ARIA|BLACKHOLE|CSV|MEMORY|HEAP|MYISAM|FEDERATED|NDB)\b|"
+    r"\bLOAD\s+(?:DATA|XML)\s+(?:LOCAL\s+)?INFILE\b|"
+    r"\bINTO\s+(?:OUTFILE|DUMPFILE)\b"
 )
 SERVER_CONFIGURATION_SQL = re.compile(
     r"(?is)\b(?:SET\s+(?:@@)?GLOBAL|FLUSH\s|SHUTDOWN\b|RESTART\b|"
     r"SET\s+PERSIST(?:_ONLY)?\b)"
 )
 TOPOLOGY_NAME = re.compile(
-    r"(?i)(?:^|_)(?:binlog|replication|replica|slave|master|group_replication|ndb)(?:_|$)"
+    r"(?i)(?:^|[/_])(?:binlog|rpl|replication|replica|slave|master|group_replication|ndb)(?:[/_]|$)"
 )
 COMPATIBILITY_SUITES = {
     "collations",
@@ -62,6 +72,7 @@ COMPATIBILITY_SUITES = {
     "jp",
     "json",
 }
+SAFE_HARNESS_SUITES = (COMPATIBILITY_SUITES - {"innodb"}) | {"vcol"}
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,37 @@ def without_mtr_comments(text: str) -> str:
         for line in text.splitlines()
         if not line.lstrip().startswith(("#", "--"))
     )
+
+
+def expanded_mtr_text(
+    mysql_test_root: Path,
+    text: str,
+    visited: frozenset[Path] = frozenset(),
+) -> str:
+    """Append literal MTR source/include contents for conservative SQL classification.
+
+    MTR remains responsible for executing the original files. Expansion is used only
+    to prevent a harmless-looking wrapper from hiding an excluded feature such as a
+    stored routine, replication setup, or file-system side effect in an ``.inc`` file.
+    Dynamic source paths are left to the baseline execution audit.
+    """
+    expanded = [text]
+    pending = [text]
+    seen = set(visited)
+    while pending:
+        current = pending.pop()
+        for match in SOURCE_DIRECTIVE.finditer(current):
+            source = match.group(1)
+            if "$" in source:
+                continue
+            source_file = (mysql_test_root / source).resolve()
+            if source_file in seen or not source_file.is_file():
+                continue
+            seen.add(source_file)
+            source_text = source_file.read_text(encoding="utf-8", errors="replace")
+            expanded.append(source_text)
+            pending.append(source_text)
+    return "\n".join(expanded)
 
 
 def classify_feature(sql: str) -> str:
@@ -146,12 +188,14 @@ def exclusion_reason(
     result_file: Path,
     test_file: Path,
     max_statements: int,
+    include_safe_harness: bool = False,
 ) -> str | None:
     if name.count("/") > 1:
         return "nested-suite-layout"
     if not TEST_NAME.fullmatch(name):
         return "invalid-manifest-name"
-    if "/" in name and name.split("/", 1)[0] not in COMPATIBILITY_SUITES:
+    suites = SAFE_HARNESS_SUITES if include_safe_harness else COMPATIBILITY_SUITES
+    if "/" in name and name.split("/", 1)[0] not in suites:
         return "outside-contract-suite"
     if not result_file.is_file():
         return "missing-result"
@@ -161,7 +205,10 @@ def exclusion_reason(
         return "over-statement-limit"
     if DELIMITER_DIRECTIVE.search(text):
         return "custom-delimiter"
-    if DEPENDENT_DIRECTIVE.search(text):
+    if include_safe_harness:
+        if UNSAFE_HARNESS_DIRECTIVE.search(text):
+            return "harness-side-effect"
+    elif DEPENDENT_DIRECTIVE.search(text):
         return "harness-dependency"
     if companion_file_exists(test_file):
         return "server-options"
@@ -175,7 +222,11 @@ def exclusion_reason(
 
 
 def discover_cases(
-    suite_root: Path, scope: str, max_statements: int, layout: str = "mysql"
+    suite_root: Path,
+    scope: str,
+    max_statements: int,
+    layout: str = "mysql",
+    include_safe_harness: bool = False,
 ) -> list[DiscoveryCase]:
     mysql_test_root = suite_root / "mysql-test"
     patterns = [mysql_test_root / ("main" if layout == "mariadb" else "t")]
@@ -191,16 +242,22 @@ def discover_cases(
                 continue
             result_file = result_file_for_test(mysql_test_root, test_file, layout)
             text = test_file.read_text(encoding="utf-8", errors="replace")
-            sql = without_mtr_comments(text)
-            statements = sql_statement_count(text)
+            analysis_text = (
+                expanded_mtr_text(mysql_test_root, text, frozenset({test_file.resolve()}))
+                if include_safe_harness
+                else text
+            )
+            sql = without_mtr_comments(analysis_text)
+            statements = sql_statement_count(analysis_text)
             reason = exclusion_reason(
                 name,
-                text,
+                analysis_text,
                 sql,
                 statements,
                 result_file,
                 test_file,
                 max_statements,
+                include_safe_harness,
             )
             cases.append(
                 DiscoveryCase(
@@ -291,7 +348,13 @@ def write_inventory(args: argparse.Namespace) -> int:
     suite_root = args.suite_root.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    cases = discover_cases(suite_root, args.scope, args.max_statements, args.mtr_layout)
+    cases = discover_cases(
+        suite_root,
+        args.scope,
+        args.max_statements,
+        args.mtr_layout,
+        args.include_safe_harness,
+    )
     candidates = [case for case in cases if case.exclusion is None]
     selected = rotating_selection(candidates, args.offset, args.limit)
     exclusions = Counter(case.exclusion for case in cases if case.exclusion)
@@ -308,6 +371,7 @@ def write_inventory(args: argparse.Namespace) -> int:
         "offset": args.offset,
         "limit": args.limit,
         "max_statements": args.max_statements,
+        "include_safe_harness": args.include_safe_harness,
         "counts": {
             "inspected": len(cases),
             "candidates": len(candidates),
@@ -363,6 +427,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--offset", type=int, default=0)
     result.add_argument("--limit", type=int, default=100)
     result.add_argument("--max-statements", type=int, default=200)
+    result.add_argument(
+        "--include-safe-harness",
+        action="store_true",
+        help=(
+            "follow literal source/include files and allow non-mutating MTR harness "
+            "directives while retaining contract and side-effect exclusions"
+        ),
+    )
     result.add_argument("--source-revision", default="mariadb-10.11.7-2ubuntu2")
     result.add_argument("--mtr-layout", choices=("mysql", "mariadb"), default="mysql")
     result.add_argument("--baseline-label", default="MariaDB")

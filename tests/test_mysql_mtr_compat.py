@@ -130,6 +130,57 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
             self.assertEqual(cases["plain"].statements, 1)
             self.assertEqual(cases["sourced"].exclusion, "harness-dependency")
 
+    def test_aggressive_discovery_follows_safe_sources_and_rejects_hidden_routines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "t"
+            result_dir = root / "mysql-test" / "r"
+            include_dir = root / "mysql-test" / "include"
+            test_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            include_dir.mkdir(parents=True)
+            (include_dir / "query.inc").write_text("SELECT 2;\n")
+            (include_dir / "routine.inc").write_text(
+                "CREATE PROCEDURE hidden_routine() SELECT 1;\n"
+            )
+            (test_dir / "sourced.test").write_text(
+                "-- source include/query.inc\nSELECT 1;\n"
+            )
+            (result_dir / "sourced.result").write_text("SELECT 1;\n1\n1\n")
+            (test_dir / "routine.test").write_text(
+                "source 'include/routine.inc';\nSELECT 1;\n"
+            )
+            (result_dir / "routine.result").write_text("SELECT 1;\n1\n1\n")
+
+            cases = {
+                case.name: case
+                for case in discover_cases(
+                    root, "main", 200, include_safe_harness=True
+                )
+            }
+            self.assertIsNone(cases["sourced"].exclusion)
+            self.assertEqual(cases["sourced"].statements, 2)
+            self.assertEqual(cases["routine"].exclusion, "outside-contract")
+
+    def test_aggressive_discovery_rejects_harness_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_dir = root / "mysql-test" / "t"
+            result_dir = root / "mysql-test" / "r"
+            test_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            (test_dir / "writes_file.test").write_text(
+                "-- write_file $MYSQL_TMP_DIR/data.txt\nvalue\nEOF\nSELECT 1;\n"
+            )
+            (result_dir / "writes_file.result").write_text("SELECT 1;\n1\n1\n")
+            cases = {
+                case.name: case
+                for case in discover_cases(
+                    root, "main", 200, include_safe_harness=True
+                )
+            }
+            self.assertEqual(cases["writes_file"].exclusion, "harness-side-effect")
+
     def test_mariadb_layout_uses_main_for_top_level_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

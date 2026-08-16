@@ -11,13 +11,13 @@
 # - Use `killme` only when the user explicitly asks you to end this container.
 # """
 #
-# Workspace path mirroring (opt-in):
+# Workspace path mirroring (enabled by default):
 # mirror_cwd = true
 # Mounts an absolute POSIX workspace path at that same path in the Linux
-# container instead of `/workspace`. Native Windows paths keep the configured
-# container mount target because they cannot be represented exactly.
+# container instead of `/workspace`. Windows drive paths use a best-effort
+# container path such as `/C/Users/example/project`.
 #
-# Preferred session template (saved by `hht workspace` after the first choice):
+# Preferred session template (saved by `hat ws` after the first choice):
 # template = "rust"
 # A `template` value in the matching `[[workspaces]]` entry in
 # harness-hat.toml overrides this value.
@@ -41,6 +41,7 @@
 #   argv = ["cargo", "test"] # run inside container with `hostdo run cargo test`
 #   cwd = "$WORKSPACE"         # execution cwd only, not part of approval matching
 #   timeout_secs = 60
+#   # Values above 300 seconds are capped at 300 seconds.
 #   # Optional context persisted for operator review; does not affect matching.
 #   reason = "run package index refresh after dependency update"
 #   approval_mode = "auto"
@@ -125,9 +126,29 @@ approval_mode = "auto"
 [[hostdo.commands]]
 argv = ["tools/prepush.sh"]
 cwd = "$WORKSPACE"
-timeout_secs = 1200
+timeout_secs = 300
 approval_mode = "auto"
 reason = "Run the repository's fail-closed pre-push suite against pinned MySQL 8.0.43 before the next CI push"
+
+[[hostdo.commands]]
+argv = [
+    "bash",
+    "tools/run_mariadb_mtr_baseline_docker.sh",
+]
+cwd = "$WORKSPACE"
+timeout_secs = 60
+approval_mode = "auto"
+reason = "Run the pinned MariaDB MTR compatibility baseline to verify recent performance changes did not regress MariaDB behavior"
+
+[[hostdo.commands]]
+argv = [
+    "/bin/bash",
+    "tools/run_mariadb_mtr_baseline_docker.sh",
+]
+cwd = "$WORKSPACE"
+timeout_secs = 60
+approval_mode = "auto"
+reason = "Run the pinned MariaDB MTR compatibility baseline to completion"
 
 [network]
 allowlist = [
@@ -152,4 +173,7 @@ allowlist = [
     "domain=archive.ubuntu.com",
     "domain=packages.ubuntu.com",
 ]
-denylist = ["domain=sdmntprsouthcentralus.oaiusercontent.com"]
+denylist = [
+    "domain=sdmntprsouthcentralus.oaiusercontent.com",
+    "domain=sdmntprnorthcentralus.oaiusercontent.com",
+]

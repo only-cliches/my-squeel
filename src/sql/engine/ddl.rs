@@ -186,6 +186,17 @@ impl Engine {
         schema.updated_at = Some(Utc::now());
         if self.mysql_strict() {
             self.validate_mysql_schema(&schema)?;
+            if let Some(rows) = self.rows.get(&table).map(|rows| rows.clone()) {
+                let previous_schema = self.schemas.get(&table).map(|schema| schema.clone());
+                self.schemas.insert(table.clone(), schema.clone());
+                let validation = self.validate_unique_constraints(&table, &rows);
+                if let Some(previous_schema) = previous_schema {
+                    self.schemas.insert(table.clone(), previous_schema);
+                } else {
+                    self.schemas.remove(&table);
+                }
+                validation?;
+            }
         }
         self.schemas.insert(table.clone(), schema);
         self.rows.entry(table.clone()).or_default();
@@ -362,8 +373,17 @@ impl Engine {
                 }
             }
         }
+        let mut warnings = Vec::new();
         for name in names {
             let table = object_name(&name)?;
+            if self.views.contains_key(&table) {
+                warnings.push(QueryWarning {
+                    level: "Note".to_string(),
+                    code: 1965,
+                    message: format!("'test.{table}' is a view"),
+                });
+                continue;
+            }
             if self.mysql_strict() && !self.schemas.contains_key(&table) {
                 if if_exists {
                     continue;
@@ -376,7 +396,10 @@ impl Engine {
             self.clear_auto_inc(&table);
             self.delete_table_from_storage(&table)?;
         }
-        Ok(QueryResult::default())
+        Ok(QueryResult {
+            warnings,
+            ..QueryResult::default()
+        })
     }
 
     pub(super) fn create_index_from_sql(&self, sql: &str) -> Result<QueryResult> {
@@ -482,16 +505,20 @@ impl Engine {
                     return Err(anyhow!("unknown column: {column}"));
                 }
             }
-            let parent = if foreign_key
+            let Some(parent) = (if foreign_key
                 .referenced_table
                 .eq_ignore_ascii_case(&schema.table)
             {
-                schema.clone()
+                Some(schema.clone())
             } else {
                 self.schemas
                     .get(&foreign_key.referenced_table)
                     .map(|schema| schema.clone())
-                    .ok_or_else(|| anyhow!("unknown table: {}", foreign_key.referenced_table))?
+            }) else {
+                // MariaDB accepts forward references while the referenced
+                // table is not yet present; enforce column checks once the
+                // parent schema exists.
+                continue;
             };
             for column in &foreign_key.referenced_columns {
                 if !parent

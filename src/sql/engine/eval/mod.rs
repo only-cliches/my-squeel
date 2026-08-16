@@ -2,6 +2,8 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use sqlparser::ast::Function;
+
 thread_local! {
     static EVAL_USER_VARIABLES: RefCell<std::collections::HashMap<String, Value>> =
         RefCell::new(std::collections::HashMap::new());
@@ -9,6 +11,10 @@ thread_local! {
 
 pub(super) fn clear_eval_user_variables() {
     EVAL_USER_VARIABLES.with(|variables| variables.borrow_mut().clear());
+}
+
+pub(super) fn take_eval_user_variables() -> HashMap<String, Value> {
+    EVAL_USER_VARIABLES.with(|variables| std::mem::take(&mut *variables.borrow_mut()))
 }
 
 fn eval_user_variable(name: &str) -> Option<Value> {
@@ -87,6 +93,15 @@ pub(super) fn public_json_value(value: &Value) -> Value {
     }
 }
 
+pub(super) fn contains_json_null_sentinel(value: &Value) -> bool {
+    match value {
+        Value::String(value) => is_json_null(value),
+        Value::Array(values) => values.iter().any(contains_json_null_sentinel),
+        Value::Object(values) => values.values().any(contains_json_null_sentinel),
+        _ => false,
+    }
+}
+
 pub(super) fn sql_default_value() -> Value {
     Value::String(SQL_DEFAULT_VALUE_SENTINEL.to_string())
 }
@@ -138,6 +153,15 @@ pub(super) fn add_qualified_columns(
     for (key, value) in data {
         target.insert(format!("{qualifier}.{key}"), value.clone());
     }
+}
+
+pub(super) fn add_qualified_columns_in_place(target: &mut Map<String, Value>, qualifier: &str) {
+    let qualified = target
+        .iter()
+        .filter(|(key, _)| !key.contains('.'))
+        .map(|(key, value)| (format!("{qualifier}.{key}"), value.clone()))
+        .collect::<Vec<_>>();
+    target.extend(qualified);
 }
 
 pub(super) fn table_factor_name_full(factor: &TableFactor) -> Result<String> {
@@ -353,9 +377,13 @@ pub(super) fn aggregate_select_result(
     if select.distinct.is_some() {
         deduplicate_rows(&mut output);
     }
-    apply_ordering_with(&mut output, order_by, order_hints, |expr, row| {
-        expr_resolved_value(expr, row)
-    })?;
+    apply_ordering_with(
+        &mut output,
+        order_by,
+        order_hints,
+        limit_offset_end(limit, offset)?,
+        expr_resolved_value,
+    )?;
     apply_limit_offset(&mut output, limit, offset)?;
 
     Ok(Some(QueryResult {
@@ -758,7 +786,7 @@ enum AggregateKind {
 #[derive(Debug, Clone)]
 struct AggregateCall {
     kind: AggregateKind,
-    args: Vec<String>,
+    args: Vec<CompiledScalarExpr>,
     distinct: bool,
     order_by: Vec<GroupConcatOrder>,
     separator: String,
@@ -766,8 +794,22 @@ struct AggregateCall {
 
 #[derive(Debug, Clone)]
 struct GroupConcatOrder {
-    expr: String,
+    expr: CompiledScalarExpr,
     asc: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledScalarExpr {
+    text: String,
+    parsed: Option<Expr>,
+}
+
+impl CompiledScalarExpr {
+    fn new(text: String) -> Self {
+        let text = text.trim().to_string();
+        let parsed = (text != "*").then(|| parse_scalar_expr(&text)).flatten();
+        Self { text, parsed }
+    }
 }
 
 fn aggregate_call(expr: &Expr) -> Option<AggregateCall> {
@@ -807,7 +849,7 @@ fn aggregate_call(expr: &Expr) -> Option<AggregateCall> {
 
     Some(AggregateCall {
         kind,
-        args,
+        args: args.into_iter().map(CompiledScalarExpr::new).collect(),
         distinct,
         order_by: Vec::new(),
         separator: ",".to_string(),
@@ -837,18 +879,18 @@ fn parse_group_concat_call(args: Vec<String>) -> AggregateCall {
                 if let Some(expr) = upper.strip_suffix(" DESC") {
                     let expr_len = expr.len();
                     Some(GroupConcatOrder {
-                        expr: trimmed[..expr_len].trim().to_string(),
+                        expr: CompiledScalarExpr::new(trimmed[..expr_len].trim().to_string()),
                         asc: false,
                     })
                 } else if let Some(expr) = upper.strip_suffix(" ASC") {
                     let expr_len = expr.len();
                     Some(GroupConcatOrder {
-                        expr: trimmed[..expr_len].trim().to_string(),
+                        expr: CompiledScalarExpr::new(trimmed[..expr_len].trim().to_string()),
                         asc: true,
                     })
                 } else if !trimmed.is_empty() {
                     Some(GroupConcatOrder {
-                        expr: trimmed.to_string(),
+                        expr: CompiledScalarExpr::new(trimmed.to_string()),
                         asc: true,
                     })
                 } else {
@@ -870,7 +912,7 @@ fn parse_group_concat_call(args: Vec<String>) -> AggregateCall {
 
     AggregateCall {
         kind: AggregateKind::GroupConcat,
-        args,
+        args: args.into_iter().map(CompiledScalarExpr::new).collect(),
         distinct,
         order_by,
         separator,
@@ -883,22 +925,21 @@ fn eval_aggregate_call(
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
 ) -> Result<Value> {
-    let mut values = Vec::new();
-    let mut ordered_group = group.iter().collect::<Vec<_>>();
     if call.kind == AggregateKind::GroupConcat && !call.order_by.is_empty() {
+        let mut ordered_group = group.iter().collect::<Vec<_>>();
         ordered_group.sort_by(|left, right| {
             for order in &call.order_by {
                 let left_value =
-                    eval_scalar_text(&order.expr, left, last_insert_id).unwrap_or(Value::Null);
+                    eval_compiled_scalar(&order.expr, left, last_insert_id).unwrap_or(Value::Null);
                 let right_value =
-                    eval_scalar_text(&order.expr, right, last_insert_id).unwrap_or(Value::Null);
+                    eval_compiled_scalar(&order.expr, right, last_insert_id).unwrap_or(Value::Null);
                 let ordering = compare_order_values(
                     &left_value,
                     &right_value,
-                    order_hints.get(&order.expr).or_else(|| {
+                    order_hints.get(&order.expr.text).or_else(|| {
                         order_hints
                             .iter()
-                            .find(|(expr, _)| expr.eq_ignore_ascii_case(&order.expr))
+                            .find(|(expr, _)| expr.eq_ignore_ascii_case(&order.expr.text))
                             .map(|(_, hint)| hint)
                     }),
                 );
@@ -912,9 +953,20 @@ fn eval_aggregate_call(
             }
             Ordering::Equal
         });
+        return eval_aggregate_call_rows(call, ordered_group.into_iter(), last_insert_id);
     }
 
-    for row in ordered_group {
+    eval_aggregate_call_rows(call, group.iter(), last_insert_id)
+}
+
+fn eval_aggregate_call_rows<'a>(
+    call: &AggregateCall,
+    rows: impl IntoIterator<Item = &'a Map<String, Value>>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    let rows = rows.into_iter();
+    let mut values = Vec::with_capacity(rows.size_hint().0);
+    for row in rows {
         if matches!(
             call.kind,
             AggregateKind::JsonArrayAgg | AggregateKind::JsonObjectAgg
@@ -924,7 +976,7 @@ fn eval_aggregate_call(
                     let value = call
                         .args
                         .first()
-                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     values.push(if value == Value::Null {
@@ -937,13 +989,13 @@ fn eval_aggregate_call(
                     let key = call
                         .args
                         .first()
-                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     let value = call
                         .args
                         .get(1)
-                        .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     if key != Value::Null {
@@ -964,7 +1016,7 @@ fn eval_aggregate_call(
         if call.kind == AggregateKind::GroupConcat {
             let mut parts = Vec::new();
             for arg in &call.args {
-                let value = eval_scalar_text(arg, row, last_insert_id)?;
+                let value = eval_compiled_scalar(arg, row, last_insert_id)?;
                 if value == Value::Null {
                     parts.clear();
                     break;
@@ -979,12 +1031,12 @@ fn eval_aggregate_call(
 
         let value = match call.args.as_slice() {
             [] => Value::Number(Number::from(1_u64)),
-            [arg] if arg == "*" => Value::Number(Number::from(1_u64)),
-            [arg] => eval_scalar_text(arg, row, last_insert_id)?,
+            [arg] if arg.text == "*" => Value::Number(Number::from(1_u64)),
+            [arg] => eval_compiled_scalar(arg, row, last_insert_id)?,
             args => {
                 let tuple = args
                     .iter()
-                    .map(|arg| eval_scalar_text(arg, row, last_insert_id))
+                    .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
                     .collect::<Result<Vec<_>>>()?;
                 if tuple.iter().any(|value| value == &Value::Null) {
                     Value::Null
@@ -1172,6 +1224,7 @@ pub(super) fn apply_ordering_with<F>(
     rows: &mut Vec<Map<String, Value>>,
     order_by: &[OrderByExpr],
     order_hints: &[Option<ColumnHint>],
+    max_rows: Option<usize>,
     resolve: F,
 ) -> Result<()>
 where
@@ -1184,27 +1237,49 @@ where
         return Ok(());
     }
 
+    if max_rows == Some(0) {
+        rows.clear();
+        return Ok(());
+    }
+
     // Resolve each ORDER BY expression once per row. The previous comparator
     // evaluated expressions for every comparison, which made sorting
     // O(n log n) expression evaluations and repeatedly allocated collation
     // keys for text values.
     let mut keyed = rows
         .drain(..)
-        .map(|row| {
+        .enumerate()
+        .map(|(position, row)| {
             let keys = order_by
                 .iter()
-                .map(|item| resolve(&item.expr, &row).unwrap_or(Value::Null))
+                .enumerate()
+                .map(|(index, item)| {
+                    let value = resolve(&item.expr, &row).unwrap_or(Value::Null);
+                    CachedSortValue::new(value, order_hints.get(index).and_then(Option::as_ref))
+                })
                 .collect::<Vec<_>>();
-            (row, keys)
+            (position, row, keys)
         })
         .collect::<Vec<_>>();
 
-    keyed.sort_by(|(_, left_keys), (_, right_keys)| {
+    let compare = |(left_position, _, left_keys): &(
+        usize,
+        Map<String, Value>,
+        Vec<CachedSortValue>,
+    ),
+                   (right_position, _, right_keys): &(
+        usize,
+        Map<String, Value>,
+        Vec<CachedSortValue>,
+    )| {
         for (index, item) in order_by.iter().enumerate() {
             let left = &left_keys[index];
             let right = &right_keys[index];
-            let ordering =
-                compare_order_values(left, right, order_hints.get(index).and_then(Option::as_ref));
+            let ordering = compare_cached_sort_values(
+                left,
+                right,
+                order_hints.get(index).and_then(Option::as_ref),
+            );
             if ordering != Ordering::Equal {
                 return if item.asc.unwrap_or(true) {
                     ordering
@@ -1213,10 +1288,19 @@ where
                 };
             }
         }
-        Ordering::Equal
-    });
+        // `sort_by` was stable, so preserve input order for equal SQL keys.
+        // Making that tie-break explicit also gives the partial-selection path
+        // a total ordering and keeps its output identical at the LIMIT boundary.
+        left_position.cmp(right_position)
+    };
 
-    *rows = keyed.into_iter().map(|(row, _)| row).collect();
+    if let Some(max_rows) = max_rows.filter(|max_rows| *max_rows < keyed.len()) {
+        keyed.select_nth_unstable_by(max_rows, &compare);
+        keyed.truncate(max_rows);
+    }
+    keyed.sort_unstable_by(compare);
+
+    *rows = keyed.into_iter().map(|(_, row, _)| row).collect();
     Ok(())
 }
 
@@ -1242,9 +1326,23 @@ pub(super) fn apply_limit_offset(
     if start >= end {
         rows.clear();
     } else {
-        *rows = rows.drain(start..end).collect();
+        rows.truncate(end);
+        if start > 0 {
+            rows.drain(..start);
+        }
     }
     Ok(())
+}
+
+pub(super) fn limit_offset_end(
+    limit: Option<&Expr>,
+    offset: Option<&Offset>,
+) -> Result<Option<usize>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let start = offset.map(offset_to_usize).transpose()?.unwrap_or(0);
+    Ok(Some(start.saturating_add(expr_to_usize(limit)?)))
 }
 
 pub(super) fn offset_to_usize(offset: &Offset) -> Result<usize> {
@@ -1272,9 +1370,11 @@ pub(super) fn expr_to_usize(expr: &Expr) -> Result<usize> {
             }
             Ok(value as usize)
         }
-        Value::String(s) => s
-            .parse::<usize>()
-            .map_err(|_| anyhow!("string expression is not a valid usize")),
+        Value::String(s) => match s.parse::<usize>() {
+            Ok(value) => Ok(value),
+            Err(_) if !s.trim_start().starts_with('-') => Ok(0),
+            Err(_) => Err(anyhow!("string expression is not a valid usize")),
+        },
         _ => Err(anyhow!("expected numeric expression")),
     }
 }
@@ -1368,6 +1468,58 @@ pub(super) fn compare_order_values(
     compare_mysql_text_values(left, right)
 }
 
+struct CachedSortValue {
+    value: Value,
+    text_key: Option<String>,
+    decimal: Option<DecimalParts>,
+}
+
+impl CachedSortValue {
+    fn new(value: Value, hint: Option<&ColumnHint>) -> Self {
+        let declared = hint
+            .and_then(|hint| hint.sql_type.as_deref())
+            .map(|value| value.trim().to_ascii_uppercase());
+        let is_decimal = declared
+            .as_deref()
+            .is_some_and(|value| value.starts_with("DECIMAL") || value.starts_with("NUMERIC"));
+        let is_binary = declared.as_deref().is_some_and(|value| {
+            value.starts_with("BINARY")
+                || value.starts_with("VARBINARY")
+                || value.ends_with("BLOB")
+                || value == "BLOB"
+        });
+        let is_text = declared.as_deref().is_none_or(|value| {
+            value.starts_with("CHAR") || value.starts_with("VARCHAR") || value.starts_with("TEXT")
+        });
+        let text_key = if is_text && !is_binary && !is_decimal && matches!(value, Value::String(_))
+        {
+            Some(mysql_text_sort_key(&value))
+        } else {
+            None
+        };
+        let decimal = is_decimal.then(|| decimal_parts(&value)).flatten();
+        Self {
+            value,
+            text_key,
+            decimal,
+        }
+    }
+}
+
+fn compare_cached_sort_values(
+    left: &CachedSortValue,
+    right: &CachedSortValue,
+    hint: Option<&ColumnHint>,
+) -> Ordering {
+    if let (Some(left), Some(right)) = (&left.decimal, &right.decimal) {
+        return compare_decimal_parts(left, right);
+    }
+    if let (Some(left), Some(right)) = (&left.text_key, &right.text_key) {
+        return left.cmp(right);
+    }
+    compare_order_values(&left.value, &right.value, hint)
+}
+
 fn compare_integer_values(left: &Value, right: &Value) -> Ordering {
     match (json_to_i128_exact(left), json_to_i128_exact(right)) {
         (Some(left), Some(right)) => left.cmp(&right),
@@ -1430,44 +1582,46 @@ fn compare_decimal_values(left: &Value, right: &Value) -> Ordering {
     let left_parts = decimal_parts(left);
     let right_parts = decimal_parts(right);
     match (left_parts, right_parts) {
-        (Some(left), Some(right)) => {
-            let sign_order = left.sign.cmp(&right.sign);
-            if sign_order != Ordering::Equal {
-                return sign_order;
-            }
-            let magnitude = left
-                .integer
-                .len()
-                .cmp(&right.integer.len())
-                .then_with(|| left.integer.cmp(&right.integer))
-                .then_with(|| {
-                    let length = left.fraction.len().max(right.fraction.len());
-                    (0..length)
-                        .map(|index| {
-                            left.fraction
+        (Some(left), Some(right)) => compare_decimal_parts(&left, &right),
+        _ => compare_f64_values(left, right),
+    }
+}
+
+fn compare_decimal_parts(left: &DecimalParts, right: &DecimalParts) -> Ordering {
+    let sign_order = left.sign.cmp(&right.sign);
+    if sign_order != Ordering::Equal {
+        return sign_order;
+    }
+    let magnitude = left
+        .integer
+        .len()
+        .cmp(&right.integer.len())
+        .then_with(|| left.integer.cmp(&right.integer))
+        .then_with(|| {
+            let length = left.fraction.len().max(right.fraction.len());
+            (0..length)
+                .map(|index| {
+                    left.fraction
+                        .as_bytes()
+                        .get(index)
+                        .copied()
+                        .unwrap_or(b'0')
+                        .cmp(
+                            &right
+                                .fraction
                                 .as_bytes()
                                 .get(index)
                                 .copied()
-                                .unwrap_or(b'0')
-                                .cmp(
-                                    &right
-                                        .fraction
-                                        .as_bytes()
-                                        .get(index)
-                                        .copied()
-                                        .unwrap_or(b'0'),
-                                )
-                        })
-                        .find(|ordering| *ordering != Ordering::Equal)
-                        .unwrap_or(Ordering::Equal)
-                });
-            if left.is_negative() {
-                magnitude.reverse()
-            } else {
-                magnitude
-            }
-        }
-        _ => compare_f64_values(left, right),
+                                .unwrap_or(b'0'),
+                        )
+                })
+                .find(|ordering| *ordering != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        });
+    if left.is_negative() {
+        magnitude.reverse()
+    } else {
+        magnitude
     }
 }
 
@@ -1602,10 +1756,7 @@ pub(super) fn mysql_eq(left: &Value, right: &Value) -> bool {
     mysql_cmp_non_null(left, right) == Ordering::Equal
 }
 
-fn binary_display_value(value: &Value) -> Option<String> {
-    let Value::String(value) = value else {
-        return None;
-    };
+fn binary_display_value(value: &str) -> Option<String> {
     let hex = value.strip_prefix(MYSQL_BINARY_SENTINEL)?;
     let bytes = hex
         .as_bytes()
@@ -1617,23 +1768,21 @@ fn binary_display_value(value: &Value) -> Option<String> {
         .map(|value| value as u8)
         .collect::<Vec<_>>();
     Some(
-        String::from_utf8(bytes.clone())
-            .unwrap_or_else(|_| bytes.into_iter().map(char::from).collect()),
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| error.into_bytes().into_iter().map(char::from).collect()),
     )
 }
 
 fn mysql_cmp_non_null(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
-        (Value::String(left), Value::String(right)) => {
-            binary_display_value(&Value::String(left.clone()))
-                .unwrap_or_else(|| left.clone())
-                .to_lowercase()
-                .cmp(
-                    &binary_display_value(&Value::String(right.clone()))
-                        .unwrap_or_else(|| right.clone())
-                        .to_lowercase(),
-                )
-        }
+        (Value::String(left), Value::String(right)) => binary_display_value(left)
+            .unwrap_or_else(|| left.clone())
+            .to_lowercase()
+            .cmp(
+                &binary_display_value(right)
+                    .unwrap_or_else(|| right.clone())
+                    .to_lowercase(),
+            ),
         (Value::Number(_), Value::Number(_))
         | (Value::Number(_), Value::String(_))
         | (Value::String(_), Value::Number(_))
@@ -2316,6 +2465,11 @@ pub(super) fn eval_expr(
             {
                 return Ok(value.clone());
             }
+            if let Some(result) =
+                eval_function_expr_fast(func, |expr| eval_expr(expr, data, last_insert_id))
+            {
+                return result;
+            }
             eval_function_text(&func.to_string(), data, last_insert_id)
         }
         Expr::Cast {
@@ -2559,6 +2713,188 @@ pub(super) fn numeric_binary(
     )))
 }
 
+#[derive(Clone, Copy)]
+struct FunctionExprArgs<'a>(&'a [FunctionArg]);
+
+impl<'a> FunctionExprArgs<'a> {
+    fn expr(argument: &'a FunctionArg) -> Option<&'a Expr> {
+        let argument = match argument {
+            FunctionArg::Named { arg, .. }
+            | FunctionArg::ExprNamed { arg, .. }
+            | FunctionArg::Unnamed(arg) => arg,
+        };
+        match argument {
+            FunctionArgExpr::Expr(expr) => Some(expr),
+            FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => None,
+        }
+    }
+
+    fn iter(self) -> impl Iterator<Item = &'a Expr> {
+        self.0.iter().filter_map(Self::expr)
+    }
+
+    fn first(self) -> Option<&'a Expr> {
+        self.iter().next()
+    }
+
+    fn get(self, index: usize) -> Option<&'a Expr> {
+        self.iter().nth(index)
+    }
+}
+
+pub(super) fn eval_function_expr_fast<F>(
+    function: &Function,
+    mut eval_arg: F,
+) -> Option<Result<Value>>
+where
+    F: FnMut(&Expr) -> Result<Value>,
+{
+    let name = function.name.0.last()?.value.to_ascii_uppercase();
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let args = FunctionExprArgs(&arguments.args);
+
+    match name.as_str() {
+        "CONCAT" => Some((|| {
+            let mut out = String::new();
+            for arg in args.iter() {
+                let value = eval_arg(arg)?;
+                if value == Value::Null {
+                    return Ok(Value::Null);
+                }
+                out.push_str(&json_scalar_to_string(&value));
+            }
+            Ok(Value::String(out))
+        })()),
+        "CONCAT_WS" => Some((|| {
+            let Some(separator) = args.first() else {
+                return Ok(Value::Null);
+            };
+            let separator = json_scalar_to_string(&eval_arg(separator)?);
+            let mut out = String::new();
+            for arg in args.iter().skip(1) {
+                let value = eval_arg(arg)?;
+                if value != Value::Null {
+                    if !out.is_empty() {
+                        out.push_str(&separator);
+                    }
+                    out.push_str(&json_scalar_to_string(&value));
+                }
+            }
+            Ok(Value::String(out))
+        })()),
+        "COALESCE" => Some((|| {
+            for arg in args.iter() {
+                let value = eval_arg(arg)?;
+                if value != Value::Null {
+                    return Ok(value);
+                }
+            }
+            Ok(Value::Null)
+        })()),
+        "IFNULL" => Some((|| {
+            let first = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if first != Value::Null {
+                Ok(first)
+            } else {
+                args.get(1)
+                    .map(|arg| eval_arg(arg))
+                    .transpose()
+                    .map(|value| value.unwrap_or(Value::Null))
+            }
+        })()),
+        "IF" => Some((|| {
+            let condition = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let branch = if value_truthy(&condition) {
+                args.get(1)
+            } else {
+                args.get(2)
+            };
+            branch
+                .map(|arg| eval_arg(arg))
+                .transpose()
+                .map(|value| value.unwrap_or(Value::Null))
+        })()),
+        "NULLIF" => Some((|| {
+            let left = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let right = args
+                .get(1)
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            Ok(if mysql_eq(&left, &right) {
+                Value::Null
+            } else {
+                left
+            })
+        })()),
+        "LOWER" | "LCASE" => Some((|| {
+            let value = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            Ok(if value == Value::Null {
+                Value::Null
+            } else {
+                Value::String(json_scalar_to_string(&value).to_lowercase())
+            })
+        })()),
+        "UPPER" | "UCASE" => Some((|| {
+            let value = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            Ok(if value == Value::Null {
+                Value::Null
+            } else {
+                Value::String(json_scalar_to_string(&value).to_uppercase())
+            })
+        })()),
+        "LENGTH" | "OCTET_LENGTH" => Some((|| {
+            let value = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            Ok(if value == Value::Null {
+                Value::Null
+            } else {
+                Value::Number(Number::from(json_scalar_to_string(&value).len() as u64))
+            })
+        })()),
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => Some((|| {
+            let value = args
+                .first()
+                .map(|arg| eval_arg(arg))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            Ok(if value == Value::Null {
+                Value::Null
+            } else {
+                Value::Number(Number::from(
+                    json_scalar_to_string(&value).chars().count() as u64
+                ))
+            })
+        })()),
+        _ => None,
+    }
+}
+
 pub(super) fn eval_function_text(
     text: &str,
     data: &Map<String, Value>,
@@ -2592,15 +2928,32 @@ pub(super) fn eval_function_text(
                 Ok(Value::Number(Number::from(last_insert_id)))
             }
         }
+        "CONNECTION_ID" => Ok(Value::Number(Number::from(1_u64))),
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_TIMESTAMP" => {
+            if args
+                .first()
+                .and_then(|arg| arg.trim().parse::<u8>().ok())
+                .is_some_and(|precision| precision > 6)
+            {
+                return Err(anyhow!("too big precision"));
+            }
             Ok(Value::String(Utc::now().naive_utc().to_string()))
         }
         "CURRENT_DATE" | "CURDATE" | "UTC_DATE" => {
             Ok(Value::String(Utc::now().date_naive().to_string()))
         }
-        "CURRENT_TIME" | "CURTIME" | "UTC_TIME" => Ok(Value::String(format_mysql_naive_time(
-            Utc::now().naive_utc().time(),
-        ))),
+        "CURRENT_TIME" | "CURTIME" | "UTC_TIME" => {
+            if args
+                .first()
+                .and_then(|arg| arg.trim().parse::<u8>().ok())
+                .is_some_and(|precision| precision > 6)
+            {
+                return Err(anyhow!("too big precision"));
+            }
+            Ok(Value::String(format_mysql_naive_time(
+                Utc::now().naive_utc().time(),
+            )))
+        }
         "DATE_ADD" | "ADDDATE" => {
             eval_date_add_sub(args.first(), args.get(1), data, last_insert_id, 1)
         }
@@ -2706,11 +3059,48 @@ pub(super) fn eval_function_text(
         "ADDTIME" => eval_add_sub_time(args.first(), args.get(1), data, last_insert_id, 1),
         "SUBTIME" => eval_add_sub_time(args.first(), args.get(1), data, last_insert_id, -1),
         "TIMEDIFF" => eval_time_diff(args.first(), args.get(1), data, last_insert_id),
+        "SEC_TO_TIME" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                let micros = (json_to_f64_lossy(&value)? * 1_000_000.0).round();
+                Ok(Value::String(format_mysql_duration(chrono::Duration::microseconds(
+                    micros.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+                ))))
+            }
+        }
+        "TIME_TO_SEC" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                let Some(duration) = parse_mysql_time_duration(&value) else {
+                    return Ok(Value::Null);
+                };
+                Ok(number_from_f64(
+                    duration.num_microseconds().unwrap_or_default() as f64 / 1_000_000.0,
+                ))
+            }
+        }
         "UUID" => Ok(Value::String(uuid::Uuid::new_v4().to_string())),
         "RAND" => Ok(number_from_f64(0.5)),
         "DATABASE" | "SCHEMA" => Ok(Value::String("app".to_string())),
         "VERSION" => Ok(Value::String("8.0.0-my-sqweel".to_string())),
         "USER" | "CURRENT_USER" => Ok(Value::String("root@localhost".to_string())),
+        "VALUES" => args
+            .first()
+            .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+            .transpose()
+            .map(|value| value.unwrap_or(Value::Null)),
         "VALUE" => Ok(Value::Null),
         "EXTRACTVALUE" => Ok(Value::Null),
         "COALESCE" => {
@@ -2875,6 +3265,43 @@ pub(super) fn eval_function_text(
             }
         }
         "ASCII" | "ORD" => eval_ascii_ord(args.first(), data, last_insert_id),
+        "STRCMP" => {
+            let left = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            let right = args
+                .get(1)
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                let left = json_scalar_to_string(&left);
+                let right = json_scalar_to_string(&right);
+                let ordering = left.trim_end().cmp(right.trim_end());
+                Ok(Value::Number(Number::from(match ordering {
+                    std::cmp::Ordering::Less => -1_i64,
+                    std::cmp::Ordering::Equal => 0_i64,
+                    std::cmp::Ordering::Greater => 1_i64,
+                })))
+            }
+        }
+        "BIT_COUNT" => {
+            let value = args
+                .first()
+                .map(|arg| eval_scalar_text(arg, data, last_insert_id))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            if value == Value::Null {
+                Ok(Value::Null)
+            } else {
+                let bits = json_to_f64_lossy(&value)? as i64;
+                Ok(Value::Number(Number::from(bits.count_ones())))
+            }
+        }
         "SOUNDEX" => eval_unary_string(args.first(), data, last_insert_id, |value| {
             mysql_soundex(&value)
         }),
@@ -3242,6 +3669,20 @@ pub(super) fn eval_scalar_text(
         return eval_expr(&expr, data, last_insert_id);
     }
     Ok(data.get(trimmed).cloned().unwrap_or(Value::Null))
+}
+
+fn eval_compiled_scalar(
+    expression: &CompiledScalarExpr,
+    data: &Map<String, Value>,
+    last_insert_id: u64,
+) -> Result<Value> {
+    if expression.text == "*" {
+        return Ok(Value::Number(Number::from(1_u64)));
+    }
+    if let Some(expr) = &expression.parsed {
+        return eval_expr(expr, data, last_insert_id);
+    }
+    Ok(data.get(&expression.text).cloned().unwrap_or(Value::Null))
 }
 
 fn eval_get_format_arg(

@@ -14,11 +14,19 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
-ARG MARIADB_PACKAGE_VERSION=1:10.11.7-2ubuntu2
+# Use the MariaDB revision supplied by the base image's Ubuntu repositories.
+# The pinned 10.11.7 compatibility corpus is prepared separately by
+# tools/prepare_mariadb_mtr.sh. An exact revision can still be requested when
+# the configured repositories (for example, an APT snapshot) provide it.
+ARG MARIADB_PACKAGE_VERSION
 
 RUN set -eu; \
     apt-get update -o APT::Update::Error-Mode=any; \
-    apt-get install -y --no-install-recommends \
+    mariadb_version_suffix=""; \
+    if [ -n "${MARIADB_PACKAGE_VERSION:-}" ]; then \
+      mariadb_version_suffix="=${MARIADB_PACKAGE_VERSION}"; \
+    fi; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential \
       make \
       cmake \
@@ -39,13 +47,17 @@ RUN set -eu; \
       liburing2 \
       perl \
       zlib1g \
-      mariadb-client="${MARIADB_PACKAGE_VERSION}" \
-      mariadb-server="${MARIADB_PACKAGE_VERSION}" \
-      mariadb-test="${MARIADB_PACKAGE_VERSION}" \
-      mariadb-test-data="${MARIADB_PACKAGE_VERSION}" \
+      "mariadb-client${mariadb_version_suffix}" \
+      "mariadb-server${mariadb_version_suffix}" \
+      "mariadb-test${mariadb_version_suffix}" \
+      "mariadb-test-data${mariadb_version_suffix}" \
       jq \
       shellcheck \
       direnv; \
+    if [ ! -e /usr/share/mysql/mysql-test ] && [ -d /usr/share/mariadb/mariadb-test ]; then \
+      mkdir -p /usr/share/mysql; \
+      ln -s /usr/share/mariadb/mariadb-test /usr/share/mysql/mysql-test; \
+    fi; \
     test -x /usr/bin/mysqltest; \
     test -x /usr/share/mysql/mysql-test/mariadb-test-run.pl; \
     test -x /usr/share/mysql/mysql-test/lib/My/SafeProcess/my_safe_process; \

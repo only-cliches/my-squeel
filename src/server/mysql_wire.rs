@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
@@ -186,24 +187,24 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
             let query = self.qualify_create_table(query);
-            self.engine.execute_sql_for_wire(&query)
+            self.engine.execute_sql_for_wire(query.as_ref())
         };
         write_query_items(
             out,
             results,
             &mut self.last_insert_id,
             &mut self.warnings,
-            Some(query),
+            Some(query.as_ref()),
         )
     }
 }
 
 impl Backend {
-    fn qualify_create_table(&self, query: &str) -> String {
+    fn qualify_create_table<'a>(&self, query: &'a str) -> Cow<'a, str> {
         if self.current_db.eq_ignore_ascii_case("test")
             || self.current_db.eq_ignore_ascii_case("app")
         {
-            return query.to_string();
+            return Cow::Borrowed(query);
         }
         let trimmed = query.trim_start();
         let upper = trimmed.to_ascii_uppercase();
@@ -211,7 +212,7 @@ impl Backend {
             .strip_prefix("CREATE TABLE")
             .map(|_| "CREATE TABLE".len())
         else {
-            return query.to_string();
+            return Cow::Borrowed(query);
         };
         while trimmed[offset..]
             .chars()
@@ -236,14 +237,14 @@ impl Backend {
             .unwrap_or(trimmed.len());
         let name = &trimmed[offset..name_end];
         if name.is_empty() || name.contains('.') {
-            return query.to_string();
+            return Cow::Borrowed(query);
         }
         let qualified = format!("`{}`.`{}`", self.current_db, name.trim_matches('`'));
         let replacement_start = query.len() - trimmed.len() + offset;
         let replacement_end = query.len() - trimmed.len() + name_end;
         let mut rewritten = query.to_string();
         rewritten.replace_range(replacement_start..replacement_end, &qualified);
-        rewritten
+        Cow::Owned(rewritten)
     }
 
     fn execute_session_query(&mut self, query: &str) -> Option<QueryResult> {
@@ -449,7 +450,17 @@ fn write_query_items<W: io::Read + io::Write>(
         Err(err) => {
             tracing::debug!(error = %err, "query execution error");
             let message = err.to_string();
-            results.error(mysql_error_kind(&message), message.as_bytes())
+            let kind = mysql_error_kind(&message);
+            let message = if kind == ErrorKind::ER_WRONG_ARGUMENTS
+                && (message.contains("not a valid usize")
+                    || message.contains("not a valid unsigned")
+                    || message.contains("not valid usize"))
+            {
+                "Incorrect arguments to EXECUTE"
+            } else {
+                message.as_str()
+            };
+            results.error(kind, message.as_bytes())
         }
     }
 }
@@ -558,6 +569,13 @@ fn mysql_error_kind(message: &str) -> ErrorKind {
         ErrorKind::ER_WRONG_USAGE
     } else if message.contains("too few arguments") {
         ErrorKind::ER_SP_WRONG_NO_OF_ARGS
+    } else if message.contains("too big precision") {
+        ErrorKind::ER_TOO_BIG_PRECISION
+    } else if message.contains("not a valid usize")
+        || message.contains("not a valid unsigned")
+        || message.contains("not valid usize")
+    {
+        ErrorKind::ER_WRONG_ARGUMENTS
     } else if message.contains("data too long") {
         ErrorKind::ER_DATA_TOO_LONG
     } else if message.contains("out of range") {
@@ -873,8 +891,8 @@ fn write_row<W: io::Read + io::Write>(
 ) -> io::Result<()> {
     for (index, key) in columns.iter().enumerate() {
         let definition = &definitions[index];
-        let value = row.get(key).cloned().unwrap_or(Value::Null);
-        if let Value::String(value) = &value
+        let value = row.get(key).unwrap_or(&Value::Null);
+        if let Value::String(value) = value
             && let Some(hex) = value.strip_prefix(crate::sql::engine::MYSQL_BINARY_SENTINEL)
         {
             let bytes = hex
@@ -886,8 +904,8 @@ fn write_row<W: io::Read + io::Write>(
                 })
                 .map(|value| value as u8)
                 .collect::<Vec<_>>();
-            let display = String::from_utf8(bytes.clone())
-                .unwrap_or_else(|_| bytes.into_iter().map(char::from).collect());
+            let display = String::from_utf8(bytes)
+                .unwrap_or_else(|error| error.into_bytes().into_iter().map(char::from).collect());
             rw.write_col(display)?;
             continue;
         }
@@ -905,10 +923,10 @@ fn write_row<W: io::Read + io::Write>(
             }
             Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_NEWDECIMAL => {
                 let scale = decimal_columns.get(key).copied().unwrap_or(0);
-                rw.write_col(format_decimal_text(&value, scale))?;
+                rw.write_col(format_decimal_text(value, scale))?;
             }
             Value::Bool(value) => {
-                write_numeric_column(rw, i64::from(value), definition)?;
+                write_numeric_column(rw, i64::from(*value), definition)?;
             }
             Value::Number(number) => {
                 if is_integral_column(definition.coltype) {
@@ -943,7 +961,7 @@ fn write_row<W: io::Read + io::Write>(
             }
             Value::String(value) if definition.coltype == ColumnType::MYSQL_TYPE_JSON => {
                 if definition.table.is_empty() {
-                    match serde_json::from_str::<serde_json::Value>(&value) {
+                    match serde_json::from_str::<serde_json::Value>(value) {
                         Ok(value) => {
                             rw.write_col(crate::sql::engine::json_wire_text(&value).map_err(
                                 |error| io::Error::new(io::ErrorKind::InvalidData, error),
@@ -966,7 +984,7 @@ fn write_row<W: io::Read + io::Write>(
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 rw.write_col(text)?;
             }
-            Value::String(value) => write_string_column(rw, &value, definition)?,
+            Value::String(value) => write_string_column(rw, value, definition)?,
             other => rw.write_col(other.to_string())?,
         }
     }
@@ -1432,14 +1450,6 @@ fn parameter_columns(count: usize) -> Vec<Column> {
 
 fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> Vec<Column> {
     let decimal_columns = mysql_decimal_columns(query);
-    let Ok(statements) = crate::sql::parse(query) else {
-        return Vec::new();
-    };
-
-    let Some(sqlparser::ast::Statement::Query(parsed_query)) = statements.into_iter().next() else {
-        return Vec::new();
-    };
-
     // Zero is accepted by LIMIT/OFFSET placeholders and generally produces an
     // empty SELECT while still allowing the engine to derive schema metadata.
     if let Ok(mut results) = engine.execute_sql_with_params_without_events(
@@ -1474,6 +1484,14 @@ fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> 
             })
             .collect();
     }
+
+    let Ok(statements) = crate::sql::parse(query) else {
+        return Vec::new();
+    };
+
+    let Some(sqlparser::ast::Statement::Query(parsed_query)) = statements.into_iter().next() else {
+        return Vec::new();
+    };
 
     let sqlparser::ast::SetExpr::Select(select) = *parsed_query.body else {
         return Vec::new();
@@ -1545,6 +1563,11 @@ fn mysql_decimal_scale(expr: &sqlparser::ast::Expr) -> Option<usize> {
         return None;
     };
     let name = function.name.0.last()?.value.to_ascii_uppercase();
+    if name == "UNIX_TIMESTAMP"
+        && function.to_string().to_ascii_uppercase().contains("CONCAT(")
+    {
+        return Some(6);
+    }
     if name == "AVG" {
         return Some(4);
     }

@@ -23,6 +23,42 @@ pub trait RedisStore: Send + Sync {
     fn smembers(&self, key: &str) -> Result<BTreeSet<String>>;
     fn del(&self, key: &str) -> Result<()>;
     fn keys(&self, pattern: &str) -> Result<Vec<String>>;
+
+    fn write_batch(&self, writes: Vec<StorageWrite>) -> Result<()> {
+        for write in writes {
+            match write {
+                StorageWrite::HSet { key, field, value } => self.hset(&key, &field, &value)?,
+                StorageWrite::HDel { key, field } => self.hdel(&key, &field)?,
+                StorageWrite::SAdd { key, member } => self.sadd(&key, &member)?,
+                StorageWrite::SRem { key, member } => self.srem(&key, &member)?,
+                StorageWrite::Del { key } => self.del(&key)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+pub enum StorageWrite {
+    HSet {
+        key: String,
+        field: String,
+        value: String,
+    },
+    HDel {
+        key: String,
+        field: String,
+    },
+    SAdd {
+        key: String,
+        member: String,
+    },
+    SRem {
+        key: String,
+        member: String,
+    },
+    Del {
+        key: String,
+    },
 }
 
 pub struct LuxRedisStore {
@@ -161,6 +197,40 @@ impl RedisStore for LuxRedisStore {
         let client = self.client.clone();
         let pattern = pattern.to_string();
         self.run_lux(async move { client.keys(&pattern).await })
+    }
+
+    fn write_batch(&self, writes: Vec<StorageWrite>) -> Result<()> {
+        let commands = writes
+            .into_iter()
+            .map(|write| match write {
+                StorageWrite::HSet { key, field, value } => {
+                    vec![
+                        b"HSET".to_vec(),
+                        key.into_bytes(),
+                        field.into_bytes(),
+                        value.into_bytes(),
+                    ]
+                }
+                StorageWrite::HDel { key, field } => {
+                    vec![b"HDEL".to_vec(), key.into_bytes(), field.into_bytes()]
+                }
+                StorageWrite::SAdd { key, member } => {
+                    vec![b"SADD".to_vec(), key.into_bytes(), member.into_bytes()]
+                }
+                StorageWrite::SRem { key, member } => {
+                    vec![b"SREM".to_vec(), key.into_bytes(), member.into_bytes()]
+                }
+                StorageWrite::Del { key } => vec![b"DEL".to_vec(), key.into_bytes()],
+            })
+            .collect::<Vec<_>>();
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let client = self.client.clone();
+        self.run_lux(async move {
+            client.pipeline(&commands).await?;
+            Ok(())
+        })
     }
 }
 

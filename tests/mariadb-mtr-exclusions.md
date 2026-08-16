@@ -38,15 +38,27 @@ also exercise excluded capabilities.
 
 ## Current upstream coverage
 
-| Test | Feature evidence |
-| --- | --- |
-| `adddate_454` | Date-column writes, interval arithmetic, and warning behavior. |
-| `timezone4` | `FROM_UNIXTIME` and `UNIX_TIMESTAMP` date/time behavior. |
+The strict gate contains 32 complete files and 381 SQL statements:
+
+| Area | Upstream files | Feature evidence |
+| --- | --- | --- |
+| DDL | `create_drop_index`, `create_replace_tmp`, `key_primary`, `alter_table_autoinc-5574`, `alter_table_trans`, `create_drop_view` | Index lifecycle, temporary-table replacement, primary keys, ALTER constraint behavior, auto-increment lowering, and view lifecycle. |
+| DML | `bulk_replace`, `insert_update_autoinc-7150`, `insert_returning_datatypes`, `replace_returning_datatypes` | Multi-row replacement, auto-increment conflict updates, and typed `INSERT`/`REPLACE ... RETURNING`. |
+| Metadata | `show_row_order-9226` | Stable `SHOW COLUMNS` ordering across large `ENUM` definitions. |
+| Aggregation | `group_by_null`, `sum_distinct`, `innodb_group` | Grouping with null-producing expressions, distinct aggregates, and InnoDB aggregate edge cases. |
+| Subqueries | `subselect_nulls`, `subselect_nulls_innodb`, `in_datetime_241` | Correlated `IN`/`EXISTS`, null-safe joins, row comparisons, date-valued scalar subqueries, and three-valued null logic. |
+| Ordering | `order_by-mdev-10122` | Aggregate ordering inside parenthesized queries and `UNION` operands. |
+| Date/time | `adddate_454`, `timezone4`, `datetime_456`, `str_to_datetime_457`, `func_timestamp`, `type_interval` | Interval arithmetic, Unix timestamps, boundary values, temporal casts, warnings, decimal timestamp metadata, and interval extraction. |
+| Windows | `win_empty_over`, `win_insert_select` | Empty `OVER()` clauses, window aggregates, ranking, and windowed `INSERT ... SELECT`. |
+| JSON | `json_equals` | Structural equality, Unicode, numeric precision, nesting limits, recursive construction, and character sets. |
+| Generated columns | `vcol/delayed`, `vcol/mrr`, `gcol/innodb_prefix_index_check` | Generated indexes, indexed predicates, optimizer-switch independence, `REPLACE DELAYED`, and generated-column prefix indexes. |
+| Uniqueness | `unique` | Unique-key insertion, nullable duplicates, and indexed deletes. |
 
 The focused non-gating audit scope in
-[`tests/mariadb-mtr-scope.txt`](mariadb-mtr-scope.txt) expands this to 21 complete files and
-305 SQL statements across DDL, DML, aggregates, subqueries, date/time, window functions, and
-JSON. Its results are reported separately from the strict manifest; a file is promoted only
+[`tests/mariadb-mtr-scope.txt`](mariadb-mtr-scope.txt) retains 24 complete files and 321 SQL
+statements across DDL, DML, aggregates, subqueries, date/time, window functions, JSON, and
+generated columns. Its results are reported separately from the strict manifest. `win_std` remains
+audit-only because its complete upstream results do not yet match MySqweel; a file is promoted only
 after it passes in full against both engines.
 
 Features without a suitable complete upstream file are covered by the
@@ -59,14 +71,15 @@ to support the rest of the relevant upstream file.
 The non-gating
 [MariaDB MTR discovery workflow](../.github/workflows/mariadb-mtr-discovery.yml)
 inventories the test files in the pinned MariaDB 10.11.7 ARM64 distribution. The
-static audit identifies complete-file candidates containing direct SQL statements after
-excluding tests with missing results, custom delimiters, harness dependencies,
-server options, topology requirements, or behavior outside the compatibility
-contract.
+static audit follows literal MTR `source`/`include` files and admits safe variables,
+multiple connections, and asynchronous send/reap behavior. It excludes missing results,
+custom delimiters, process or file-system side effects, server options and configuration,
+topology requirements, storage engines, and behavior outside the compatibility contract.
 
-Each weekly or manually triggered run selects a rotating batch of 100
-candidates, validates each file against MariaDB first, and runs baseline passes
-against MySqweel. The workflow publishes the inventory, complete execution
-reports, and a generated promotion manifest containing only files that passed
-both engines. Promotion into the strict manifest still requires review against
-the admission rules above.
+Each weekly, manual, or relevant push run inventories all 5,585 packaged files and executes every
+safely classifiable candidate rather than sampling a rotating batch. The current pinned inventory
+contains 308 candidates and 19,517 direct and sourced SQL statements. Each file is validated
+against MariaDB first, then run against MySqweel when the external-server baseline is valid. The
+workflow publishes the inventory, complete execution reports, and a generated promotion manifest
+containing only files that passed both engines. Promotion into the strict manifest still requires
+review against the admission rules above.

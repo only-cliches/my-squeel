@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::StorageWrite;
 
 pub(super) fn storage_tables_key() -> &'static str {
     "my-sqweel:tables"
@@ -80,23 +81,27 @@ pub(super) fn storage_key_part(value: &str) -> String {
     out
 }
 
-pub(super) fn persist_column_hint(
-    store: &dyn RedisStore,
+pub(super) fn append_column_hint_writes(
+    writes: &mut Vec<StorageWrite>,
     key: &str,
     hint: &ColumnHint,
-) -> Result<()> {
-    store.hset(key, "sql_type", hint.sql_type.as_deref().unwrap_or(""))?;
-    store.hset(
-        key,
-        "nullable",
-        hint.nullable.map(bool_string).unwrap_or(""),
-    )?;
-    store.hset(key, "default", hint.default.as_deref().unwrap_or(""))?;
-    store.hset(key, "primary_key", bool_string(hint.primary_key))?;
-    store.hset(key, "auto_increment", bool_string(hint.auto_increment))?;
-    store.hset(key, "generated", hint.generated.as_deref().unwrap_or(""))?;
-    store.hset(key, "generated_stored", bool_string(hint.generated_stored))?;
-    Ok(())
+) {
+    let fields = [
+        ("sql_type", hint.sql_type.as_deref().unwrap_or("")),
+        ("nullable", hint.nullable.map(bool_string).unwrap_or("")),
+        ("default", hint.default.as_deref().unwrap_or("")),
+        ("primary_key", bool_string(hint.primary_key)),
+        ("auto_increment", bool_string(hint.auto_increment)),
+        ("generated", hint.generated.as_deref().unwrap_or("")),
+        ("generated_stored", bool_string(hint.generated_stored)),
+    ];
+    for (field, value) in fields {
+        writes.push(StorageWrite::HSet {
+            key: key.to_string(),
+            field: field.to_string(),
+            value: value.to_string(),
+        });
+    }
 }
 
 pub(super) fn decode_column_hint_from_hash(fields: &BTreeMap<String, String>) -> ColumnHint {

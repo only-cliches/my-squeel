@@ -35,7 +35,7 @@ Meilisearch-shaped search surface.
 | Storage | In memory | Disposable state; optional locked Lux-backed directory persistence |
 | Compatibility profiles | Drift tolerant / MySQL strict | Choose convenience or fail-fast schema behavior |
 | MySQL verification | MySQL 8.0.43 | Differential corpus and exact parity suites |
-| Upstream MariaDB MTR verification | MariaDB 10.11.7 | 2 gated files / 21 scoped files / 305 SQL statements on ARM64 |
+| Upstream MariaDB MTR verification | MariaDB 10.11.7 | 32 gated files / 381 SQL statements on ARM64 |
 
 ## Where it fits
 
@@ -372,10 +372,12 @@ instead of being silently evaluated as `NULL`, `FALSE`, or a partial result.
 - ORM-shaped tests cover migration, CRUD, relation, and introspection patterns used by Diesel,
   Drizzle/Knex, Prisma, and SeaORM.
 - The [MariaDB MTR workflow](.github/workflows/mariadb-mtr-discovery.yml) inventories the ARM64
-  MariaDB 10.11.7 MTR distribution, filters complete external-server candidates, and rotates
-  100-file batches through MariaDB and MySqweel. It also audits the focused
-  [`tests/mariadb-mtr-scope.txt`](tests/mariadb-mtr-scope.txt) set covering 21 files and 305 SQL
-  statements across DDL, DML, aggregates, subqueries, date/time, windows, and JSON.
+  MariaDB 10.11.7 MTR distribution and runs every safely classifiable external-server candidate
+  through MariaDB and MySqweel. The pinned inventory currently inspects 5,585 files and executes
+  308 candidates containing 19,517 direct and sourced SQL statements. It also audits the focused
+  [`tests/mariadb-mtr-scope.txt`](tests/mariadb-mtr-scope.txt) set covering 24 files and 321 SQL
+  statements across DDL, DML, aggregates, subqueries, date/time, windows, JSON, and generated
+  columns.
 
 The percentage describes this versioned corpus, not the entire MySQL grammar. Every reported edge
 case should become a regression case before its implementation is changed.
@@ -385,7 +387,7 @@ pass against both MariaDB and MySqweel. A discovered file becomes eligible for t
 only after that dual-engine pass and a compatibility-boundary review. The strict manifest records
 the exact upstream test and expected-result hashes in
 [`tests/mariadb-mtr-allowlist.txt`](tests/mariadb-mtr-allowlist.txt). The broader focused scope
-is intentionally non-gating until its complete files pass against both engines.
+remains non-gating; complete files move into the strict manifest only after they pass both engines.
 
 ### Schema, DDL, and metadata
 
@@ -592,6 +594,18 @@ MYSQL_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test \
 MYSQL_PARITY_REQUIRED=1 \
 cargo test --all-targets --locked
 ```
+
+On macOS or another Docker host, run the pinned MariaDB 10.11.7 MTR baseline in isolated ARM64
+containers with:
+
+```sh
+tools/run_mariadb_mtr_baseline_docker.sh
+```
+
+The script provisions and removes its own MariaDB container and Docker network. It caches the
+downloaded Ubuntu MTR packages under `.cache/mariadb-mtr` and writes the report to
+`artifacts/mariadb-mtr-baseline/mtr-report.md`. Intel Macs can use the same command through Docker's
+ARM64 emulation, although it will be slower than Apple Silicon.
 
 On an Ubuntu 24.04 ARM64 runner, reproduce the upstream MariaDB MTR comparison with the pinned
 Ubuntu MariaDB packages:

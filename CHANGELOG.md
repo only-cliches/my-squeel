@@ -2,6 +2,32 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.4.2 Aug 15, 2026
+
+### Performance
+
+- Optimized `ORDER BY ... LIMIT/OFFSET` execution by selecting only the best `OFFSET + LIMIT` rows before sorting, instead of fully sorting every matching row. Stable input-order tie-breaking preserves the previous result ordering at page boundaries.
+- Avoided the table scan's default primary-key sort when an explicit `ORDER BY` already contains the complete primary key and therefore defines a total order. Window projections retain the previous base ordering.
+- Changed `LIMIT/OFFSET` pagination to trim result vectors in place rather than allocating replacement vectors.
+- Removed per-cell lowercase `String` allocations from declared SQL type matching while retaining case-insensitive coercion behavior.
+- Added a direct parser path for ordinary `SELECT` statements that cannot require MySQL compatibility rewrites, avoiding repeated string replacements and case conversions on every execution.
+- Preallocated single-table scan result vectors from known row or index-match counts.
+- Reused a per-query row materialization plan across table scans, including resolved schema column order, parsed generated-column expressions, and exact/case-insensitive column lookup sets.
+- Expanded the release benchmark with full-scan projection and scalar-query cases. Across the original 4,000-row cases, compound ordering with pagination improved from 67.63 to 153.31 queries per second (127% faster), while filtered ordering with pagination improved from 109.41 to 154.40 queries per second (41% faster).
+
+### Tests
+
+- Added regression coverage for exact ordered pagination, total primary-key ordering, applying `DISTINCT` before bounded ordering, direct-parser eligibility, and schema-drift row materialization.
+
+### Compatibility and CI
+
+- Added a one-command Docker wrapper for running the pinned MariaDB 10.11.7 MTR baseline locally, including isolated service provisioning, ARM64 execution on macOS, package caching, report generation, and automatic cleanup.
+- Expanded the strict, hash-pinned MariaDB 10.11.7 MTR gate from 23 files and 280 SQL statements to 32 files and 381 statements, adding upstream coverage for view lifecycle, null-safe equality, ALTER constraint transactions, auto-increment lowering, Unix-timestamp decimal metadata, generated-column prefix indexes, InnoDB grouping, and unique/subquery edge cases.
+- Verified the expanded strict gate at 100%: all 32 upstream files and all 381 statements pass against both MariaDB 10.11.7 and MySqweel.
+- Replaced rotating 100-file MariaDB MTR discovery samples with an exhaustive safe-harness audit that follows literal upstream includes and runs all 308 current candidates, covering 19,517 direct and sourced SQL statements from a 5,585-file inventory.
+- Refined MariaDB compatibility for foreign-key-aware `DELETE IGNORE` warnings and row skipping, supported `MATCH FULL`/`MATCH PARTIAL` clauses, affected-row reporting, and `LIMIT 0` metadata queries against system tables.
+- Recorded the exhaustive audit as non-gating: 31 candidates pass, while 277 fail and 140 encounter infrastructure failures; unsupported or infrastructure-bound cases remain outside the strict promotion gate.
+
 ## 0.4.1 future
 
 ### Fixed

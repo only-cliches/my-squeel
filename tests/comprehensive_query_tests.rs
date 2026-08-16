@@ -317,13 +317,54 @@ fn order_by_with_limit_and_offset() {
         .execute_sql("CREATE TABLE numbers (id INT, val INT)")
         .unwrap();
     engine
-        .execute_sql("INSERT INTO numbers VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .execute_sql(
+            "INSERT INTO numbers VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 40)",
+        )
         .unwrap();
 
     let result = engine
         .execute_sql("SELECT val FROM numbers ORDER BY val DESC LIMIT 2 OFFSET 1")
         .unwrap();
-    assert_eq!(result[0].rows.len(), 2);
+    assert_eq!(
+        result[0]
+            .rows
+            .iter()
+            .map(|row| row["val"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![40, 40]
+    );
+
+    // DISTINCT is applied before the bounded ordering optimization, so rows
+    // discarded as duplicates do not leave the requested page under-filled.
+    let distinct = engine
+        .execute_sql("SELECT DISTINCT val FROM numbers ORDER BY val DESC LIMIT 2 OFFSET 1")
+        .unwrap();
+    assert_eq!(
+        distinct[0]
+            .rows
+            .iter()
+            .map(|row| row["val"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![40, 30]
+    );
+
+    engine
+        .execute_sql("CREATE TABLE ranked (id INT PRIMARY KEY, score INT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO ranked VALUES (10, 5), (2, 5), (1, 7), (20, 3)")
+        .unwrap();
+    let total_order = engine
+        .execute_sql("SELECT id FROM ranked ORDER BY score DESC, id ASC LIMIT 3")
+        .unwrap();
+    assert_eq!(
+        total_order[0]
+            .rows
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 10]
+    );
 }
 
 // NULL handling

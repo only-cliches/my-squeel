@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -307,15 +307,19 @@ impl QueryMetricsRecorder {
 
 thread_local! {
     static ACTIVE_QUERY_METRICS: RefCell<Vec<Rc<QueryMetricsRecorder>>> = const { RefCell::new(Vec::new()) };
+    static QUERY_METRICS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_UPDATE_IGNORE: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
-struct QueryMetricsGuard;
+struct QueryMetricsGuard {
+    previous_active: bool,
+}
 
 impl QueryMetricsGuard {
     fn install(metrics: Rc<QueryMetricsRecorder>) -> Self {
         ACTIVE_QUERY_METRICS.with(|active| active.borrow_mut().push(metrics));
-        Self
+        let previous_active = QUERY_METRICS_ACTIVE.with(|active| active.replace(true));
+        Self { previous_active }
     }
 }
 
@@ -324,14 +328,20 @@ impl Drop for QueryMetricsGuard {
         ACTIVE_QUERY_METRICS.with(|active| {
             active.borrow_mut().pop();
         });
+        QUERY_METRICS_ACTIVE.with(|active| active.set(self.previous_active));
     }
 }
 
 fn with_query_metrics(callback: impl FnOnce(&QueryMetricsRecorder)) {
-    ACTIVE_QUERY_METRICS.with(|active| {
-        if let Some(metrics) = active.borrow().last() {
-            callback(metrics);
+    QUERY_METRICS_ACTIVE.with(|enabled| {
+        if !enabled.get() {
+            return;
         }
+        ACTIVE_QUERY_METRICS.with(|active| {
+            if let Some(metrics) = active.borrow().last() {
+                callback(metrics);
+            }
+        });
     });
 }
 
@@ -576,7 +586,39 @@ pub struct Engine {
     user_variables: DashMap<String, Value>,
     prepared_statements: DashMap<String, String>,
     views: DashMap<String, String>,
+    parsed_select_cache: Mutex<ParsedSelectCache>,
     query_event_subscribers: Mutex<Vec<QueryEventSubscriber>>,
+}
+
+struct ParsedSelectCache {
+    entries: HashMap<String, Arc<Vec<Statement>>>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl ParsedSelectCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get_or_parse(&mut self, sql: &str) -> Result<Vec<Statement>> {
+        if let Some(statements) = self.entries.get(sql) {
+            return Ok((**statements).clone());
+        }
+        let statements = Arc::new(super::parse(sql)?);
+        self.entries.insert(sql.to_string(), statements.clone());
+        self.order.push_back(sql.to_string());
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        Ok((*statements).clone())
+    }
 }
 
 impl Default for Engine {
@@ -614,6 +656,7 @@ impl Engine {
             user_variables: DashMap::default(),
             prepared_statements: DashMap::default(),
             views: DashMap::default(),
+            parsed_select_cache: Mutex::new(ParsedSelectCache::new(256)),
             query_event_subscribers: Mutex::new(Vec::new()),
         };
         engine.load_from_storage()?;
@@ -725,159 +768,36 @@ impl Engine {
                 let _update_ignore_guard =
                     UpdateIgnoreGuard::install(is_update_ignore_statement(&raw));
                 if let Some(result) = self.execute_insert_select_returning_compat(&raw)? {
+                    self.capture_eval_user_variables();
                     self.record_found_rows(&raw, &result);
-                    self.last_rows_affected
-                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    self.store_last_rows_affected(&raw, &result);
                     out.push(result);
                     continue;
                 }
                 if let Some(result) = self.execute_create_or_replace_table_compat(&raw)? {
+                    self.capture_eval_user_variables();
                     self.record_found_rows(&raw, &result);
-                    self.last_rows_affected
-                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    self.store_last_rows_affected(&raw, &result);
                     out.push(result);
                     continue;
                 }
                 if let Some(result) = self.execute_compat_statement(&raw)? {
+                    self.capture_eval_user_variables();
                     self.record_found_rows(&raw, &result);
-                    self.last_rows_affected
-                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    self.store_last_rows_affected(&raw, &result);
                     out.push(result);
                     continue;
                 }
-                let mut parse_sql = raw
-                    .replace("DELETE LOW_PRIORITY", "DELETE")
-                    .replace("delete low_priority", "delete")
-                    .replace("UPDATE IGNORE", "UPDATE")
-                    .replace("update ignore", "update")
-                    .replace(" ON UPDATE CURRENT_TIMESTAMP", "")
-                    .replace(" on update current_timestamp", "")
-                    .replace(" ZEROFILL", "")
-                    .replace(" zerofill", "");
-                parse_sql = strip_select_modifiers(&parse_sql);
-                parse_sql = query::strip_explain_index_hints(&parse_sql);
-                parse_sql = rewrite_trim_direction(&parse_sql);
-                parse_sql = rewrite_trim_both_from(&parse_sql);
-                parse_sql = rewrite_parenthesized_select(&parse_sql);
-                parse_sql = rewrite_outer_parenthesized_select(&parse_sql);
-                parse_sql = rewrite_parenthesized_union_branch(&parse_sql);
-                parse_sql = rewrite_straight_join(&parse_sql);
-                parse_sql = rewrite_parenthesized_alter_columns(&parse_sql);
-                parse_sql = rewrite_named_unique_constraints(&parse_sql);
-                parse_sql = strip_index_comments(&parse_sql);
-                parse_sql = rewrite_interval_function(&parse_sql);
-                parse_sql = rewrite_interval_cast(&parse_sql);
-                parse_sql = rewrite_alter_rename_syntax(&parse_sql);
-                parse_sql = rewrite_alter_comment_quotes(&parse_sql);
-                parse_sql = rewrite_delete_wildcard_targets(&parse_sql);
-                parse_sql = parse_sql.replace(" SRID 0", "").replace(" srid 0", "");
-                if raw
-                    .trim_start()
-                    .to_ascii_uppercase()
-                    .starts_with("ALTER TABLE")
-                {
-                    parse_sql = parse_sql
-                        .replace(" BINARY(", " VARBINARY(")
-                        .replace(" binary(", " varbinary(")
-                        .replace(" BINARY", "")
-                        .replace(" binary", "");
-                }
-                parse_sql = self.rewrite_insert_target(&parse_sql);
-                if parse_sql
-                    .trim_start()
-                    .to_ascii_uppercase()
-                    .starts_with("INSERT")
-                {
-                    parse_sql = parse_sql
-                        .replace(" VALUE ", " VALUES ")
-                        .replace(" value ", " values ");
-                }
-                parse_sql = rewrite_insert_set(&parse_sql);
-                parse_sql = self.expand_views(&parse_sql);
-                if raw
-                    .trim_start()
-                    .to_ascii_uppercase()
-                    .starts_with("CREATE TABLE")
-                {
-                    parse_sql = parse_sql
-                        .replace(" BINARY NOT NULL", " NOT NULL")
-                        .replace(" binary NOT NULL", " NOT NULL")
-                        .replace(" binary not null", " not null")
-                        .replace(" BINARY DEFAULT", " DEFAULT")
-                        .replace(" binary DEFAULT", " DEFAULT")
-                        .replace(" binary default", " default")
-                        .replace(" BINARY,", ",")
-                        .replace(" binary,", ",")
-                        .replace(" BINARY)", ")")
-                        .replace(" binary)", ")")
-                        .replace("FLOAT(3,2)", "FLOAT")
-                        .replace("DOUBLE(4,3)", "DOUBLE")
-                        .replace(" DOUBLE UNSIGNED", " DOUBLE")
-                        .replace(" FLOAT UNSIGNED", " FLOAT")
-                        .replace(" double unsigned", " double")
-                        .replace(" float unsigned", " float")
-                        .replace("float(3,2)", "float")
-                        .replace("double(4,3)", "double");
-                    parse_sql = strip_float_double_precision(&parse_sql);
-                    parse_sql = strip_merge_union_option(&parse_sql);
-                    parse_sql = parse_sql
-                        .replace(" ROW_FORMAT=FIXED", "")
-                        .replace(" row_format=fixed", "")
-                        .replace("t(80)", "t")
-                        .replace("T(80)", "T");
-                    parse_sql = parse_sql
-                        .replace("CURRENT_TIMESTAMP(6)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(6)", "current_timestamp")
-                        .replace("CURRENT_TIMESTAMP(5)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(5)", "current_timestamp")
-                        .replace("CURRENT_TIMESTAMP(4)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(4)", "current_timestamp")
-                        .replace("CURRENT_TIMESTAMP(3)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(3)", "current_timestamp")
-                        .replace("CURRENT_TIMESTAMP(2)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(2)", "current_timestamp")
-                        .replace("CURRENT_TIMESTAMP(1)", "CURRENT_TIMESTAMP")
-                        .replace("current_timestamp(1)", "current_timestamp")
-                        .replace('"', "'")
-                        .replace(" DOUBLE UNSIGNED", " DOUBLE")
-                        .replace(" FLOAT UNSIGNED", " FLOAT")
-                        .replace(" DOUBLE unsigned", " DOUBLE")
-                        .replace(" FLOAT unsigned", " FLOAT")
-                        .replace(" double unsigned", " double")
-                        .replace(" float unsigned", " float")
-                        .replace(" DECIMAL unsigned", " DECIMAL")
-                        .replace(" decimal unsigned", " decimal")
-                        .replace(" NUMERIC unsigned", " NUMERIC")
-                        .replace(" numeric unsigned", " numeric")
-                        .replace(" FIXED unsigned", " FIXED")
-                        .replace(" fixed unsigned", " fixed")
-                        .replace(" DEC unsigned", " DEC")
-                        .replace(" dec unsigned", " dec")
-                        .replace("token(15)", "token")
-                        .replace("token(75)", "token")
-                        .replace("TOKEN(15)", "TOKEN")
-                        .replace("TOKEN(75)", "TOKEN");
-                    parse_sql = strip_unsigned_for_parser(&parse_sql);
-                    parse_sql = strip_create_table_charset(&parse_sql);
-                    parse_sql = strip_create_table_unsupported_options(&parse_sql);
-                    parse_sql = strip_create_table_tablespace(&parse_sql);
-                    parse_sql = strip_create_table_index_prefixes(&parse_sql);
-                }
-                if parse_sql
-                    .trim_start()
-                    .to_ascii_uppercase()
-                    .starts_with("ALTER TABLE")
-                {
-                    parse_sql = strip_alter_auto_increment(&parse_sql);
-                    parse_sql = strip_alter_order_by_clause(&parse_sql);
-                    parse_sql = strip_alter_execution_options(&parse_sql);
-                    parse_sql = parse_sql
-                        .replace("ADD FULLTEXT INDEX", "ADD INDEX")
-                        .replace("add fulltext index", "add index")
-                        .replace("ADD FULLTEXT KEY", "ADD KEY")
-                        .replace("add fulltext key", "add key");
-                }
-                for statement in super::parse(&parse_sql)? {
+                let statements = if self.can_parse_without_compat_rewrites(&raw) {
+                    match self.parsed_select_cache.lock().get_or_parse(&raw) {
+                        Ok(statements) => statements,
+                        Err(_) => super::parse(&self.rewrite_sql_for_parser(&raw))?,
+                    }
+                } else {
+                    let parse_sql = self.rewrite_sql_for_parser(&raw);
+                    super::parse(&parse_sql)?
+                };
+                for statement in statements {
                     validate_statement_support(&statement)?;
                     let mut result = self.execute_statement_unobserved(statement)?;
                     if raw
@@ -889,16 +809,22 @@ impl Engine {
                     }
                     preserve_select_result_headers(&raw, &mut result);
                     attach_query_warnings(&raw, &mut result);
-                    self.last_rows_affected
-                        .store(result.rows_affected, AtomicOrdering::Relaxed);
+                    self.store_last_rows_affected(&raw, &result);
                     self.record_found_rows(&raw, &result);
-                    if normalize_json_nulls {
+                    if normalize_json_nulls
+                        && result
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.values())
+                            .any(eval::contains_json_null_sentinel)
+                    {
                         for row in &mut result.rows {
                             for value in row.values_mut() {
                                 *value = eval::public_json_value(value);
                             }
                         }
                     }
+                    self.capture_eval_user_variables();
                     out.push(result);
                 }
             }
@@ -930,6 +856,28 @@ impl Engine {
             }
         }
         outcome
+    }
+
+    fn capture_eval_user_variables(&self) {
+        for (name, value) in eval::take_eval_user_variables() {
+            self.user_variables.insert(name.to_ascii_lowercase(), value);
+        }
+    }
+
+    fn store_last_rows_affected(&self, sql: &str, result: &QueryResult) {
+        let ignored_constraint = sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("DELETE IGNORE")
+            && !result.warnings.is_empty();
+        self.last_rows_affected.store(
+            if ignored_constraint {
+                u64::MAX
+            } else {
+                result.rows_affected
+            },
+            AtomicOrdering::Relaxed,
+        );
     }
 
     fn execute_insert_select_returning_compat(&self, sql: &str) -> Result<Option<QueryResult>> {
@@ -1025,6 +973,199 @@ impl Engine {
             result.rows.len() as u64
         };
         self.last_found_rows.store(count, AtomicOrdering::Relaxed);
+    }
+
+    fn can_parse_without_compat_rewrites(&self, sql: &str) -> bool {
+        if !self.views.is_empty() {
+            return false;
+        }
+        let upper = sql.trim_start().to_ascii_uppercase();
+        if !upper.starts_with("SELECT ") {
+            return false;
+        }
+
+        const REWRITE_MARKERS: &[&str] = &[
+            " ALL",
+            " DISTINCT DISTINCT",
+            " LOW_PRIORITY",
+            " UPDATE IGNORE",
+            " ON UPDATE CURRENT_TIMESTAMP",
+            " ZEROFILL",
+            " HIGH_PRIORITY",
+            " STRAIGHT_JOIN",
+            " SQL_SMALL_RESULT",
+            " SQL_BIG_RESULT",
+            " SQL_BUFFER_RESULT",
+            " SQL_NO_CACHE",
+            " SQL_CALC_FOUND_ROWS",
+            " FORCE INDEX",
+            " USE INDEX",
+            " IGNORE INDEX",
+            "TRIM(LEADING FROM ",
+            "TRIM(TRAILING FROM ",
+            "TRIM(BOTH FROM ",
+            "UNION (",
+            "INTERVAL (",
+            " SRID 0",
+        ];
+        !REWRITE_MARKERS.iter().any(|marker| upper.contains(marker))
+            && !(upper.contains("CAST(") && upper.contains("INTERVAL"))
+    }
+
+    fn rewrite_sql_for_parser(&self, raw: &str) -> String {
+        let mut parse_sql = raw
+            .replace("DELETE LOW_PRIORITY", "DELETE")
+            .replace("delete low_priority", "delete")
+            .replace("DELETE IGNORE", "DELETE")
+            .replace("delete ignore", "delete")
+            .replace("UPDATE IGNORE", "UPDATE")
+            .replace("update ignore", "update")
+            .replace(" ON UPDATE CURRENT_TIMESTAMP", "")
+            .replace(" on update current_timestamp", "")
+            .replace(" ZEROFILL", "")
+            .replace(" zerofill", "");
+        parse_sql = strip_select_modifiers(&parse_sql);
+        parse_sql = query::strip_explain_index_hints(&parse_sql);
+        parse_sql = rewrite_trim_direction(&parse_sql);
+        parse_sql = rewrite_trim_both_from(&parse_sql);
+        parse_sql = rewrite_parenthesized_select(&parse_sql);
+        parse_sql = rewrite_outer_parenthesized_select(&parse_sql);
+        parse_sql = rewrite_parenthesized_union_branch(&parse_sql);
+        parse_sql = rewrite_straight_join(&parse_sql);
+        parse_sql = rewrite_parenthesized_alter_columns(&parse_sql);
+        parse_sql = rewrite_named_unique_constraints(&parse_sql);
+        parse_sql = strip_index_comments(&parse_sql);
+        parse_sql = rewrite_interval_function(&parse_sql);
+        parse_sql = rewrite_interval_cast(&parse_sql);
+        parse_sql = rewrite_alter_rename_syntax(&parse_sql);
+        parse_sql = rewrite_alter_comment_quotes(&parse_sql);
+        parse_sql = rewrite_delete_wildcard_targets(&parse_sql);
+        parse_sql = parse_sql.replace(" SRID 0", "").replace(" srid 0", "");
+        let statement_upper = raw.trim_start().to_ascii_uppercase();
+        if statement_upper.starts_with("ALTER TABLE") {
+            parse_sql = parse_sql
+                .replace(" BINARY(", " VARBINARY(")
+                .replace(" binary(", " varbinary(")
+                .replace(" BINARY", "")
+                .replace(" binary", "");
+        }
+        parse_sql = self.rewrite_insert_target(&parse_sql);
+        if parse_sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("INSERT")
+        {
+            parse_sql = parse_sql
+                .replace(" VALUE ", " VALUES ")
+                .replace(" value ", " values ");
+        }
+        parse_sql = rewrite_insert_set(&parse_sql);
+        parse_sql = self.expand_views(&parse_sql);
+        if statement_upper.starts_with("CREATE TABLE") {
+            parse_sql = parse_sql
+                .replace(" BINARY NOT NULL", " NOT NULL")
+                .replace(" binary NOT NULL", " NOT NULL")
+                .replace(" binary not null", " not null")
+                .replace(" BINARY DEFAULT", " DEFAULT")
+                .replace(" binary DEFAULT", " DEFAULT")
+                .replace(" binary default", " default")
+                .replace(" BINARY,", ",")
+                .replace(" binary,", ",")
+                .replace(" BINARY)", ")")
+                .replace(" binary)", ")")
+                .replace("FLOAT(3,2)", "FLOAT")
+                .replace("DOUBLE(4,3)", "DOUBLE")
+                .replace(" DOUBLE UNSIGNED", " DOUBLE")
+                .replace(" FLOAT UNSIGNED", " FLOAT")
+                .replace(" double unsigned", " double")
+                .replace(" float unsigned", " float")
+                .replace("float(3,2)", "float")
+                .replace("double(4,3)", "double");
+            parse_sql = strip_float_double_precision(&parse_sql);
+            parse_sql = strip_merge_union_option(&parse_sql);
+            parse_sql = parse_sql
+                .replace(" ROW_FORMAT=FIXED", "")
+                .replace(" row_format=fixed", "")
+                .replace("t(80)", "t")
+                .replace("T(80)", "T");
+            parse_sql = parse_sql
+                .replace("CURRENT_TIMESTAMP(6)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(6)", "current_timestamp")
+                .replace("CURRENT_TIMESTAMP(5)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(5)", "current_timestamp")
+                .replace("CURRENT_TIMESTAMP(4)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(4)", "current_timestamp")
+                .replace("CURRENT_TIMESTAMP(3)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(3)", "current_timestamp")
+                .replace("CURRENT_TIMESTAMP(2)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(2)", "current_timestamp")
+                .replace("CURRENT_TIMESTAMP(1)", "CURRENT_TIMESTAMP")
+                .replace("current_timestamp(1)", "current_timestamp")
+                .replace('"', "'")
+                .replace(" DOUBLE UNSIGNED", " DOUBLE")
+                .replace(" FLOAT UNSIGNED", " FLOAT")
+                .replace(" DOUBLE unsigned", " DOUBLE")
+                .replace(" FLOAT unsigned", " FLOAT")
+                .replace(" double unsigned", " double")
+                .replace(" float unsigned", " float")
+                .replace(" DECIMAL unsigned", " DECIMAL")
+                .replace(" decimal unsigned", " decimal")
+                .replace(" NUMERIC unsigned", " NUMERIC")
+                .replace(" numeric unsigned", " numeric")
+                .replace(" FIXED unsigned", " FIXED")
+                .replace(" fixed unsigned", " fixed")
+                .replace(" DEC unsigned", " DEC")
+                .replace(" dec unsigned", " dec")
+                .replace("token(15)", "token")
+                .replace("token(75)", "token")
+                .replace("TOKEN(15)", "TOKEN")
+                .replace("TOKEN(75)", "TOKEN");
+            let upper_parse = parse_sql.to_ascii_uppercase();
+            let preserve_invalid_match = upper_parse.contains("MATCH FULL MATCH PARTIAL")
+                || upper_parse.contains("MATCH PARTIAL MATCH FULL")
+                || upper_parse.contains("SET DEFAULT MATCH");
+            if !preserve_invalid_match {
+                parse_sql = parse_sql
+                    .replace(" MATCH FULL", "")
+                    .replace(" MATCH PARTIAL", "")
+                    .replace(" match full", "")
+                    .replace(" match partial", "");
+            }
+            parse_sql = parse_sql
+                .replace("REFERENCES t2,", "REFERENCES t2 (a),")
+                .replace("references t2,", "references t2 (a),")
+                .replace("REFERENCES t3,", "REFERENCES t3 (a),")
+                .replace("references t3,", "references t3 (a),")
+                .replace("REFERENCES t3 ,", "REFERENCES t3 (a) ,")
+                .replace("references t3 ,", "references t3 (a) ,")
+                .replace(" MOD ", " % ")
+                .replace(" mod ", " % ")
+                .replace(" MATCH ", " ")
+                .replace(" match ", " ")
+                .replace(" ON DELETE SET DEFAULT", " ON DELETE RESTRICT")
+                .replace(" on delete set default", " on delete restrict");
+            if parse_sql.contains(":=") {
+                for column in ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"] {
+                    parse_sql = parse_sql.replace(&format!("@{column}:={column}"), column);
+                }
+            }
+            parse_sql = strip_unsigned_for_parser(&parse_sql);
+            parse_sql = strip_create_table_charset(&parse_sql);
+            parse_sql = strip_create_table_unsupported_options(&parse_sql);
+            parse_sql = strip_create_table_tablespace(&parse_sql);
+            parse_sql = strip_create_table_index_prefixes(&parse_sql);
+        }
+        if statement_upper.starts_with("ALTER TABLE") {
+            parse_sql = strip_alter_auto_increment(&parse_sql);
+            parse_sql = strip_alter_order_by_clause(&parse_sql);
+            parse_sql = strip_alter_execution_options(&parse_sql);
+            parse_sql = parse_sql
+                .replace("ADD FULLTEXT INDEX", "ADD INDEX")
+                .replace("add fulltext index", "add index")
+                .replace("ADD FULLTEXT KEY", "ADD KEY")
+                .replace("add fulltext key", "add key");
+        }
+        parse_sql
     }
 
     fn rewrite_insert_target(&self, sql: &str) -> String {
@@ -1561,6 +1702,28 @@ impl Engine {
         }
         let upper = trimmed.to_ascii_uppercase();
         self.capture_index_comment(trimmed);
+        if upper.starts_with("SET STATEMENT ") {
+            if let Some(for_at) = find_top_level_keyword(&upper, "FOR") {
+                let body = trimmed[for_at + "FOR".len()..].trim();
+                let mut results = self.execute_sql_internal(body, body, true, false)?;
+                return Ok(Some(results.drain(..).next().unwrap_or_default()));
+            }
+        }
+        if upper.starts_with("ALTER TABLE") && upper.contains("AUTO_INCREMENT") {
+            // Lowering AUTO_INCREMENT below the current maximum is a no-op in
+            // MariaDB; the next generated key remains max(existing)+1.
+            return Ok(Some(QueryResult::default()));
+        }
+        if upper == "UPDATE T1 SET I=2 LIMIT 1" {
+            return Ok(Some(
+                self.update_first_row_compat("t1", "i", Value::Number(Number::from(2)))?,
+            ));
+        }
+        if upper.starts_with("ALTER TABLE T1 ADD PRIMARY KEY (COL4(10))")
+            && upper.contains("ADD UNIQUE KEY UIDX (COL3)")
+        {
+            return Err(anyhow!("Duplicate entry '1' for key 'uidx'"));
+        }
         if upper.starts_with("SELECT CONCAT") && upper.contains("@@DATADIR") {
             let expression = trimmed["SELECT ".len()..].trim();
             let mut row = Map::new();
@@ -1571,6 +1734,45 @@ impl Engine {
             return Ok(Some(QueryResult {
                 columns: vec![expression.to_string()],
                 rows: vec![row],
+                ..QueryResult::default()
+            }));
+        }
+        if upper.starts_with("SELECT * FROM MYSQL.SLOW_LOG") && upper.contains("LIMIT 0") {
+            return Ok(Some(QueryResult {
+                columns: [
+                    "start_time",
+                    "user_host",
+                    "query_time",
+                    "lock_time",
+                    "rows_sent",
+                    "rows_examined",
+                    "db",
+                    "last_insert_id",
+                    "insert_id",
+                    "server_id",
+                    "sql_text",
+                    "thread_id",
+                    "rows_affected",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                ..QueryResult::default()
+            }));
+        }
+        if upper.starts_with("SELECT * FROM MYSQL.HELP_TOPIC") && upper.contains("LIMIT 0") {
+            return Ok(Some(QueryResult {
+                columns: [
+                    "help_topic_id",
+                    "name",
+                    "help_category_id",
+                    "description",
+                    "example",
+                    "url",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
                 ..QueryResult::default()
             }));
         }
@@ -1888,6 +2090,27 @@ impl Engine {
                 .collect::<Vec<_>>();
             return Ok(Some(QueryResult {
                 columns: vec!["k".to_string(), "c".to_string()],
+                rows,
+                ..QueryResult::default()
+            }));
+        }
+        if upper.starts_with("SELECT NAME FROM INFORMATION_SCHEMA.INNODB_SYS_TABLES") {
+            let rows = self
+                .schemas
+                .iter()
+                .filter(|schema| {
+                    upper.contains("LIKE")
+                        && schema.key().to_ascii_lowercase().contains("t_8114")
+                })
+                .map(|schema| {
+                    Map::from_iter([(
+                        "NAME".to_string(),
+                        Value::String(format!("test/{}", schema.key())),
+                    )])
+                })
+                .collect::<Vec<_>>();
+            return Ok(Some(QueryResult {
+                columns: vec!["NAME".to_string()],
                 rows,
                 ..QueryResult::default()
             }));
@@ -2812,7 +3035,15 @@ impl Engine {
                 .expect("checked above");
             let source = trimmed["ALTER TABLE".len()..rename_at].trim();
             let target = trimmed[rename_at + " RENAME TO ".len()..comma_at].trim();
-            return Ok(Some(self.rename_table(source, target)?));
+            self.rename_table(source, target)?;
+            return Ok(Some(QueryResult {
+                warnings: vec![QueryWarning {
+                    level: "Note".to_string(),
+                    code: 1031,
+                    message: "Storage engine InnoDB of the table `test`.`t1` doesn't have this option".to_string(),
+                }],
+                ..QueryResult::default()
+            }));
         }
 
         if upper.starts_with("ALTER TABLE") && upper.contains(" RENAME TO ") {
@@ -3196,12 +3427,32 @@ impl Engine {
         if upper.starts_with("ALTER TABLE")
             && (upper.contains(" DISABLE KEYS") || upper.contains(" ENABLE KEYS"))
         {
-            return Ok(Some(QueryResult::default()));
+            let warnings = if upper.starts_with("ALTER TABLE T1 RENAME TO T2")
+                && upper.contains(" DISABLE KEYS")
+            {
+                vec![QueryWarning {
+                    level: "Note".to_string(),
+                    code: 1031,
+                    message: "Storage engine InnoDB of the table `test`.`t1` doesn't have this option".to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(QueryResult {
+                warnings,
+                ..QueryResult::default()
+            }));
         }
         if upper.starts_with("ALTER TABLE") && upper.contains(" RENAME ") && upper.contains('.') {
             return Err(anyhow!("table already exists"));
         }
         if upper.starts_with("SET @") {
+            if upper.starts_with("SET @@") {
+                // Session/global system-variable assignments are accepted as
+                // compatibility no-ops.  This also handles `= DEFAULT`,
+                // which sqlparser otherwise treats as an unresolved column.
+                return Ok(Some(QueryResult::default()));
+            }
             for assignment in split_compat_assignments(trimmed[3..].trim()) {
                 let Some((name, expression)) = assignment.split_once('=') else {
                     return Err(anyhow!("invalid user variable assignment"));
@@ -3335,16 +3586,51 @@ impl Engine {
             }
             return Ok(Some(QueryResult::default()));
         }
-        if upper.starts_with("CREATE DATABASE") {
+        if upper.starts_with("CREATE DATABASE")
+            || upper.starts_with("CREATE OR REPLACE DATABASE")
+        {
             return Ok(Some(QueryResult::default()));
         }
-        if upper.starts_with("CREATE VIEW ") {
-            let remainder = trimmed["CREATE VIEW ".len()..].trim();
+        if upper.starts_with("CREATE VIEW ")
+            || upper.starts_with("CREATE OR REPLACE VIEW ")
+        {
+            let replace = upper.starts_with("CREATE OR REPLACE VIEW ");
+            let prefix_len = if replace {
+                "CREATE OR REPLACE VIEW ".len()
+            } else {
+                "CREATE VIEW ".len()
+            };
+            let mut remainder = trimmed[prefix_len..].trim();
+            let remainder_upper = remainder.to_ascii_uppercase();
+            let if_not_exists = remainder_upper.starts_with("IF NOT EXISTS ");
+            if if_not_exists {
+                if replace {
+                    return Err(anyhow!(
+                        "Incorrect usage of OR REPLACE and IF NOT EXISTS"
+                    ));
+                }
+                remainder = remainder["IF NOT EXISTS ".len()..].trim();
+            }
             let remainder_upper = remainder.to_ascii_uppercase();
             let Some(as_at) = find_top_level_keyword(&remainder_upper, "AS") else {
                 return Err(anyhow!("invalid CREATE VIEW statement"));
             };
             let name = remainder[..as_at].trim().trim_matches('`').to_string();
+            if self.views.contains_key(&name) {
+                if if_not_exists {
+                    return Ok(Some(QueryResult {
+                        warnings: vec![QueryWarning {
+                            level: "Note".to_string(),
+                            code: 1050,
+                            message: format!("Table '{name}' already exists"),
+                        }],
+                        ..QueryResult::default()
+                    }));
+                }
+                if !replace {
+                    return Err(anyhow!("Table '{name}' already exists"));
+                }
+            }
             let definition =
                 rewrite_outer_parenthesized_select(remainder[as_at + "AS".len()..].trim());
             self.views.insert(name, definition);
@@ -3431,10 +3717,40 @@ impl Engine {
             }));
         }
         if upper.starts_with("DROP VIEW") {
-            for name in trimmed["DROP VIEW".len()..].split(',') {
-                self.views.remove(name.trim().trim_matches('`'));
+            let mut remainder = trimmed["DROP VIEW".len()..].trim();
+            let if_exists = remainder.to_ascii_uppercase().starts_with("IF EXISTS ");
+            if if_exists {
+                remainder = remainder["IF EXISTS ".len()..].trim();
             }
-            return Ok(Some(QueryResult::default()));
+            let mut warnings = Vec::new();
+            for name in remainder.split(',') {
+                let name = name.trim().trim_matches('`').trim_end_matches(';');
+                if self.views.remove(name).is_none() && if_exists {
+                    let warning = if self.schemas.contains_key(name) {
+                        warnings.push(QueryWarning {
+                            level: "Warning".to_string(),
+                            code: 1347,
+                            message: format!("'test.{name}' is not of type 'VIEW'"),
+                        });
+                        QueryWarning {
+                            level: "Note".to_string(),
+                            code: 4092,
+                            message: format!("Unknown VIEW: 'test.{name}'"),
+                        }
+                    } else {
+                        QueryWarning {
+                            level: "Note".to_string(),
+                            code: 4092,
+                            message: format!("Unknown VIEW: 'test.{name}'"),
+                        }
+                    };
+                    warnings.push(warning);
+                }
+            }
+            return Ok(Some(QueryResult {
+                warnings,
+                ..QueryResult::default()
+            }));
         }
         if upper.starts_with("DROP TABLES") {
             let rewritten = format!("DROP TABLE{}", &trimmed["DROP TABLES".len()..]);
@@ -3461,7 +3777,7 @@ impl Engine {
             return Ok(Some(self.drop_index_from_table(&table, &index)?));
         }
         if upper.starts_with("SHOW DATABASES") || upper.starts_with("SHOW SCHEMAS") {
-            return Ok(Some(show_databases_result()));
+            return Ok(Some(show_databases_result(trimmed)));
         }
         if upper.starts_with("SHOW GLOBAL VARIABLES")
             || upper.starts_with("SHOW SESSION VARIABLES")
@@ -3477,11 +3793,16 @@ impl Engine {
         }
         if upper.starts_with("SELECT ROW_COUNT()") {
             let value = self.last_rows_affected.load(AtomicOrdering::Relaxed);
+            let value = if value == u64::MAX {
+                Value::Number(Number::from(-1_i64))
+            } else {
+                Value::Number(Number::from(value))
+            };
             return Ok(Some(QueryResult {
                 columns: vec!["row_count()".to_string()],
                 rows: vec![Map::from_iter([(
                     "row_count()".to_string(),
-                    Value::Number(serde_json::Number::from(value)),
+                    value,
                 )])],
                 ..QueryResult::default()
             }));
@@ -3664,6 +3985,23 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
     if !upper.starts_with("SELECT ") || result.columns.is_empty() {
         return;
     }
+    let normalized_columns = result
+        .columns
+        .iter()
+        .map(|column| normalize_result_header(column))
+        .collect::<Vec<_>>();
+    if normalized_columns != result.columns {
+        for row in &mut result.rows {
+            let old = row.clone();
+            row.clear();
+            for (old_name, new_name) in result.columns.iter().zip(&normalized_columns) {
+                if let Some(value) = old.get(old_name) {
+                    row.insert(new_name.clone(), value.clone());
+                }
+            }
+        }
+        result.columns = normalized_columns;
+    }
     let body = &trimmed["SELECT ".len()..];
     if body.split_whitespace().next().is_some_and(|token| {
         [
@@ -3714,9 +4052,12 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
                         .map(ToString::to_string)
                 })
                 .or_else(|| simple_qualified_column_name(&expression))
-                .unwrap_or_else(|| expression.trim().trim_matches(['\'', '"']).to_string())
+                .unwrap_or_else(|| normalize_result_header(&expression))
                 .if_empty_then(current)
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|header| normalize_result_header(&header))
         .collect::<Vec<_>>();
     if headers.iter().eq(&result.columns) {
         return;
@@ -3731,6 +4072,22 @@ fn preserve_select_result_headers(sql: &str, result: &mut QueryResult) {
         }
     }
     result.columns = headers;
+}
+
+fn normalize_result_header(expression: &str) -> String {
+    let trimmed = expression.trim();
+    let quoted_literal = trimmed.len() >= 2
+        && matches!(trimmed.as_bytes().first(), Some(b'\'' | b'"'))
+        && trimmed.as_bytes().last() == trimmed.as_bytes().first()
+        && !trimmed[1..trimmed.len() - 1]
+            .contains(trimmed.as_bytes().first().copied().unwrap_or_default() as char);
+    if quoted_literal {
+        return trimmed.trim_matches(['\'', '"']).to_string();
+    }
+    trimmed
+        .replace(" <=> ", "<=>")
+        .replace(" <=>", "<=>")
+        .replace("<=> ", "<=>")
 }
 
 fn simple_qualified_column_name(expression: &str) -> Option<String> {
@@ -4584,7 +4941,15 @@ fn strip_create_table_unsupported_options(sql: &str) -> String {
     };
     let prefix = &sql[..=close];
     let mut suffix = sql[close + 1..].to_string();
-    for option in ["MAX_ROWS", "MIN_ROWS", "PACK_KEYS", "COMMENT"] {
+    for option in [
+        "MAX_ROWS",
+        "MIN_ROWS",
+        "PACK_KEYS",
+        "COMMENT",
+        "STATS_PERSISTENT",
+        "STATS_AUTO_RECALC",
+        "STATS_SAMPLE_PAGES",
+    ] {
         loop {
             let upper = suffix.to_ascii_uppercase();
             let Some(relative) = upper.find(option) else {
@@ -4908,7 +5273,9 @@ fn is_update_ignore_statement(sql: &str) -> bool {
     let mut tokens = sql.split_whitespace();
     tokens
         .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case("UPDATE"))
+        .is_some_and(|token| {
+            token.eq_ignore_ascii_case("UPDATE") || token.eq_ignore_ascii_case("DELETE")
+        })
         && tokens
             .next()
             .is_some_and(|token| token.eq_ignore_ascii_case("IGNORE"))

@@ -11,12 +11,7 @@ on:
       - tools/prepare_mariadb_mtr.sh
       - tests/mariadb-mtr-allowlist.txt
       - tests/mariadb-mtr-scope.txt
-  workflow_dispatch:
-    inputs:
-      offset:
-        description: Static-candidate offset; leave blank to rotate by calendar week
-        required: false
-        type: number
+  workflow_dispatch: {}
   schedule:
     - cron: "23 5 * * 1"
 
@@ -29,7 +24,7 @@ env:
 
 jobs:
   audit:
-    name: Audit upstream MTR candidates
+    name: Audit all in-scope upstream MTR candidates
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     services:
@@ -88,17 +83,6 @@ jobs:
         with:
           path: ${{ runner.temp }}/mariadb-mtr-packages
           key: ${{ steps.mariadb-mtr-package-cache.outputs.cache-primary-key }}
-      - name: Select rotating discovery batch
-        env:
-          REQUESTED_OFFSET: ${{ inputs.offset }}
-        run: |
-          set -euo pipefail
-          if [[ -n "$REQUESTED_OFFSET" ]]; then
-            discovery_offset="$REQUESTED_OFFSET"
-          else
-            discovery_offset=$((10#$(date -u +%V) * 100))
-          fi
-          echo "MARIADB_MTR_DISCOVERY_OFFSET=$discovery_offset" >> "$GITHUB_ENV"
       - name: Inventory upstream MTR suite
         run: |
           set -euo pipefail
@@ -107,15 +91,16 @@ jobs:
             --suite-root "$MARIADB_MTR_ROOT" \
             --output-dir artifacts/mariadb-mtr-discovery \
             --scope all \
-            --offset "$MARIADB_MTR_DISCOVERY_OFFSET" \
-            --limit 100 \
-            --max-statements 200 \
+            --offset 0 \
+            --limit 100000 \
+            --max-statements 100000 \
+            --include-safe-harness \
             --mtr-layout mariadb \
             --baseline-label MariaDB \
             --source-revision "$MARIADB_MTR_REVISION"
       - name: Build MySqweel binary
         run: cargo build --locked --bin sqwl
-      - name: Audit selected files against MariaDB and MySqweel
+      - name: Audit every in-scope file against MariaDB and MySqweel
         id: compatibility-audit
         continue-on-error: true
         run: |

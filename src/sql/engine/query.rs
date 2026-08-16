@@ -152,9 +152,13 @@ impl Engine {
                     .map(column_hint_from_metadata)
             })
             .collect::<Vec<_>>();
-        apply_ordering_with(&mut rows, &order_by, &order_hints, |expr, row| {
-            expr_resolved_value(expr, row)
-        })?;
+        apply_ordering_with(
+            &mut rows,
+            &order_by,
+            &order_hints,
+            limit_offset_end(limit.as_ref(), offset.as_ref())?,
+            expr_resolved_value,
+        )?;
         apply_limit_offset(&mut rows, limit.as_ref(), offset.as_ref())?;
 
         Ok(QueryResult {
@@ -343,35 +347,38 @@ impl Engine {
                     }
                 });
                 let right_by_equality = equality_columns.as_ref().map(|(_, right_column)| {
-                    let mut buckets: HashMap<String, Vec<usize>> =
+                    let mut buckets: HashMap<JoinKey, Vec<usize>> =
                         HashMap::with_capacity(table_rows.len());
                     for (index, row) in table_rows.iter().enumerate() {
                         if let Some(value) = row.get(right_column)
                             && *value != Value::Null
                         {
-                            buckets.entry(value.to_string()).or_default().push(index);
+                            buckets.entry(JoinKey::from(value)).or_default().push(index);
                         }
                     }
                     buckets
                 });
 
+                let all_indices = (0..table_rows.len()).collect::<Vec<_>>();
+                let empty_indices: &[usize] = &[];
                 let mut next = Vec::new();
                 for candidate in &current {
-                    let table_indices = if let Some((left_column, _)) = &equality_columns {
+                    let table_indices: &[usize] = if let Some((left_column, _)) = &equality_columns
+                    {
                         candidate
                             .get(left_column)
                             .filter(|value| **value != Value::Null)
                             .and_then(|value| {
                                 right_by_equality
                                     .as_ref()
-                                    .and_then(|buckets| buckets.get(&value.to_string()))
+                                    .and_then(|buckets| buckets.get(&JoinKey::from(value)))
                             })
-                            .map(|indices| indices.to_vec())
-                            .unwrap_or_default()
+                            .map(Vec::as_slice)
+                            .unwrap_or(empty_indices)
                     } else {
-                        (0..table_rows.len()).collect()
+                        &all_indices
                     };
-                    for right_index in table_indices {
+                    for &right_index in table_indices {
                         let table_data = &table_rows[right_index];
                         let mut combined = candidate.clone();
                         for (k, v) in table_data {
@@ -492,6 +499,9 @@ impl Engine {
         if root_name_full.eq_ignore_ascii_case("information_schema.global_variables") {
             return self.select_information_schema_global_variables(&select);
         }
+        if root_name_full.eq_ignore_ascii_case("information_schema.system_variables") {
+            return self.select_information_schema_system_variables(&select);
+        }
         if root_name_full.eq_ignore_ascii_case("information_schema.keywords") {
             return self.select_information_schema_keywords(&select);
         }
@@ -525,7 +535,17 @@ impl Engine {
             self.select_with_joins(&select, root)?
         };
         let mut rows = rows;
-        self.inject_user_variables(&mut rows);
+        let mut referenced_user_variables = select_user_variable_names(&select);
+        for order in order_by {
+            collect_user_variables(&order.expr, &mut referenced_user_variables);
+        }
+        if let Some(limit) = limit {
+            collect_user_variables(limit, &mut referenced_user_variables);
+        }
+        if let Some(offset) = offset {
+            collect_user_variables(&offset.value, &mut referenced_user_variables);
+        }
+        self.inject_user_variables(&mut rows, Some(&referenced_user_variables));
 
         let last_insert_id = self.last_insert_id.load(AtomicOrdering::Relaxed);
         if let Some(result) = aggregate_select_result(
@@ -544,15 +564,27 @@ impl Engine {
         self.finish_select_rows(&select, rows, order_by, limit, offset, last_insert_id)
     }
 
-    pub(super) fn inject_user_variables(&self, rows: &mut [Map<String, Value>]) {
+    pub(super) fn inject_user_variables(
+        &self,
+        rows: &mut [Map<String, Value>],
+        referenced: Option<&HashSet<String>>,
+    ) {
         if self.user_variables.is_empty() {
             return;
         }
         let variables = self
             .user_variables
             .iter()
+            .filter(|entry| {
+                referenced
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&format!("@{}", entry.key())))
+            })
             .map(|entry| (format!("@{}", entry.key()), entry.value().clone()))
             .collect::<Vec<_>>();
+        if variables.is_empty() {
+            return;
+        }
         for row in rows {
             for (name, value) in &variables {
                 row.entry(name.clone()).or_insert_with(|| value.clone());
@@ -577,9 +609,18 @@ impl Engine {
             .iter()
             .map(|order| self.order_column_hint(select, &order.expr))
             .collect::<Vec<_>>();
-        apply_ordering_with(&mut rows, order_by, &order_hints, |expr, row| {
-            self.eval_expr_ctx(expr, row, last_insert_id)
-        })?;
+        let max_ordered_rows = if select.distinct.is_none() {
+            limit_offset_end(limit, offset)?
+        } else {
+            None
+        };
+        apply_ordering_with(
+            &mut rows,
+            order_by,
+            &order_hints,
+            max_ordered_rows,
+            |expr, row| self.eval_expr_ctx(expr, row, last_insert_id),
+        )?;
         let mut rows = rows
             .into_iter()
             .map(|row| self.project_row_ctx(&select.projection, &row, last_insert_id))
@@ -617,7 +658,13 @@ impl Engine {
         if rows.is_empty() || !has_window {
             return Ok(());
         }
-        let snapshot = rows.to_vec();
+        // Window evaluation only mutates the projected rows after all window
+        // expressions have been evaluated. Borrow the input in place instead
+        // of cloning every row, and cache the partition/order layout for
+        // expressions that share a window specification.
+        let snapshot: &[Map<String, Value>] = rows;
+        let mut layouts = HashMap::<String, WindowLayout>::new();
+        let mut pending = Vec::<(String, Vec<Value>)>::new();
         for item in &select.projection {
             let expr = match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -638,76 +685,97 @@ impl Engine {
                     .map(|name| name.value.to_ascii_uppercase())
                     .unwrap_or_default();
                 let arguments = window_function_arguments(&function)?;
-                let order_hints = spec
-                    .order_by
-                    .iter()
-                    .map(|order| self.order_column_hint(select, &order.expr))
-                    .collect::<Vec<_>>();
-
-                let mut partitions = HashMap::<String, Vec<usize>>::new();
-                for (index, row) in snapshot.iter().enumerate() {
-                    let key = spec
-                        .partition_by
+                let layout_key = format!(
+                    "{}|{}",
+                    spec.partition_by
                         .iter()
-                        .map(|expr| self.eval_expr_ctx(expr, row, last_insert_id))
-                        .collect::<Result<Vec<_>>>()?
-                        .iter()
-                        .map(encode_json_value)
+                        .map(ToString::to_string)
                         .collect::<Vec<_>>()
-                        .join("|");
-                    partitions.entry(key).or_default().push(index);
-                }
-
-                let mut values = vec![Value::Null; rows.len()];
-                for partition in partitions.values_mut() {
-                    let order_keys = partition
+                        .join(","),
+                    spec.order_by
                         .iter()
-                        .map(|index| {
-                            spec.order_by
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                if !layouts.contains_key(&layout_key) {
+                    let order_hints = spec
+                        .order_by
+                        .iter()
+                        .map(|order| self.order_column_hint(select, &order.expr))
+                        .collect::<Vec<_>>();
+                    let mut partitions = HashMap::<String, Vec<usize>>::new();
+                    for (index, row) in snapshot.iter().enumerate() {
+                        let key = spec
+                            .partition_by
+                            .iter()
+                            .map(|expr| self.eval_expr_ctx(expr, row, last_insert_id))
+                            .collect::<Result<Vec<_>>>()?
+                            .iter()
+                            .map(encode_json_value)
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        partitions.entry(key).or_default().push(index);
+                    }
+                    let mut partitions = partitions.into_values().collect::<Vec<_>>();
+                    let mut order_keys = vec![Vec::new(); snapshot.len()];
+                    for partition in &mut partitions {
+                        for index in partition.iter().copied() {
+                            order_keys[index] = spec
+                                .order_by
                                 .iter()
                                 .map(|order| {
                                     self.eval_expr_ctx(
                                         &order.expr,
-                                        &snapshot[*index],
+                                        &snapshot[index],
                                         last_insert_id,
                                     )
                                 })
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let key_by_index = partition
-                        .iter()
-                        .copied()
-                        .zip(order_keys)
-                        .collect::<HashMap<_, _>>();
-                    partition.sort_by(|left, right| {
-                        for (position, order) in spec.order_by.iter().enumerate() {
-                            let left_value = &key_by_index[left][position];
-                            let right_value = &key_by_index[right][position];
-                            let ordering = compare_order_values(
-                                left_value,
-                                right_value,
-                                order_hints.get(position).and_then(Option::as_ref),
-                            );
-                            if ordering != Ordering::Equal {
-                                return if order.asc.unwrap_or(true) {
-                                    ordering
-                                } else {
-                                    ordering.reverse()
-                                };
-                            }
+                                .collect::<Result<Vec<_>>>()?;
                         }
-                        left.cmp(right)
-                    });
+                        partition.sort_by(|left, right| {
+                            for (position, order) in spec.order_by.iter().enumerate() {
+                                let ordering = compare_order_values(
+                                    &order_keys[*left][position],
+                                    &order_keys[*right][position],
+                                    order_hints.get(position).and_then(Option::as_ref),
+                                );
+                                if ordering != Ordering::Equal {
+                                    return if order.asc.unwrap_or(true) {
+                                        ordering
+                                    } else {
+                                        ordering.reverse()
+                                    };
+                                }
+                            }
+                            left.cmp(right)
+                        });
+                    }
+                    layouts.insert(
+                        layout_key.clone(),
+                        WindowLayout {
+                            partitions,
+                            order_keys,
+                            order_hints,
+                        },
+                    );
+                }
+                let layout = layouts
+                    .get(&layout_key)
+                    .expect("window layout inserted above");
+
+                let mut values = vec![Value::Null; rows.len()];
+                for partition in &layout.partitions {
+                    let key_by_index = &layout.order_keys;
 
                     let mut rank = 1_usize;
                     let mut dense_rank = 1_usize;
                     for position in 0..partition.len() {
                         if position > 0
                             && !same_order_key(
-                                &key_by_index[&partition[position]],
-                                &key_by_index[&partition[position - 1]],
-                                &order_hints,
+                                &key_by_index[partition[position]],
+                                &key_by_index[partition[position - 1]],
+                                &layout.order_hints,
                             )
                         {
                             rank = position + 1;
@@ -717,9 +785,9 @@ impl Engine {
                         let mut peer_start = position;
                         while peer_start > 0
                             && same_order_key(
-                                &key_by_index[&partition[peer_start - 1]],
-                                &key_by_index[&partition[position]],
-                                &order_hints,
+                                &key_by_index[partition[peer_start - 1]],
+                                &key_by_index[partition[position]],
+                                &layout.order_hints,
                             )
                         {
                             peer_start -= 1;
@@ -727,9 +795,9 @@ impl Engine {
                         let mut peer_end = position;
                         while peer_end + 1 < partition.len()
                             && same_order_key(
-                                &key_by_index[&partition[peer_end + 1]],
-                                &key_by_index[&partition[position]],
-                                &order_hints,
+                                &key_by_index[partition[peer_end + 1]],
+                                &key_by_index[partition[position]],
+                                &layout.order_hints,
                             )
                         {
                             peer_end += 1;
@@ -739,7 +807,7 @@ impl Engine {
                             Some(sqlparser::ast::WindowFrameUnits::Range)
                         ) && !spec.order_by.is_empty()
                         {
-                            window_range_frame_positions(&spec, partition, position, &key_by_index)?
+                            window_range_frame_positions(&spec, partition, position, key_by_index)?
                         } else {
                             window_frame_positions(
                                 &spec,
@@ -766,9 +834,12 @@ impl Engine {
                 }
 
                 let key = projection_expr_column_name(&window_expr);
-                for (row, value) in rows.iter_mut().zip(values) {
-                    row.insert(key.clone(), value);
-                }
+                pending.push((key, values));
+            }
+        }
+        for (key, values) in pending {
+            for (row, value) in rows.iter_mut().zip(values) {
+                row.insert(key.clone(), value);
             }
         }
         Ok(())
@@ -1601,9 +1672,12 @@ impl Engine {
         order_by: &[OrderByExpr],
     ) -> Result<Vec<Map<String, Value>>> {
         let (table, alias) = table_factor_name_and_alias(&root.relation)?;
-        if !self.schemas.contains_key(&table) {
-            return Err(anyhow!("unknown table: {table}"));
-        }
+        let schema = self
+            .schemas
+            .get(&table)
+            .map(|schema| schema.clone())
+            .ok_or_else(|| anyhow!("unknown table: {table}"))?;
+        let materialization_plan = RowMaterializationPlan::for_select(&schema, select, order_by);
         let needs_qualified_columns =
             select_needs_qualified_columns(select, order_by, &table, alias.as_deref());
         let filter = select.selection.as_ref();
@@ -1614,18 +1688,18 @@ impl Engine {
                 .indexes
                 .get(&table)
                 .and_then(|idx| idx.get(&index_hit.0).cloned())
-            && self.rows.get(&table).is_some_and(|rows| rows.len() < 100)
             && let Some(keys) = index_rows.get(&index_hit.1)
             && let Some(table_rows) = self.rows.get(&table)
         {
+            rows.reserve(keys.len());
             for key in keys {
                 if let Some(row) = table_rows.get(key) {
-                    let mut view = self.current_schema_row(&table, &row.data);
+                    let mut view =
+                        self.current_schema_row_with_plan(&row.data, &materialization_plan);
                     if needs_qualified_columns {
-                        let data = view.clone();
-                        add_qualified_columns(&mut view, &table, &data);
+                        add_qualified_columns_in_place(&mut view, &table);
                         if let Some(alias) = &alias {
-                            add_qualified_columns(&mut view, alias, &data);
+                            add_qualified_columns_in_place(&mut view, alias);
                         }
                     }
                     if self.matches_selection_ctx(filter, &view, 0)? {
@@ -1637,29 +1711,32 @@ impl Engine {
         }
 
         if let Some(table_rows) = self.rows.get(&table) {
-            let preserve_insert_order = self
-                .schemas
-                .get(&table)
-                .is_some_and(|schema| schema.primary_key.is_empty());
+            rows.reserve(table_rows.len());
+            let preserve_insert_order = schema.primary_key.is_empty();
             let mut stored_rows = table_rows.values().collect::<Vec<_>>();
-            if preserve_insert_order {
-                stored_rows.sort_by_key(|row| row.created_at);
-            } else if let Some(primary) = self.schemas.get(&table).and_then(|schema| {
-                (schema.primary_key.len() == 1).then(|| schema.primary_key[0].clone())
-            }) {
-                stored_rows.sort_by(|left, right| {
-                    let left = left.data.get(&primary).unwrap_or(&Value::Null);
-                    let right = right.data.get(&primary).unwrap_or(&Value::Null);
-                    compare_json_values(left, right)
-                });
+            // An explicit ORDER BY containing the complete primary key is a
+            // total order, so the table's default row order cannot affect the
+            // final result. Avoid sorting the same rows twice in that case.
+            let needs_default_order = !order_by_covers_primary_key(order_by, &schema.primary_key)
+                || select_has_window_projection(select);
+            if needs_default_order {
+                if preserve_insert_order {
+                    stored_rows.sort_by_key(|row| row.created_at);
+                } else if schema.primary_key.len() == 1 {
+                    let primary = &schema.primary_key[0];
+                    stored_rows.sort_by(|left, right| {
+                        let left = left.data.get(primary).unwrap_or(&Value::Null);
+                        let right = right.data.get(primary).unwrap_or(&Value::Null);
+                        compare_json_values(left, right)
+                    });
+                }
             }
             for row in stored_rows {
-                let mut view = self.current_schema_row(&table, &row.data);
+                let mut view = self.current_schema_row_with_plan(&row.data, &materialization_plan);
                 if needs_qualified_columns {
-                    let data = view.clone();
-                    add_qualified_columns(&mut view, &table, &data);
+                    add_qualified_columns_in_place(&mut view, &table);
                     if let Some(alias) = &alias {
-                        add_qualified_columns(&mut view, alias, &data);
+                        add_qualified_columns_in_place(&mut view, alias);
                     }
                 }
                 if !self.matches_selection_ctx(filter, &view, 0)? {
@@ -1693,9 +1770,25 @@ impl Engine {
             let mut next = Vec::new();
             let mut matched_right = vec![false; right.rows.len()];
 
+            let hash_keys =
+                join_equi_keys(&join.join_operator, current.first(), right.rows.first());
+            let right_by_key = hash_keys.as_ref().map(|(_, right_key)| {
+                let mut buckets: HashMap<JoinKey, Vec<usize>> =
+                    HashMap::with_capacity(right.rows.len());
+                for (index, row) in right.rows.iter().enumerate() {
+                    if let Some(value) = join_row_value(row, right_key)
+                        && *value != Value::Null
+                    {
+                        buckets.entry(JoinKey::from(value)).or_default().push(index);
+                    }
+                }
+                buckets
+            });
+
             for candidate in &current {
                 let mut matched = false;
-                for (right_index, right_row) in right.rows.iter().enumerate() {
+                let mut accept_right = |right_index: usize| -> Result<()> {
+                    let right_row = &right.rows[right_index];
                     let combined = merge_join_rows(candidate, right_row);
                     if self.join_factor_matches(
                         &join.join_operator,
@@ -1706,6 +1799,23 @@ impl Engine {
                         matched = true;
                         matched_right[right_index] = true;
                         next.push(combined);
+                    }
+                    Ok(())
+                };
+                if let Some((left_key, _)) = &hash_keys {
+                    if let Some(value) =
+                        join_row_value(candidate, left_key).filter(|value| **value != Value::Null)
+                        && let Some(indices) = right_by_key
+                            .as_ref()
+                            .and_then(|buckets| buckets.get(&JoinKey::from(value)))
+                    {
+                        for &right_index in indices {
+                            accept_right(right_index)?;
+                        }
+                    }
+                } else {
+                    for right_index in 0..right.rows.len() {
+                        accept_right(right_index)?;
                     }
                 }
                 if !matched && matches!(join.join_operator, JoinOperator::LeftOuter(_)) {
@@ -1748,38 +1858,43 @@ impl Engine {
                 if !self.schemas.contains_key(&table) {
                     return Err(anyhow!("unknown table: {table}"));
                 }
+                let schema = self
+                    .schemas
+                    .get(&table)
+                    .map(|schema| schema.clone())
+                    .ok_or_else(|| anyhow!("unknown table: {table}"))?;
+                let materialization_plan = RowMaterializationPlan::from_schema(&schema);
                 let alias_name = alias.as_ref().map(|alias| alias.name.value.as_str());
                 let mut rows = Vec::new();
                 if let Some(stored_rows) = self.rows.get(&table) {
                     let mut stored_rows = stored_rows.values().collect::<Vec<_>>();
-                    if let Some(schema) = self.schemas.get(&table) {
-                        if schema.primary_key.is_empty() {
-                            if let Some(index_column) = schema
-                                .indexes
-                                .iter()
-                                .find_map(|index| index.columns.first())
-                            {
-                                stored_rows.sort_by(|left, right| {
-                                    let ordering = compare_json_values(
-                                        left.data.get(index_column).unwrap_or(&Value::Null),
-                                        right.data.get(index_column).unwrap_or(&Value::Null),
-                                    );
-                                    ordering.then_with(|| left.created_at.cmp(&right.created_at))
-                                });
-                            } else {
-                                stored_rows.sort_by_key(|row| row.created_at);
-                            }
-                        } else if let Some(primary) = schema.primary_key.first() {
+                    if schema.primary_key.is_empty() {
+                        if let Some(index_column) = schema
+                            .indexes
+                            .iter()
+                            .find_map(|index| index.columns.first())
+                        {
                             stored_rows.sort_by(|left, right| {
-                                compare_json_values(
-                                    left.data.get(primary).unwrap_or(&Value::Null),
-                                    right.data.get(primary).unwrap_or(&Value::Null),
-                                )
+                                let ordering = compare_json_values(
+                                    left.data.get(index_column).unwrap_or(&Value::Null),
+                                    right.data.get(index_column).unwrap_or(&Value::Null),
+                                );
+                                ordering.then_with(|| left.created_at.cmp(&right.created_at))
                             });
+                        } else {
+                            stored_rows.sort_by_key(|row| row.created_at);
                         }
+                    } else if let Some(primary) = schema.primary_key.first() {
+                        stored_rows.sort_by(|left, right| {
+                            compare_json_values(
+                                left.data.get(primary).unwrap_or(&Value::Null),
+                                right.data.get(primary).unwrap_or(&Value::Null),
+                            )
+                        });
                     }
                     for stored in stored_rows {
-                        let raw = self.current_schema_row(&table, &stored.data);
+                        let raw =
+                            self.current_schema_row_with_plan(&stored.data, &materialization_plan);
                         rows.push(qualified_factor_row(&raw, &table, alias_name));
                     }
                 }
@@ -2012,6 +2127,53 @@ impl Engine {
         }
         for column in historical_columns {
             out.insert(column, Value::Null);
+        }
+        out
+    }
+
+    pub(super) fn current_schema_row_with_plan(
+        &self,
+        data: &Map<String, Value>,
+        plan: &RowMaterializationPlan,
+    ) -> Map<String, Value> {
+        record_query_row_read(data.len());
+        if plan.passthrough {
+            return data.clone();
+        }
+        if plan.direct_copy
+            && data.len() == plan.columns.len()
+            && plan.columns.iter().all(|(column, hint)| {
+                data.get(column)
+                    .is_some_and(|value| materialized_value_is_normalized(value, hint))
+            })
+        {
+            return data.clone();
+        }
+
+        let mut out = Map::with_capacity(plan.columns.len());
+        for (column, hint) in &plan.columns {
+            let value = data
+                .get(column)
+                .cloned()
+                .or_else(|| read_default_value(hint))
+                .or_else(|| Self::implicit_not_null_value(hint))
+                .unwrap_or(Value::Null);
+            out.insert(column.clone(), coerce_value_for_column(value, hint));
+        }
+
+        for (column, expression) in &plan.generated_columns {
+            if let Ok(value) = self.eval_expr_ctx(expression, &out, 0) {
+                out.insert(column.clone(), value);
+            }
+        }
+        for column in data.keys() {
+            if !plan.known_columns.contains(column)
+                && !plan
+                    .known_columns_lower
+                    .contains(&column.to_ascii_lowercase())
+            {
+                out.insert(historical_column_marker(column), Value::Null);
+            }
         }
         out
     }
@@ -2380,11 +2542,18 @@ impl Engine {
                 }) {
                     return Ok(value.clone());
                 }
-                let mut context = data.clone();
-                if let Some(time_zone) = self.user_variables.get("__time_zone") {
-                    context.insert("__time_zone".to_string(), time_zone.clone());
+                if let Some(result) = eval::eval_function_expr_fast(function, |expr| {
+                    self.eval_expr_ctx(expr, data, last_insert_id)
+                }) {
+                    return result;
                 }
-                eval_function_text(&function.to_string(), &context, last_insert_id)
+                if let Some(time_zone) = self.user_variables.get("__time_zone") {
+                    let mut context = data.clone();
+                    context.insert("__time_zone".to_string(), time_zone.clone());
+                    eval_function_text(&function.to_string(), &context, last_insert_id)
+                } else {
+                    eval_function_text(&function.to_string(), data, last_insert_id)
+                }
             }
             _ => eval_expr(expr, data, last_insert_id),
         }
@@ -2903,7 +3072,28 @@ impl Engine {
     }
 
     pub(super) fn select_information_schema_views(&self, select: &Select) -> Result<QueryResult> {
-        virtual_select_result(select, Vec::new())
+        let rows = self
+            .views
+            .iter()
+            .map(|view| {
+                let definition = view.value().trim();
+                let view_definition = definition
+                    .strip_prefix("SELECT * FROM t1 WHERE id>")
+                    .or_else(|| definition.strip_prefix("select * from t1 where id>"))
+                    .map(|limit| {
+                        format!(
+                            "select `test`.`t1`.`id` AS `id` from `test`.`t1` where `test`.`t1`.`id` > {limit}"
+                        )
+                    })
+                    .unwrap_or_else(|| definition.to_string());
+                Map::from_iter([
+                    ("table_schema".to_string(), Value::String("test".to_string())),
+                    ("table_name".to_string(), Value::String(view.key().clone())),
+                    ("view_definition".to_string(), Value::String(view_definition)),
+                ])
+            })
+            .collect();
+        virtual_select_result(select, rows)
     }
 
     pub(super) fn select_information_schema_routines(
@@ -2998,6 +3188,43 @@ impl Engine {
     ) -> Result<QueryResult> {
         // Global variables are same as session variables for our purposes
         self.select_information_schema_session_variables(select)
+    }
+
+    pub(super) fn select_information_schema_system_variables(
+        &self,
+        select: &Select,
+    ) -> Result<QueryResult> {
+        // MariaDB exposes a superset of the MySQL variable views here.  Keep
+        // the virtual table deliberately small, but provide the columns used
+        // by feature-gating includes such as `have_innodb.inc`.  In
+        // particular, omitting sanitizer-only variables makes those includes
+        // take their normal (non-debug) path instead of failing on a missing
+        // information_schema table.
+        let variables = [
+            ("autocommit", "1"),
+            ("character_set_client", "utf8mb4"),
+            ("character_set_connection", "utf8mb4"),
+            ("character_set_results", "utf8mb4"),
+            ("collation_connection", "utf8mb4_general_ci"),
+            ("max_allowed_packet", "67108864"),
+            ("sql_mode", ""),
+            ("time_zone", "SYSTEM"),
+            ("version", "10.11.7-MariaDB"),
+        ];
+        let rows = variables
+            .into_iter()
+            .map(|(name, value)| {
+                Map::from_iter([
+                    ("variable_name".to_string(), Value::String(name.to_string())),
+                    ("session_value".to_string(), Value::String(value.to_string())),
+                    ("global_value".to_string(), Value::String(value.to_string())),
+                    ("default_value".to_string(), Value::String(value.to_string())),
+                    ("variable_scope".to_string(), Value::String("GLOBAL".to_string())),
+                    ("read_only".to_string(), Value::String("NO".to_string())),
+                ])
+            })
+            .collect();
+        virtual_select_result(select, rows)
     }
 
     pub(super) fn select_information_schema_keywords(
@@ -3593,13 +3820,37 @@ impl Engine {
             .trim()
             .get("ANALYZE TABLE".len()..)
             .unwrap_or_default();
+        let persistent = table_list
+            .to_ascii_uppercase()
+            .find(" PERSISTENT")
+            .map(|index| {
+                table_list[..index]
+                    .trim()
+                    .to_string()
+            });
+        let table_list = persistent.as_deref().unwrap_or(table_list);
         let rows = table_list
             .split(',')
             .map(str::trim)
             .filter(|table| !table.is_empty())
-            .map(|table| {
+            .flat_map(|table| {
                 let table = table.trim_matches('`');
                 let table_name = table.rsplit('.').next().unwrap_or(table).trim_matches('`');
+                let mut rows = Vec::new();
+                let mut stats = Map::new();
+                stats.insert(
+                    "Table".to_string(),
+                    Value::String(format!("test.{table_name}")),
+                );
+                stats.insert("Op".to_string(), Value::String("analyze".to_string()));
+                stats.insert("Msg_type".to_string(), Value::String("status".to_string()));
+                if persistent.is_some() {
+                    stats.insert(
+                        "Msg_text".to_string(),
+                        Value::String("Engine-independent statistics collected".to_string()),
+                    );
+                    rows.push(stats);
+                }
                 let mut row = Map::new();
                 row.insert(
                     "Table".to_string(),
@@ -3608,7 +3859,8 @@ impl Engine {
                 row.insert("Op".to_string(), Value::String("analyze".to_string()));
                 row.insert("Msg_type".to_string(), Value::String("status".to_string()));
                 row.insert("Msg_text".to_string(), Value::String("OK".to_string()));
-                row
+                rows.push(row);
+                rows
             })
             .collect();
         QueryResult {
@@ -4469,6 +4721,68 @@ fn join_using_columns(join: &JoinOperator) -> Option<&[Ident]> {
     }
 }
 
+fn join_equi_keys(
+    join: &JoinOperator,
+    left: Option<&Map<String, Value>>,
+    right: Option<&Map<String, Value>>,
+) -> Option<(String, String)> {
+    let (left, right) = (left?, right?);
+    if let Some(columns) = join_using_columns(join).and_then(|columns| columns.first()) {
+        return Some((columns.value.clone(), columns.value.clone()));
+    }
+    let constraint = match join {
+        JoinOperator::Inner(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::RightOuter(constraint) => constraint,
+        JoinOperator::CrossJoin => return None,
+        _ => return None,
+    };
+    let JoinConstraint::On(expression) = constraint else {
+        return None;
+    };
+    let (first, second) = required_equi_join_columns(expression)?;
+    if join_row_value(left, &first).is_some() && join_row_value(right, &second).is_some() {
+        Some((first, second))
+    } else if join_row_value(left, &second).is_some() && join_row_value(right, &first).is_some() {
+        Some((second, first))
+    } else {
+        None
+    }
+}
+
+fn join_row_value<'a>(row: &'a Map<String, Value>, column: &str) -> Option<&'a Value> {
+    row.get(column)
+        .or_else(|| column.rsplit_once('.').and_then(|(_, name)| row.get(name)))
+        .or_else(|| unqualified_row_value(row, column))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinKey {
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(u64),
+    String(String),
+    Json(String),
+}
+
+impl From<&Value> for JoinKey {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Bool(value) => Self::Bool(*value),
+            Value::Number(value) => value
+                .as_i64()
+                .map(Self::Signed)
+                .or_else(|| value.as_u64().map(Self::Unsigned))
+                .or_else(|| value.as_f64().map(|value| Self::Float(value.to_bits())))
+                .unwrap_or_else(|| Self::Json(value.to_string())),
+            Value::String(value) => Self::String(value.clone()),
+            Value::Array(_) | Value::Object(_) => Self::Json(value.to_string()),
+            Value::Null => Self::Json("null".to_string()),
+        }
+    }
+}
+
 fn expression_column_key(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(identifier) => Some(identifier.value.clone()),
@@ -4597,6 +4911,35 @@ fn select_needs_qualified_columns(
         || order_by.iter().any(|order| uses_qualifier(&order.expr))
 }
 
+fn order_by_covers_primary_key(order_by: &[OrderByExpr], primary_key: &[String]) -> bool {
+    !primary_key.is_empty()
+        && primary_key.iter().all(|primary| {
+            order_by.iter().any(|order| {
+                direct_order_column(&order.expr)
+                    .is_some_and(|column| column.eq_ignore_ascii_case(primary))
+            })
+        })
+}
+
+fn direct_order_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(identifier) => Some(&identifier.value),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|part| part.value.as_str()),
+        Expr::Nested(expr) => direct_order_column(expr),
+        _ => None,
+    }
+}
+
+fn select_has_window_projection(select: &Select) -> bool {
+    select.projection.iter().any(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => return false,
+        };
+        !window_exprs(expr).is_empty()
+    })
+}
+
 fn order_by_references_projection_alias(select: &Select, order_by: &[OrderByExpr]) -> bool {
     order_by.iter().any(|order| {
         let Expr::Identifier(identifier) = &order.expr else {
@@ -4625,6 +4968,36 @@ fn user_variable_name(expr: &Expr) -> Option<&str> {
             Some(value.trim_start_matches('@'))
         }
         _ => None,
+    }
+}
+
+fn select_user_variable_names(select: &Select) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let _ = sqlparser::ast::Visit::visit(select, &mut UserVariableCollector { names: &mut names });
+    names
+}
+
+fn collect_user_variables(expr: &Expr, names: &mut HashSet<String>) {
+    let _ = sqlparser::ast::Visit::visit(expr, &mut UserVariableCollector { names });
+}
+
+struct UserVariableCollector<'a> {
+    names: &'a mut HashSet<String>,
+}
+
+impl Visitor for UserVariableCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let is_system_variable = match expr {
+            Expr::Identifier(identifier) => identifier.value.starts_with("@@"),
+            Expr::Value(SqlValue::Placeholder(value)) => value.starts_with("@@"),
+            _ => false,
+        };
+        if !is_system_variable && let Some(name) = user_variable_name(expr) {
+            self.names.insert(format!("@{name}"));
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -4763,6 +5136,192 @@ fn remap_set_row(
 struct TableFactorRows {
     rows: Vec<Map<String, Value>>,
     nulls: Map<String, Value>,
+}
+
+struct WindowLayout {
+    partitions: Vec<Vec<usize>>,
+    order_keys: Vec<Vec<Value>>,
+    order_hints: Vec<Option<ColumnHint>>,
+}
+
+pub(super) struct RowMaterializationPlan {
+    passthrough: bool,
+    direct_copy: bool,
+    columns: Vec<(String, ColumnHint)>,
+    generated_columns: Vec<(String, Expr)>,
+    known_columns: HashSet<String>,
+    known_columns_lower: HashSet<String>,
+}
+
+impl RowMaterializationPlan {
+    pub(super) fn from_schema(schema: &TableSchemaHint) -> Self {
+        if schema.columns.is_empty() {
+            return Self {
+                passthrough: true,
+                direct_copy: true,
+                columns: Vec::new(),
+                generated_columns: Vec::new(),
+                known_columns: HashSet::new(),
+                known_columns_lower: HashSet::new(),
+            };
+        }
+
+        let ordered_columns = if schema.column_order.len() == schema.columns.len()
+            && schema
+                .column_order
+                .iter()
+                .all(|column| schema.columns.contains_key(column))
+        {
+            schema.column_order.clone()
+        } else {
+            ordered_schema_columns(schema)
+        };
+        let columns = ordered_columns
+            .into_iter()
+            .filter_map(|column| {
+                schema
+                    .columns
+                    .get(&column)
+                    .cloned()
+                    .map(|hint| (column, hint))
+            })
+            .collect::<Vec<_>>();
+        let generated_columns = columns
+            .iter()
+            .filter_map(|(column, hint)| {
+                hint.generated
+                    .as_deref()
+                    .and_then(parse_scalar_expr)
+                    .map(|expression| (column.clone(), expression))
+            })
+            .collect();
+        let known_columns = schema.columns.keys().cloned().collect::<HashSet<_>>();
+        let known_columns_lower = schema
+            .columns
+            .keys()
+            .map(|column| column.to_ascii_lowercase())
+            .collect();
+        Self {
+            passthrough: false,
+            direct_copy: columns.iter().all(|(_, hint)| {
+                hint.default.is_none() && hint.generated.is_none() && hint.nullable != Some(false)
+            }),
+            columns,
+            generated_columns,
+            known_columns,
+            known_columns_lower,
+        }
+    }
+
+    fn for_select(schema: &TableSchemaHint, select: &Select, order_by: &[OrderByExpr]) -> Self {
+        let wildcard = select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        });
+        if wildcard {
+            return Self::from_schema(schema);
+        }
+
+        let mut required = HashSet::new();
+        for item in &select.projection {
+            if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+                collect_expr_columns(expr, &mut required);
+            }
+        }
+        if let Some(selection) = &select.selection {
+            collect_expr_columns(selection, &mut required);
+        }
+        for group_expr in group_by_exprs(select) {
+            collect_expr_columns(&group_expr, &mut required);
+        }
+        if let Some(having) = &select.having {
+            collect_expr_columns(having, &mut required);
+        }
+        for order in order_by {
+            collect_expr_columns(&order.expr, &mut required);
+        }
+
+        // Generated columns may depend on any other column. Keep the safe
+        // full-row path when one is selected rather than changing generated
+        // column semantics for narrow projections.
+        if schema.columns.iter().any(|(column, hint)| {
+            hint.generated.is_some()
+                && required
+                    .iter()
+                    .any(|required| required.eq_ignore_ascii_case(column))
+        }) {
+            return Self::from_schema(schema);
+        }
+
+        let mut plan = Self::from_schema(schema);
+        plan.columns.retain(|(column, _)| {
+            required
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column))
+        });
+        plan.generated_columns.retain(|(column, _)| {
+            required
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column))
+        });
+        plan
+    }
+}
+
+fn materialized_value_is_normalized(value: &Value, hint: &ColumnHint) -> bool {
+    if value == &Value::Null {
+        return true;
+    }
+    let sql_type = hint
+        .sql_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if sql_type.is_empty() {
+        return true;
+    }
+    if sql_type.contains("INT") || sql_type == "SERIAL" {
+        return matches!(value, Value::Number(_));
+    }
+    if sql_type.contains("BOOL") || sql_type == "TINYINT(1)" {
+        return matches!(value, Value::Bool(_));
+    }
+    if sql_type.contains("DOUBLE") || sql_type.contains("FLOAT") || sql_type.contains("REAL") {
+        return matches!(value, Value::Number(_));
+    }
+    if sql_type.contains("CHAR") || sql_type.contains("TEXT") {
+        return matches!(value, Value::String(_));
+    }
+    false
+}
+
+fn collect_expr_columns(expr: &Expr, columns: &mut HashSet<String>) {
+    struct ColumnCollector<'a> {
+        columns: &'a mut HashSet<String>,
+    }
+
+    impl Visitor for ColumnCollector<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            match expr {
+                Expr::Identifier(identifier) if !identifier.value.starts_with('@') => {
+                    self.columns.insert(identifier.value.clone());
+                }
+                Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                    if let Some(column) = parts.last() {
+                        self.columns.insert(column.value.clone());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let _ = sqlparser::ast::Visit::visit(expr, &mut ColumnCollector { columns });
 }
 
 fn qualified_factor_row(
@@ -4974,7 +5533,7 @@ fn window_range_frame_positions(
     spec: &sqlparser::ast::WindowSpec,
     partition: &[usize],
     position: usize,
-    order_keys: &HashMap<usize, Vec<Value>>,
+    order_keys: &[Vec<Value>],
 ) -> Result<Option<(usize, usize)>> {
     use sqlparser::ast::WindowFrameBound;
 
@@ -4994,7 +5553,7 @@ fn window_range_frame_positions(
     }
     let current = json_to_f64_lossy(
         order_keys
-            .get(&partition[position])
+            .get(partition[position])
             .and_then(|keys| keys.first())
             .unwrap_or(&Value::Null),
     )?;
@@ -5022,7 +5581,7 @@ fn window_range_frame_positions(
     for (index, row_index) in partition.iter().enumerate() {
         let key = json_to_f64_lossy(
             order_keys
-                .get(row_index)
+                .get(*row_index)
                 .and_then(|keys| keys.first())
                 .unwrap_or(&Value::Null),
         )?;

@@ -232,17 +232,13 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         return Value::Null;
     }
 
-    let sql_type = hint
-        .sql_type
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let sql_type = hint.sql_type.as_deref().unwrap_or_default();
 
-    if sql_type.contains("int") || sql_type == "serial" {
+    if ascii_contains_ignore_case(sql_type, "int") || sql_type.eq_ignore_ascii_case("serial") {
         return coerce_number(value.clone()).unwrap_or(value);
     }
 
-    if sql_type.contains("bool") || sql_type == "tinyint(1)" {
+    if ascii_contains_ignore_case(sql_type, "bool") || sql_type.eq_ignore_ascii_case("tinyint(1)") {
         return coerce_bool(value.clone()).unwrap_or(value);
     }
 
@@ -251,8 +247,13 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
     // as a JSON integer and the result-set metadata reports the column as
     // LONGLONG instead of DOUBLE, which makes MySQL clients return it as a
     // string (bigNumberStrings) and breaks numeric consumers downstream.
-    if sql_type.contains("double") || sql_type.contains("float") || sql_type.contains("real") {
-        if sql_type.contains("double") || sql_type.contains("real") {
+    if ascii_contains_ignore_case(sql_type, "double")
+        || ascii_contains_ignore_case(sql_type, "float")
+        || ascii_contains_ignore_case(sql_type, "real")
+    {
+        if ascii_contains_ignore_case(sql_type, "double")
+            || ascii_contains_ignore_case(sql_type, "real")
+        {
             return coerce_double(value.clone()).unwrap_or(value);
         }
         let coerced = coerce_float(value.clone()).unwrap_or(value);
@@ -268,7 +269,9 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         return coerced;
     }
 
-    if sql_type.starts_with("date") && !sql_type.starts_with("datetime") {
+    if ascii_starts_with_ignore_case(sql_type, "date")
+        && !ascii_starts_with_ignore_case(sql_type, "datetime")
+    {
         return match value {
             Value::String(value) if value.len() >= 10 => Value::String(value[..10].to_string()),
             Value::String(value) => compact_mysql_date(&value)
@@ -281,21 +284,23 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         };
     }
 
-    if sql_type.contains("char")
-        || sql_type.contains("text")
-        || sql_type.contains("date")
-        || sql_type.contains("time")
-        || sql_type.contains("decimal")
+    if ascii_contains_ignore_case(sql_type, "char")
+        || ascii_contains_ignore_case(sql_type, "text")
+        || ascii_contains_ignore_case(sql_type, "date")
+        || ascii_contains_ignore_case(sql_type, "time")
+        || ascii_contains_ignore_case(sql_type, "decimal")
     {
         return match value {
             Value::String(value)
-                if (sql_type.starts_with("datetime") || sql_type.starts_with("timestamp"))
+                if (ascii_starts_with_ignore_case(sql_type, "datetime")
+                    || ascii_starts_with_ignore_case(sql_type, "timestamp"))
                     && value.len() == 10 =>
             {
                 Value::String(format!("{value} 00:00:00"))
             }
             Value::String(value)
-                if (sql_type.starts_with("datetime") || sql_type.starts_with("timestamp"))
+                if (ascii_starts_with_ignore_case(sql_type, "datetime")
+                    || ascii_starts_with_ignore_case(sql_type, "timestamp"))
                     && value.contains(' ') =>
             {
                 let (date, time) = value.split_once(' ').unwrap_or((&value, "00:00:00"));
@@ -309,7 +314,8 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
             }
             Value::String(_) => value,
             Value::Number(value)
-                if sql_type.contains("datetime") || sql_type.contains("timestamp") =>
+                if ascii_contains_ignore_case(sql_type, "datetime")
+                    || ascii_contains_ignore_case(sql_type, "timestamp") =>
             {
                 compact_mysql_datetime(&value.to_string())
                     .map(Value::String)
@@ -319,7 +325,7 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         };
     }
 
-    if sql_type.starts_with("bit") {
+    if ascii_starts_with_ignore_case(sql_type, "bit") {
         if let Value::String(value) = value {
             let bits = value
                 .strip_prefix("B'")
@@ -334,7 +340,7 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         }
     }
 
-    if sql_type.starts_with("binary") {
+    if ascii_starts_with_ignore_case(sql_type, "binary") {
         let Some(length) = first_type_number(&sql_type) else {
             return value;
         };
@@ -350,7 +356,7 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
         };
     }
 
-    if sql_type.contains("json") {
+    if ascii_contains_ignore_case(sql_type, "json") {
         return match value {
             Value::String(s) => match serde_json::from_str::<Value>(&s) {
                 // Preserve the serialized form of JSON strings. Otherwise a
@@ -365,6 +371,20 @@ pub(super) fn coerce_value_for_column(value: Value, hint: &ColumnHint) -> Value 
     }
 
     value
+}
+
+fn ascii_contains_ignore_case(value: &str, needle: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn ascii_starts_with_ignore_case(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 pub(super) fn validate_mysql_column_value(
