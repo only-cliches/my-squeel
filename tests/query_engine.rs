@@ -326,6 +326,40 @@ fn supports_last_insert_id_and_scalar_expressions() {
 }
 
 #[test]
+fn explicit_auto_increment_values_set_last_insert_id() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY AUTO_INCREMENT);")
+        .unwrap();
+    engine
+        .execute_sql(
+            "CREATE TABLE children (id BIGINT PRIMARY KEY AUTO_INCREMENT, parent_id BIGINT);",
+        )
+        .unwrap();
+
+    let parent = engine
+        .execute_sql("INSERT INTO parents (id) VALUES (1);")
+        .unwrap();
+    assert_eq!(parent[0].rows_affected, 1);
+    assert_eq!(parent[0].last_insert_id, 1);
+
+    let child = engine
+        .execute_sql("INSERT INTO children (id, parent_id) VALUES (1, 1);")
+        .unwrap();
+    assert_eq!(child[0].rows_affected, 1);
+    assert_eq!(child[0].last_insert_id, 1);
+
+    let last_insert_id = engine
+        .execute_sql("SELECT LAST_INSERT_ID() AS inserted")
+        .unwrap();
+    assert_eq!(
+        last_insert_id[0].rows[0].get("inserted").unwrap().as_u64(),
+        Some(1)
+    );
+}
+
+#[test]
 fn supports_returning_on_write_statements() {
     let _guard = test_lock();
     let engine = Engine::default();

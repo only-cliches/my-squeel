@@ -299,7 +299,14 @@ impl Engine {
             }
 
             let (row_id, generated_id) = self.resolve_row_id(table, &data)?;
-            let generated_insert_id = generated_id.then(|| value_to_u64(&row_id)).flatten();
+            let row_insert_id = if generated_id {
+                value_to_u64(&row_id)
+            } else {
+                auto_increment_column
+                    .as_deref()
+                    .and_then(|column| data.get(column))
+                    .and_then(value_to_u64)
+            };
             if !generated_id
                 && let Some(schema) = self.schemas.get(table).map(|schema| schema.clone())
                 && let Some(auto_column) = schema
@@ -448,7 +455,7 @@ impl Engine {
             pending_rows_written += 1;
             pending_cells_written += stored.data.len();
             if first_insert_id == 0 {
-                first_insert_id = generated_insert_id.unwrap_or(0);
+                first_insert_id = row_insert_id.unwrap_or(0);
             }
             returned_rows.push(stored.data.clone());
             rows_to_persist.insert(key, stored);
