@@ -1032,6 +1032,15 @@ impl Engine {
                 }
             }
             self.rows.insert(table_name.clone(), next_rows);
+            for key in &deleted_keys {
+                if let Some(row) = current_rows.get(key) {
+                    self.remove_row_from_indexes(&table_name, key, &row.data);
+                }
+            }
+            if self.storage.is_persistent() {
+                let deleted_keys = deleted_keys.iter().cloned().collect::<BTreeSet<_>>();
+                self.persist_row_batch(&table_name, &deleted_keys, &BTreeMap::new())?;
+            }
             let mut result = self.returning_result(
                 &table_name,
                 returning.as_deref(),
@@ -1042,16 +1051,6 @@ impl Engine {
             result.warnings.extend(warnings);
             return Ok(result);
         }
-        for key in &deleted_keys {
-            if let Some(row) = current_rows.get(key) {
-                self.remove_row_from_indexes(&table_name, key, &row.data);
-            }
-        }
-        if self.storage.is_persistent() {
-            let deleted_keys = deleted_keys.into_iter().collect::<BTreeSet<_>>();
-            self.persist_row_batch(&table_name, &deleted_keys, &BTreeMap::new())?;
-        }
-
         self.returning_result(&table_name, returning.as_deref(), returned_rows, deleted, 0)
     }
 
