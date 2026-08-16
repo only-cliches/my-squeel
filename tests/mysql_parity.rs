@@ -1,5 +1,7 @@
 mod common;
 
+use std::cell::RefCell;
+use std::fmt::Debug;
 use std::net::TcpListener;
 use std::thread;
 
@@ -9,6 +11,68 @@ use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, Row, Value as MyValue};
 
 use common::{MYSQL_DOCKER_DATABASE, mysql_compare_target};
+
+thread_local! {
+    static PARITY_MISMATCHES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+struct ParityMismatchCollector;
+
+impl ParityMismatchCollector {
+    fn new() -> Self {
+        PARITY_MISMATCHES.with(|mismatches| {
+            assert!(
+                mismatches.borrow_mut().replace(Vec::new()).is_none(),
+                "parity mismatch collector is already active"
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for ParityMismatchCollector {
+    fn drop(&mut self) {
+        let mismatches = PARITY_MISMATCHES.with(|mismatches| {
+            mismatches
+                .borrow_mut()
+                .take()
+                .expect("parity mismatch collector disappeared")
+        });
+        if mismatches.is_empty() {
+            return;
+        }
+
+        let report = format!(
+            "{} MySQL parity mismatch(es):\n\n{}",
+            mismatches.len(),
+            mismatches.join("\n\n")
+        );
+        if thread::panicking() {
+            eprintln!("{report}");
+        } else {
+            panic!("{report}");
+        }
+    }
+}
+
+fn assert_parity_eq<T: Debug + PartialEq>(actual: &T, expected: &T, context: &str) {
+    if actual == expected {
+        return;
+    }
+
+    let mismatch = format!("{context}\n  MySqweel: {actual:#?}\n  MySQL:    {expected:#?}");
+    let collected = PARITY_MISMATCHES.with(|mismatches| {
+        let mut mismatches = mismatches.borrow_mut();
+        let Some(mismatches) = mismatches.as_mut() else {
+            return false;
+        };
+        mismatches.push(mismatch.clone());
+        true
+    });
+    if !collected {
+        panic!("{mismatch}");
+    }
+}
 
 fn start_whatever_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local port");
@@ -84,7 +148,11 @@ fn exec_prepared_drop_with_stats<P: Into<mysql::Params>>(
 fn assert_query_parity(mysql: &mut mysql::PooledConn, whatever: &mut mysql::PooledConn, sql: &str) {
     let mysql_rows = fetch_rows(mysql, sql).expect("mysql select");
     let whatever_rows = fetch_rows(whatever, sql).expect("whatever select");
-    assert_eq!(whatever_rows, mysql_rows, "query mismatch: {sql}");
+    assert_parity_eq(
+        &whatever_rows,
+        &mysql_rows,
+        &format!("query mismatch: {sql}"),
+    );
 }
 
 fn assert_query_parity_unordered(
@@ -96,7 +164,11 @@ fn assert_query_parity_unordered(
     let mut whatever_rows = fetch_rows(whatever, sql).expect("whatever select");
     mysql_rows.sort();
     whatever_rows.sort();
-    assert_eq!(whatever_rows, mysql_rows, "query mismatch: {sql}");
+    assert_parity_eq(
+        &whatever_rows,
+        &mysql_rows,
+        &format!("query mismatch: {sql}"),
+    );
 }
 
 fn assert_show_index_parity(
@@ -115,19 +187,25 @@ fn assert_show_index_parity(
     }
     mysql_rows.sort();
     whatever_rows.sort();
-    assert_eq!(whatever_rows, mysql_rows, "query mismatch: {sql}");
+    assert_parity_eq(
+        &whatever_rows,
+        &mysql_rows,
+        &format!("query mismatch: {sql}"),
+    );
 }
 
 fn assert_exec_parity(mysql: &mut mysql::PooledConn, whatever: &mut mysql::PooledConn, sql: &str) {
     let mysql_stats = exec_drop_with_stats(mysql, sql).expect("mysql exec");
     let whatever_stats = exec_drop_with_stats(whatever, sql).expect("whatever exec");
-    assert_eq!(
-        whatever_stats.0, mysql_stats.0,
-        "rows_affected mismatch for: {sql}"
+    assert_parity_eq(
+        &whatever_stats.0,
+        &mysql_stats.0,
+        &format!("rows_affected mismatch for: {sql}"),
     );
-    assert_eq!(
-        whatever_stats.1, mysql_stats.1,
-        "last_insert_id mismatch for: {sql}"
+    assert_parity_eq(
+        &whatever_stats.1,
+        &mysql_stats.1,
+        &format!("last_insert_id mismatch for: {sql}"),
     );
 }
 
@@ -148,7 +226,11 @@ fn assert_prepared_query_parity<P: Into<mysql::Params> + Clone>(
 ) {
     let mysql_rows = fetch_prepared_rows(mysql, sql, params.clone()).expect("mysql prepared");
     let whatever_rows = fetch_prepared_rows(whatever, sql, params).expect("whatever prepared");
-    assert_eq!(whatever_rows, mysql_rows, "prepared query mismatch: {sql}");
+    assert_parity_eq(
+        &whatever_rows,
+        &mysql_rows,
+        &format!("prepared query mismatch: {sql}"),
+    );
 }
 
 fn assert_prepared_exec_parity<P: Into<mysql::Params> + Clone>(
@@ -161,19 +243,22 @@ fn assert_prepared_exec_parity<P: Into<mysql::Params> + Clone>(
         exec_prepared_drop_with_stats(mysql, sql, params.clone()).expect("mysql prepared exec");
     let whatever_stats =
         exec_prepared_drop_with_stats(whatever, sql, params).expect("whatever prepared exec");
-    assert_eq!(
-        whatever_stats.0, mysql_stats.0,
-        "prepared rows_affected mismatch for: {sql}"
+    assert_parity_eq(
+        &whatever_stats.0,
+        &mysql_stats.0,
+        &format!("prepared rows_affected mismatch for: {sql}"),
     );
-    assert_eq!(
-        whatever_stats.1, mysql_stats.1,
-        "prepared last_insert_id mismatch for: {sql}"
+    assert_parity_eq(
+        &whatever_stats.1,
+        &mysql_stats.1,
+        &format!("prepared last_insert_id mismatch for: {sql}"),
     );
 }
 
 #[test]
 fn sorting_and_compound_sorting_match_mysql_for_all_primitives() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let mysql_target = mysql_compare_target();
     let whatever_url = start_whatever_server();
     let whatever_pool = Pool::new(Opts::from_url(&whatever_url).expect("valid MySqweel URL"))
@@ -321,6 +406,7 @@ fn sorting_and_compound_sorting_match_mysql_for_all_primitives() {
 #[test]
 fn parity_with_mysql_for_supported_semantics() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -1053,6 +1139,7 @@ fn parity_with_mysql_for_supported_semantics() {
 #[test]
 fn parity_with_mysql_for_information_schema() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -1309,6 +1396,7 @@ fn recursive_ctes_return_mysql_rows() {
 #[test]
 fn parity_with_mysql_for_json_expressions() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -1477,6 +1565,7 @@ fn parity_with_mysql_for_json_expressions() {
 #[test]
 fn parity_with_mysql_for_json_collection_paths() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };
@@ -1581,6 +1670,7 @@ fn parity_with_mysql_for_json_collection_paths() {
 #[test]
 fn parity_with_mysql_for_conditional_expressions() {
     let _guard = common::test_lock();
+    let _mismatches = ParityMismatchCollector::new();
     let Some(mysql_target) = mysql_compare_target() else {
         return;
     };

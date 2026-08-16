@@ -31,6 +31,8 @@ All notable changes to MySqweel will be documented in this file.
 - Fixed persistent single-table deletes so removed rows, primary-key membership, and secondary indexes are updated in Lux storage before the engine is reopened.
 - Fixed `ALTER TABLE ... ADD COLUMN ... AUTO_INCREMENT` metadata so the new column remains visible in `information_schema.columns` and `key_column_usage`; parity helpers now also assert `last_insert_id` for write statements.
 - Fixed MySQL wire prepared-statement metadata probing so INSERT, UPDATE, and DELETE statements execute only once, during `COM_STMT_EXECUTE`, preserving auto-increment and affected-row semantics.
+- Matched MySQL's `ON DUPLICATE KEY UPDATE` insert-ID behavior by returning the existing row's auto-increment value when an update resolves a unique-key conflict.
+- Changed real-MySQL parity comparisons to collect value mismatches through the full scenario and report them together, instead of stopping at the first mismatch.
 
 ## 0.4.1 future
 

@@ -282,25 +282,35 @@ fn supports_last_insert_id_and_scalar_expressions() {
 
     engine
         .execute_sql(
-            "CREATE TABLE auto_users (id BIGINT PRIMARY KEY AUTO_INCREMENT, email TEXT UNIQUE);",
+            "CREATE TABLE auto_users (id BIGINT PRIMARY KEY AUTO_INCREMENT, email TEXT UNIQUE, name TEXT);",
         )
         .unwrap();
     engine
         .execute_sql(
-            "INSERT INTO auto_users (email) VALUES ('a@example.com'), ('b@example.com');",
+            "INSERT INTO auto_users (email, name) VALUES ('a@example.com', 'Alice'), ('b@example.com', 'Bob');",
         )
         .unwrap();
     engine
+        .execute_sql("INSERT IGNORE INTO auto_users (email) VALUES ('a@example.com');")
+        .unwrap();
+    let updated = engine
         .execute_sql(
-            "INSERT IGNORE INTO auto_users (email) VALUES ('a@example.com');",
+            "INSERT INTO auto_users (email, name) VALUES ('a@example.com', 'Updated') \
+             ON DUPLICATE KEY UPDATE name = VALUES(name);",
         )
         .unwrap();
-    engine
-        .execute_sql(
-            "INSERT INTO auto_users (email) VALUES ('a@example.com') \
-             ON DUPLICATE KEY UPDATE email = VALUES(email);",
-        )
+    assert_eq!(updated[0].rows_affected, 2);
+    assert_eq!(updated[0].last_insert_id, 1);
+    let duplicate_last_id = engine
+        .execute_sql("SELECT LAST_INSERT_ID() AS inserted")
         .unwrap();
+    assert_eq!(
+        duplicate_last_id[0].rows[0]
+            .get("inserted")
+            .unwrap()
+            .as_u64(),
+        Some(1)
+    );
     let replaced = engine
         .execute_sql("REPLACE INTO auto_users (email) VALUES ('a@example.com');")
         .unwrap();

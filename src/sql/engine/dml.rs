@@ -248,6 +248,12 @@ impl Engine {
     ) -> Result<QueryResult> {
         let single_row = rows.len() == 1;
         let unique_schema = self.schemas.get(table).map(|schema| schema.clone());
+        let auto_increment_column = unique_schema.as_ref().and_then(|schema| {
+            schema
+                .columns
+                .iter()
+                .find_map(|(column, hint)| hint.auto_increment.then_some(column.clone()))
+        });
         let mut unique_lookup = unique_schema
             .as_ref()
             .and_then(|schema| {
@@ -258,6 +264,7 @@ impl Engine {
             .unwrap_or_default();
         let mut affected = 0_u64;
         let mut first_insert_id = 0_u64;
+        let mut duplicate_update_id = 0_u64;
         let mut rows_to_persist: BTreeMap<String, StoredRow> = BTreeMap::new();
         let mut rows_to_delete: BTreeSet<String> = BTreeSet::new();
         let mut returned_rows = Vec::new();
@@ -351,6 +358,16 @@ impl Engine {
                     let existing = table_rows
                         .get_mut(conflict_key)
                         .ok_or_else(|| anyhow!("conflict row disappeared"))?;
+                    if duplicate_update_id == 0
+                        && let Some(auto_increment_column) = auto_increment_column.as_deref()
+                    {
+                        duplicate_update_id = existing
+                            .data
+                            .get(auto_increment_column)
+                            .and_then(value_to_u64)
+                            .or_else(|| value_to_u64(&existing.id))
+                            .unwrap_or(0);
+                    }
                     record_query_row_read(existing.data.len());
                     let original_data = existing.data.clone();
                     let mut existing_context = existing.data.clone();
@@ -442,9 +459,14 @@ impl Engine {
             self.persist_row_batch(table, &rows_to_delete, &rows_to_persist)?;
         }
         record_query_writes(pending_rows_written, pending_cells_written);
-        if first_insert_id != 0 {
+        let statement_insert_id = if first_insert_id != 0 {
+            first_insert_id
+        } else {
+            duplicate_update_id
+        };
+        if statement_insert_id != 0 {
             self.last_insert_id
-                .store(first_insert_id, AtomicOrdering::Relaxed);
+                .store(statement_insert_id, AtomicOrdering::Relaxed);
         }
 
         self.returning_result(
@@ -452,7 +474,7 @@ impl Engine {
             options.returning,
             returned_rows,
             affected,
-            first_insert_id,
+            statement_insert_id,
         )
     }
 
