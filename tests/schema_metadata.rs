@@ -1092,6 +1092,22 @@ fn information_schema_key_column_usage_handles_pk_added_via_alter_table() {
             .and_then(|v| v.as_u64()),
         Some(1)
     );
+
+    let columns = engine
+        .execute_sql(
+            "SELECT column_name, ordinal_position, column_key, extra \
+             FROM information_schema.columns \
+             WHERE table_name = 'late_pk' ORDER BY ordinal_position",
+        )
+        .unwrap();
+    assert_eq!(columns[0].rows.len(), 2);
+    let id = columns[0]
+        .rows
+        .iter()
+        .find(|row| row.get("column_name").and_then(|v| v.as_str()) == Some("id"))
+        .expect("ALTER-added PK should appear in information_schema.columns");
+    assert_eq!(id.get("column_key").and_then(|v| v.as_str()), Some("PRI"));
+    assert_eq!(id.get("extra").and_then(|v| v.as_str()), Some("auto_increment"));
 }
 
 #[test]

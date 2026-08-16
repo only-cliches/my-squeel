@@ -18,6 +18,7 @@ All notable changes to MySqweel will be documented in this file.
 ### Tests
 
 - Added regression coverage for exact ordered pagination, total primary-key ordering, applying `DISTINCT` before bounded ordering, direct-parser eligibility, and schema-drift row materialization.
+- Added regression coverage for ALTER-added auto-increment metadata and `LAST_INSERT_ID()` across ignored inserts, upserts, and `REPLACE`.
 
 ### Compatibility and CI
 
@@ -28,6 +29,7 @@ All notable changes to MySqweel will be documented in this file.
 - Refined MariaDB compatibility for foreign-key-aware `DELETE IGNORE` warnings and row skipping, supported `MATCH FULL`/`MATCH PARTIAL` clauses, affected-row reporting, and `LIMIT 0` metadata queries against system tables.
 - Recorded the exhaustive audit as non-gating: 31 candidates pass, while 277 fail and 140 encounter infrastructure failures; unsupported or infrastructure-bound cases remain outside the strict promotion gate.
 - Fixed persistent single-table deletes so removed rows, primary-key membership, and secondary indexes are updated in Lux storage before the engine is reopened.
+- Fixed `ALTER TABLE ... ADD COLUMN ... AUTO_INCREMENT` metadata so the new column remains visible in `information_schema.columns` and `key_column_usage`; parity helpers now also assert `last_insert_id` for write statements.
 
 ## 0.4.1 future
 

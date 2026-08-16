@@ -125,6 +125,10 @@ fn assert_exec_parity(mysql: &mut mysql::PooledConn, whatever: &mut mysql::Poole
         whatever_stats.0, mysql_stats.0,
         "rows_affected mismatch for: {sql}"
     );
+    assert_eq!(
+        whatever_stats.1, mysql_stats.1,
+        "last_insert_id mismatch for: {sql}"
+    );
 }
 
 fn assert_exec_succeeds(
@@ -160,6 +164,10 @@ fn assert_prepared_exec_parity<P: Into<mysql::Params> + Clone>(
     assert_eq!(
         whatever_stats.0, mysql_stats.0,
         "prepared rows_affected mismatch for: {sql}"
+    );
+    assert_eq!(
+        whatever_stats.1, mysql_stats.1,
+        "prepared last_insert_id mismatch for: {sql}"
     );
 }
 

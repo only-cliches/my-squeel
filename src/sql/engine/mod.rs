@@ -1709,7 +1709,7 @@ impl Engine {
                 return Ok(Some(results.drain(..).next().unwrap_or_default()));
             }
         }
-        if upper.starts_with("ALTER TABLE") && upper.contains("AUTO_INCREMENT") {
+        if is_table_level_auto_increment_assignment(trimmed) {
             // Lowering AUTO_INCREMENT below the current maximum is a no-op in
             // MariaDB; the next generated key remains max(existing)+1.
             return Ok(Some(QueryResult::default()));
@@ -4415,13 +4415,15 @@ fn rewrite_trim_both_from(sql: &str) -> String {
 
 fn strip_alter_auto_increment(sql: &str) -> String {
     let upper = sql.to_ascii_uppercase();
-    let Some(start) = upper
-        .find("AUTO_INCREMENT =")
-        .or_else(|| upper.find("AUTO_INCREMENT="))
-        .or_else(|| upper.find("AUTO_INCREMENT "))
-    else {
+    let Some(start) = upper.find("AUTO_INCREMENT") else {
         return sql.to_string();
     };
+    // Keep column definitions such as `id BIGINT PRIMARY KEY
+    // AUTO_INCREMENT`; only strip a table-level next-value assignment so the
+    // SQL parser can handle the rest of the ALTER statement.
+    if !is_table_level_auto_increment_assignment(sql) {
+        return sql.to_string();
+    }
     let mut begin = start;
     while begin > 0 && sql.as_bytes()[begin - 1].is_ascii_whitespace() {
         begin -= 1;
@@ -4437,6 +4439,22 @@ fn strip_alter_auto_increment(sql: &str) -> String {
     result.push_str(&sql[..begin]);
     result.push_str(&sql[end..]);
     result
+}
+
+fn is_table_level_auto_increment_assignment(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.trim_start().starts_with("ALTER TABLE") {
+        return false;
+    }
+    let Some(start) = upper.find("AUTO_INCREMENT") else {
+        return false;
+    };
+    let after = sql[start + "AUTO_INCREMENT".len()..].trim_start();
+    after.starts_with('=')
+        || after
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
 }
 
 fn strip_unsigned_for_parser(sql: &str) -> String {

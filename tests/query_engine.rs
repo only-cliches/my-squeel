@@ -279,6 +279,40 @@ fn supports_last_insert_id_and_scalar_expressions() {
         .unwrap();
     assert_eq!(ignored[0].rows_affected, 0);
     assert_eq!(ignored[0].last_insert_id, 0);
+
+    engine
+        .execute_sql(
+            "CREATE TABLE auto_users (id BIGINT PRIMARY KEY AUTO_INCREMENT, email TEXT UNIQUE);",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO auto_users (email) VALUES ('a@example.com'), ('b@example.com');",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT IGNORE INTO auto_users (email) VALUES ('a@example.com');",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO auto_users (email) VALUES ('a@example.com') \
+             ON DUPLICATE KEY UPDATE email = VALUES(email);",
+        )
+        .unwrap();
+    let replaced = engine
+        .execute_sql("REPLACE INTO auto_users (email) VALUES ('a@example.com');")
+        .unwrap();
+    assert_eq!(replaced[0].rows_affected, 2);
+    assert_eq!(replaced[0].last_insert_id, 5);
+    let last_auto_id = engine
+        .execute_sql("SELECT LAST_INSERT_ID() AS inserted")
+        .unwrap();
+    assert_eq!(
+        last_auto_id[0].rows[0].get("inserted").unwrap().as_u64(),
+        Some(5)
+    );
 }
 
 #[test]
