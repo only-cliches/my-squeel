@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MariaDB-named entry point for the shared MTR compatibility runner."""
+"""Entry point for the MariaDB MTR compatibility runner."""
 
-from mysql_mtr_compat import parser, run
+from mariadb_mtr_core import parser, run
 
 
 if __name__ == "__main__":

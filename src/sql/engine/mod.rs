@@ -1715,9 +1715,11 @@ impl Engine {
             return Ok(Some(QueryResult::default()));
         }
         if upper == "UPDATE T1 SET I=2 LIMIT 1" {
-            return Ok(Some(
-                self.update_first_row_compat("t1", "i", Value::Number(Number::from(2)))?,
-            ));
+            return Ok(Some(self.update_first_row_compat(
+                "t1",
+                "i",
+                Value::Number(Number::from(2)),
+            )?));
         }
         if upper.starts_with("ALTER TABLE T1 ADD PRIMARY KEY (COL4(10))")
             && upper.contains("ADD UNIQUE KEY UIDX (COL3)")
@@ -2099,8 +2101,7 @@ impl Engine {
                 .schemas
                 .iter()
                 .filter(|schema| {
-                    upper.contains("LIKE")
-                        && schema.key().to_ascii_lowercase().contains("t_8114")
+                    upper.contains("LIKE") && schema.key().to_ascii_lowercase().contains("t_8114")
                 })
                 .map(|schema| {
                     Map::from_iter([(
@@ -3040,7 +3041,9 @@ impl Engine {
                 warnings: vec![QueryWarning {
                     level: "Note".to_string(),
                     code: 1031,
-                    message: "Storage engine InnoDB of the table `test`.`t1` doesn't have this option".to_string(),
+                    message:
+                        "Storage engine InnoDB of the table `test`.`t1` doesn't have this option"
+                            .to_string(),
                 }],
                 ..QueryResult::default()
             }));
@@ -3433,7 +3436,9 @@ impl Engine {
                 vec![QueryWarning {
                     level: "Note".to_string(),
                     code: 1031,
-                    message: "Storage engine InnoDB of the table `test`.`t1` doesn't have this option".to_string(),
+                    message:
+                        "Storage engine InnoDB of the table `test`.`t1` doesn't have this option"
+                            .to_string(),
                 }]
             } else {
                 Vec::new()
@@ -3586,14 +3591,10 @@ impl Engine {
             }
             return Ok(Some(QueryResult::default()));
         }
-        if upper.starts_with("CREATE DATABASE")
-            || upper.starts_with("CREATE OR REPLACE DATABASE")
-        {
+        if upper.starts_with("CREATE DATABASE") || upper.starts_with("CREATE OR REPLACE DATABASE") {
             return Ok(Some(QueryResult::default()));
         }
-        if upper.starts_with("CREATE VIEW ")
-            || upper.starts_with("CREATE OR REPLACE VIEW ")
-        {
+        if upper.starts_with("CREATE VIEW ") || upper.starts_with("CREATE OR REPLACE VIEW ") {
             let replace = upper.starts_with("CREATE OR REPLACE VIEW ");
             let prefix_len = if replace {
                 "CREATE OR REPLACE VIEW ".len()
@@ -3605,9 +3606,7 @@ impl Engine {
             let if_not_exists = remainder_upper.starts_with("IF NOT EXISTS ");
             if if_not_exists {
                 if replace {
-                    return Err(anyhow!(
-                        "Incorrect usage of OR REPLACE and IF NOT EXISTS"
-                    ));
+                    return Err(anyhow!("Incorrect usage of OR REPLACE and IF NOT EXISTS"));
                 }
                 remainder = remainder["IF NOT EXISTS ".len()..].trim();
             }
@@ -3800,10 +3799,7 @@ impl Engine {
             };
             return Ok(Some(QueryResult {
                 columns: vec!["row_count()".to_string()],
-                rows: vec![Map::from_iter([(
-                    "row_count()".to_string(),
-                    value,
-                )])],
+                rows: vec![Map::from_iter([("row_count()".to_string(), value)])],
                 ..QueryResult::default()
             }));
         }
@@ -5289,14 +5285,11 @@ fn cast_warning_inputs(sql: &str) -> Vec<(String, String, bool)> {
 
 fn is_update_ignore_statement(sql: &str) -> bool {
     let mut tokens = sql.split_whitespace();
-    tokens
+    tokens.next().is_some_and(|token| {
+        token.eq_ignore_ascii_case("UPDATE") || token.eq_ignore_ascii_case("DELETE")
+    }) && tokens
         .next()
-        .is_some_and(|token| {
-            token.eq_ignore_ascii_case("UPDATE") || token.eq_ignore_ascii_case("DELETE")
-        })
-        && tokens
-            .next()
-            .is_some_and(|token| token.eq_ignore_ascii_case("IGNORE"))
+        .is_some_and(|token| token.eq_ignore_ascii_case("IGNORE"))
 }
 
 pub type SharedEngine = Arc<Engine>;

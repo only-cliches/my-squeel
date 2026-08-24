@@ -106,6 +106,105 @@ fn information_schema_check_constraints_is_queryable() {
 }
 
 #[test]
+fn empty_information_schema_views_retains_result_columns() {
+    let engine = Engine::default();
+    let result = engine
+        .execute_sql("SELECT * FROM information_schema.views WHERE table_schema = 'app'")
+        .unwrap();
+
+    assert!(result[0].rows.is_empty());
+    assert_eq!(
+        result[0].columns,
+        [
+            "table_schema",
+            "table_name",
+            "view_definition",
+            "check_option",
+            "security_type"
+        ]
+    );
+}
+
+#[test]
+fn empty_information_schema_columns_retains_drizzle_result_columns() {
+    let engine = Engine::default();
+    let result = engine
+        .execute_sql(
+            "select * from information_schema.columns \
+             where table_schema = 'app' and table_name != '__drizzle_migrations' \
+             order by table_name, ordinal_position;",
+        )
+        .unwrap();
+
+    assert!(result[0].rows.is_empty());
+    assert_eq!(
+        result[0].columns,
+        [
+            "table_schema",
+            "table_name",
+            "column_name",
+            "ordinal_position",
+            "is_nullable",
+            "column_default",
+            "column_type",
+            "data_type",
+            "character_set_name",
+            "generation_expression",
+            "column_key",
+            "extra",
+        ]
+    );
+}
+
+#[test]
+fn empty_information_schema_statistics_retains_drizzle_result_columns() {
+    let engine = Engine::default();
+    let result = engine
+        .execute_sql(
+            "select * from INFORMATION_SCHEMA.STATISTICS \
+             WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'app' \
+             and INFORMATION_SCHEMA.STATISTICS.INDEX_NAME != 'PRIMARY';",
+        )
+        .unwrap();
+
+    assert!(result[0].rows.is_empty());
+    assert_eq!(
+        result[0].columns,
+        [
+            "table_schema",
+            "table_name",
+            "index_name",
+            "column_name",
+            "seq_in_index",
+            "non_unique",
+        ]
+    );
+}
+
+#[test]
+fn empty_information_schema_wildcards_are_result_sets() {
+    let engine = Engine::default();
+    for table in [
+        "tables",
+        "table_constraints",
+        "key_column_usage",
+        "referential_constraints",
+        "routines",
+        "triggers",
+        "check_constraints",
+        "files",
+    ] {
+        let result = engine
+            .execute_sql(&format!("SELECT * FROM information_schema.{table}"))
+            .unwrap();
+        assert!(
+            !result[0].columns.is_empty(),
+            "empty information_schema.{table} must retain its result columns"
+        );
+    }
+}
+
+#[test]
 fn information_schema_files_is_queryable() {
     let engine = Engine::default();
     let result = engine
@@ -177,4 +276,72 @@ fn information_schema_session_variables_supports_filtering() {
         .execute_sql("SELECT * FROM information_schema.session_variables WHERE variable_name = 'NONEXISTENT'")
         .unwrap();
     assert_eq!(result[0].rows.len(), 0);
+}
+
+#[test]
+fn information_schema_constraint_join_exposes_primary_key_columns() {
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE memberships (organization_id BIGINT, user_id BIGINT, PRIMARY KEY (organization_id, user_id))",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql(
+            "SELECT table_name, column_name, ordinal_position
+             FROM information_schema.table_constraints t
+             LEFT JOIN information_schema.key_column_usage k
+             USING(constraint_name, table_schema, table_name)
+             WHERE t.constraint_type = 'PRIMARY KEY'
+               AND t.table_schema = 'app'
+             ORDER BY ordinal_position",
+        )
+        .unwrap();
+
+    assert_eq!(result[0].rows.len(), 2);
+    assert_eq!(
+        result[0].rows[0]
+            .get("column_name")
+            .and_then(|value| value.as_str()),
+        Some("organization_id")
+    );
+    assert_eq!(
+        result[0].rows[1]
+            .get("column_name")
+            .and_then(|value| value.as_str()),
+        Some("user_id")
+    );
+}
+
+#[test]
+fn information_schema_statistics_includes_unique_constraints() {
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email VARCHAR(255), CONSTRAINT users_email_unique UNIQUE (email))",
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql(
+            "SELECT index_name, column_name, non_unique
+             FROM information_schema.statistics
+             WHERE table_schema = 'app' AND table_name = 'users' AND index_name != 'PRIMARY'",
+        )
+        .unwrap();
+
+    assert_eq!(result[0].rows.len(), 1);
+    assert_eq!(
+        result[0].rows[0]
+            .get("index_name")
+            .and_then(|value| value.as_str()),
+        Some("users_email_unique")
+    );
+    assert_eq!(
+        result[0].rows[0]
+            .get("non_unique")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
 }

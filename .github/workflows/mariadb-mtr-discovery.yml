@@ -6,8 +6,8 @@ on:
       - .github/workflows/mariadb-mtr-discovery.yml
       - tools/mariadb_mtr_compat.py
       - tools/mariadb_mtr_discover.py
-      - tools/mysql_mtr_compat.py
-      - tools/mysql_mtr_discover.py
+      - tools/mariadb_mtr_core.py
+      - tools/mariadb_mtr_discover_core.py
       - tools/prepare_mariadb_mtr.sh
       - tests/mariadb-mtr-allowlist.txt
       - tests/mariadb-mtr-scope.txt

@@ -34,7 +34,7 @@ Meilisearch-shaped search surface.
 | Debug and search HTTP | `127.0.0.1:3407` | Drift inspection, seeding, snapshots, and local search |
 | Storage | In memory | Disposable state; optional locked Lux-backed directory persistence |
 | Compatibility profiles | Drift tolerant / MySQL strict | Choose convenience or fail-fast schema behavior |
-| MySQL verification | MySQL 8.0.43 | Differential corpus and exact parity suites |
+| MariaDB differential verification | MariaDB 10.11.7 | Differential corpus and exact parity suites |
 | Upstream MariaDB MTR verification | MariaDB 10.11.7 | 32 gated files / 381 SQL statements on ARM64 |
 
 ## Where it fits
@@ -52,7 +52,7 @@ MySqweel is useful for:
 - local text, facet, and vector-search development
 - demos, teaching, and experiments
 
-Use real MySQL when your workload depends on transactions, atomic multi-statement writes,
+Use real MariaDB when your workload depends on transactions, atomic multi-statement writes,
 permissions, replication, optimizer fidelity, security boundaries, high-concurrency durability,
 scale, or compliance guarantees.
 
@@ -453,7 +453,7 @@ The following are outside the supported compatibility surface:
 - nested `JSON_TABLE` column expansion and MySQL binary-JSON storage byte-for-byte accounting
 - the complete JSON Schema keyword vocabulary; the embedded validator currently covers the common structural/type constraints
 
-Use real MySQL for tests that depend on any of these behaviors.
+Use real MariaDB for tests that depend on any of these behaviors.
 
 ## Meilisearch-shaped local search
 
@@ -569,16 +569,16 @@ Run the complete local suite:
 cargo test --all-targets --locked
 ```
 
-Before pushing, run the same fail-closed entry point used by CI's real-MySQL feature job:
+Before pushing, run the same fail-closed entry point used by CI's MariaDB feature job:
 
 ```sh
 tools/prepush.sh
 ```
 
-The pre-push check requires either `MYSQL_COMPARE_URL` or a working Docker daemon. When Docker is
-used, it pulls and provisions the pinned `mysql:8.0.43` image, shares that server across the suite,
+The pre-push check requires either `MARIADB_COMPARE_URL` or a working Docker daemon. When Docker is
+used, it pulls and provisions the pinned `mariadb:10.11.7` image, shares that server across the suite,
 and removes it afterward. Unlike the default local suite, this command fails instead of silently
-skipping differential tests when real MySQL is unavailable.
+skipping differential tests when MariaDB is unavailable.
 
 Enable the checked-in Git hook once per clone to run it automatically before every push:
 
@@ -586,12 +586,12 @@ Enable the checked-in Git hook once per clone to run it automatically before eve
 git config core.hooksPath .githooks
 ```
 
-When Docker and a local MySQL-compatible image are available, compatibility tests provision and
-remove their own comparison server. To require comparison or use an existing MySQL instance:
+When Docker and a local MariaDB image are available, compatibility tests provision and
+remove their own comparison server. To require comparison or use an existing MariaDB instance:
 
 ```sh
-MYSQL_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test \
-MYSQL_PARITY_REQUIRED=1 \
+MARIADB_COMPARE_URL=mysql://root:password@127.0.0.1:3306/test \
+MARIADB_PARITY_REQUIRED=1 \
 cargo test --all-targets --locked
 ```
 
@@ -646,7 +646,7 @@ cargo run --bin sqwl -- --log-filter my_sqweel=debug serve --repl
 ```
 
 When fixing a compatibility mismatch, add the smallest reproducing query to the differential
-corpus or parity suite first. A useful report includes the schema, fixture rows, query, MySQL
+corpus or parity suite first. A useful report includes the schema, fixture rows, query, MariaDB
 version, expected result, and MySqweel result.
 
 ## Project layout
@@ -661,8 +661,9 @@ src/sql/engine/                    SQL execution and compatibility validation
 src/schema/mod.rs                  Schema-hint model
 src/model.rs                       Stored-row model
 src/storage/mod.rs                 Embedded Lux-backed storage adapter
-tests/mysql_compatibility_corpus.rs Differential MySQL query corpus
-tests/mysql_parity.rs              Exact real-MySQL parity suite
+tests/mariadb_compatibility_corpus.rs Differential MariaDB query corpus
+tests/mariadb_parity.rs              Exact MariaDB parity suite
+tests/mariadb_error_compatibility.rs MariaDB error-code parity suite
 tests/orm_compatibility.rs         ORM-shaped wire and migration coverage
 ```
 

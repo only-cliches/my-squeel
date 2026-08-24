@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -122,7 +122,13 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             },
         );
         let params = parameter_columns(param_count);
-        let columns = prepared_result_columns(&self.engine, query, param_count);
+        let mut columns = prepared_result_columns(&self.engine, query, param_count);
+        if references_information_schema(query) {
+            let aliases = information_schema_aliases(query);
+            for column in &mut columns {
+                column.column = canonical_information_schema_column(&column.column, &aliases);
+            }
+        }
         info.reply(stmt_id, &params, &columns)
     }
 
@@ -146,13 +152,18 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             );
             return results.completed(0, 0);
         }
-        let out = if is_last_insert_id_query(&statement_sql) {
+        let mut out = if is_last_insert_id_query(&statement_sql) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
         } else {
             let statement_sql = self.qualify_create_table(&statement_sql);
             self.engine
                 .execute_sql_with_params_for_wire(&statement_sql, &params)
         };
+        if references_information_schema(&statement_sql)
+            && let Ok(items) = &mut out
+        {
+            canonicalize_information_schema_columns(items, &statement_sql);
+        }
         write_query_items(
             out,
             results,
@@ -181,7 +192,7 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
         if !is_show_warnings {
             self.warnings.clear();
         }
-        let out = if let Some(result) = self.execute_session_query(query) {
+        let mut out = if let Some(result) = self.execute_session_query(query) {
             Ok(vec![result])
         } else if is_last_insert_id_query(query) {
             Ok(vec![last_insert_id_result(self.last_insert_id)])
@@ -189,6 +200,11 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             let query = self.qualify_create_table(query);
             self.engine.execute_sql_for_wire(query.as_ref())
         };
+        if references_information_schema(query)
+            && let Ok(items) = &mut out
+        {
+            canonicalize_information_schema_columns(items, query);
+        }
         write_query_items(
             out,
             results,
@@ -196,6 +212,68 @@ impl<W: io::Read + io::Write> MysqlShim<W> for Backend {
             &mut self.warnings,
             Some(query.as_ref()),
         )
+    }
+}
+
+fn references_information_schema(query: &str) -> bool {
+    query.to_ascii_lowercase().contains("information_schema")
+}
+
+fn information_schema_aliases(query: &str) -> HashSet<String> {
+    let Ok(statements) = crate::sql::parse(query) else {
+        return HashSet::new();
+    };
+    statements
+        .into_iter()
+        .filter_map(|statement| match statement {
+            sqlparser::ast::Statement::Query(query) => match *query.body {
+                sqlparser::ast::SetExpr::Select(select) => Some(select.projection),
+                _ => None,
+            },
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn canonical_information_schema_column(column: &str, aliases: &HashSet<String>) -> String {
+    if aliases.contains(column) {
+        column.to_string()
+    } else {
+        column.to_ascii_uppercase()
+    }
+}
+
+/// MySQL exposes INFORMATION_SCHEMA's declared column names in uppercase.
+/// Keep the engine's case-insensitive internal maps unchanged, but match that
+/// observable behavior for wire clients such as ORM schema introspectors.
+fn canonicalize_information_schema_columns(items: &mut [QueryResult], query: &str) {
+    let aliases = information_schema_aliases(query);
+    for item in items {
+        item.columns = item
+            .columns
+            .drain(..)
+            .map(|column| canonical_information_schema_column(&column, &aliases))
+            .collect();
+        for metadata in &mut item.column_metadata {
+            metadata.name = canonical_information_schema_column(&metadata.name, &aliases);
+        }
+        for row in &mut item.rows {
+            let original = std::mem::take(row);
+            *row = original
+                .into_iter()
+                .map(|(column, value)| {
+                    (
+                        canonical_information_schema_column(&column, &aliases),
+                        value,
+                    )
+                })
+                .collect();
+        }
     }
 }
 
@@ -1456,7 +1534,10 @@ fn prepared_result_columns(engine: &Engine, query: &str, param_count: usize) -> 
     let Ok(statements) = crate::sql::parse(query) else {
         return Vec::new();
     };
-    if !matches!(statements.first(), Some(sqlparser::ast::Statement::Query(_))) {
+    if !matches!(
+        statements.first(),
+        Some(sqlparser::ast::Statement::Query(_))
+    ) {
         return Vec::new();
     }
     let decimal_columns = mysql_decimal_columns(query);
@@ -1570,7 +1651,10 @@ fn mysql_decimal_scale(expr: &sqlparser::ast::Expr) -> Option<usize> {
     };
     let name = function.name.0.last()?.value.to_ascii_uppercase();
     if name == "UNIX_TIMESTAMP"
-        && function.to_string().to_ascii_uppercase().contains("CONCAT(")
+        && function
+            .to_string()
+            .to_ascii_uppercase()
+            .contains("CONCAT(")
     {
         return Some(6);
     }
@@ -1708,10 +1792,55 @@ mod tests {
     use serde_json::{Map, json};
 
     use super::{
-        Backend, normalize_session_var_name, parse_mysql_datetime_value, prepared_result_columns,
+        Backend, canonicalize_information_schema_columns, normalize_session_var_name,
+        parse_mysql_datetime_value, prepared_result_columns, references_information_schema,
         validate_wire_rows,
     };
-    use crate::sql::engine::{Engine, EngineConfig};
+    use crate::sql::engine::{Engine, EngineConfig, QueryResult};
+
+    #[test]
+    fn information_schema_wire_results_use_mysql_column_casing() {
+        assert!(references_information_schema(
+            "select * from information_schema.columns"
+        ));
+
+        let mut row = Map::new();
+        row.insert("table_name".to_string(), json!("users"));
+        row.insert("column_name".to_string(), json!("id"));
+        let mut results = vec![QueryResult {
+            columns: vec!["table_name".to_string(), "column_name".to_string()],
+            rows: vec![row],
+            ..QueryResult::default()
+        }];
+
+        canonicalize_information_schema_columns(
+            &mut results,
+            "select * from information_schema.columns",
+        );
+
+        assert_eq!(results[0].columns, ["TABLE_NAME", "COLUMN_NAME"]);
+        assert_eq!(results[0].rows[0].get("TABLE_NAME"), Some(&json!("users")));
+        assert_eq!(results[0].rows[0].get("COLUMN_NAME"), Some(&json!("id")));
+    }
+
+    #[test]
+    fn information_schema_wire_results_preserve_explicit_aliases() {
+        let mut row = Map::new();
+        row.insert("columnName".to_string(), json!("id"));
+        let mut results = vec![QueryResult {
+            columns: vec!["columnName".to_string()],
+            rows: vec![row],
+            ..QueryResult::default()
+        }];
+
+        canonicalize_information_schema_columns(
+            &mut results,
+            "SELECT COLUMN_NAME AS `columnName` FROM information_schema.KEY_COLUMN_USAGE",
+        );
+
+        assert_eq!(results[0].columns, ["columnName"]);
+        assert_eq!(results[0].rows[0].get("columnName"), Some(&json!("id")));
+    }
 
     #[test]
     fn session_select_shortcut_does_not_capture_table_queries() {
@@ -1776,11 +1905,7 @@ mod tests {
             )
             .unwrap();
 
-        let columns = prepared_result_columns(
-            &engine,
-            "INSERT INTO users (email) VALUES (?)",
-            1,
-        );
+        let columns = prepared_result_columns(&engine, "INSERT INTO users (email) VALUES (?)", 1);
         assert!(columns.is_empty());
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.rows.get("users").map(|rows| rows.len()), Some(0));

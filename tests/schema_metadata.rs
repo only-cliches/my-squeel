@@ -1107,7 +1107,10 @@ fn information_schema_key_column_usage_handles_pk_added_via_alter_table() {
         .find(|row| row.get("column_name").and_then(|v| v.as_str()) == Some("id"))
         .expect("ALTER-added PK should appear in information_schema.columns");
     assert_eq!(id.get("column_key").and_then(|v| v.as_str()), Some("PRI"));
-    assert_eq!(id.get("extra").and_then(|v| v.as_str()), Some("auto_increment"));
+    assert_eq!(
+        id.get("extra").and_then(|v| v.as_str()),
+        Some("auto_increment")
+    );
 }
 
 #[test]

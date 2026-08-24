@@ -289,6 +289,7 @@ impl Engine {
                 limit,
                 offset,
                 last_insert_id,
+                &|expr, data, last_insert_id| self.eval_expr_ctx(expr, data, last_insert_id),
             )? {
                 return Ok(self.with_select_metadata(&select, result));
             }
@@ -414,6 +415,7 @@ impl Engine {
                 limit,
                 offset,
                 last_insert_id,
+                &|expr, data, last_insert_id| self.eval_expr_ctx(expr, data, last_insert_id),
             )? {
                 return Ok(self.with_select_metadata(&select, result));
             }
@@ -441,6 +443,7 @@ impl Engine {
                 limit,
                 offset,
                 last_insert_id,
+                &|expr, data, last_insert_id| self.eval_expr_ctx(expr, data, last_insert_id),
             )? {
                 return Ok(self.with_select_metadata(&select, result));
             }
@@ -464,6 +467,13 @@ impl Engine {
             return self.select_information_schema_columns(&select);
         }
         if root_name_full.eq_ignore_ascii_case("information_schema.table_constraints") {
+            if root.joins.iter().any(|join| {
+                table_factor_name_full(&join.relation).is_ok_and(|name| {
+                    name.eq_ignore_ascii_case("information_schema.key_column_usage")
+                })
+            }) {
+                return self.select_information_schema_constraints_with_column_usage(&select);
+            }
             return self.select_information_schema_table_constraints(&select);
         }
         if root_name_full.eq_ignore_ascii_case("information_schema.statistics") {
@@ -557,6 +567,7 @@ impl Engine {
             limit,
             offset,
             last_insert_id,
+            &|expr, data, last_insert_id| self.eval_expr_ctx(expr, data, last_insert_id),
         )? {
             return Ok(self.with_select_metadata(&select, result));
         }
@@ -2635,6 +2646,7 @@ impl Engine {
             limit,
             offset,
             0,
+            &|expr, data, last_insert_id| self.eval_expr_ctx(expr, data, last_insert_id),
         )? {
             return Ok(self.with_select_metadata(select, result));
         }
@@ -2701,7 +2713,19 @@ impl Engine {
             );
             rows.push(row);
         }
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "table_schema",
+                "table_name",
+                "table_type",
+                "engine",
+                "table_rows",
+                "index_length",
+                "max_data_length",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_schemata(
@@ -2761,6 +2785,11 @@ impl Engine {
                 );
                 row.insert("column_type".to_string(), Value::String(column_type));
                 row.insert("data_type".to_string(), Value::String(data_type));
+                row.insert("character_set_name".to_string(), Value::Null);
+                row.insert(
+                    "generation_expression".to_string(),
+                    Value::String(String::new()),
+                );
                 row.insert(
                     "column_key".to_string(),
                     Value::String(column_key.to_string()),
@@ -2776,7 +2805,24 @@ impl Engine {
                 rows.push(row);
             }
         }
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "table_schema",
+                "table_name",
+                "column_name",
+                "ordinal_position",
+                "is_nullable",
+                "column_default",
+                "column_type",
+                "data_type",
+                "character_set_name",
+                "generation_expression",
+                "column_key",
+                "extra",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_table_constraints(
@@ -2851,6 +2897,71 @@ impl Engine {
                 rows.push(row);
             }
         }
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "constraint_schema",
+                "table_schema",
+                "table_name",
+                "constraint_name",
+                "constraint_type",
+            ],
+        )
+    }
+
+    fn select_information_schema_constraints_with_column_usage(
+        &self,
+        select: &Select,
+    ) -> Result<QueryResult> {
+        let mut rows = Vec::new();
+        for schema in self.schemas.iter() {
+            for (idx, column) in schema.primary_key.iter().enumerate() {
+                let mut row =
+                    key_column_usage_row(&schema.table, "PRIMARY", column, idx + 1, None, None);
+                row.insert(
+                    "constraint_type".to_string(),
+                    Value::String("PRIMARY KEY".to_string()),
+                );
+                rows.push(row);
+            }
+            for unique in &schema.unique {
+                let constraint_name = unique_index_name(&schema, unique);
+                for (idx, column) in unique.iter().enumerate() {
+                    let mut row = key_column_usage_row(
+                        &schema.table,
+                        &constraint_name,
+                        column,
+                        idx + 1,
+                        None,
+                        None,
+                    );
+                    row.insert(
+                        "constraint_type".to_string(),
+                        Value::String("UNIQUE".to_string()),
+                    );
+                    rows.push(row);
+                }
+            }
+            for foreign_key in &schema.foreign_keys {
+                for (idx, column) in foreign_key.columns.iter().enumerate() {
+                    let referenced = foreign_key.referenced_columns.get(idx).cloned();
+                    let mut row = key_column_usage_row(
+                        &schema.table,
+                        &foreign_key.name,
+                        column,
+                        idx + 1,
+                        Some(idx + 1),
+                        Some((foreign_key.referenced_table.clone(), referenced)),
+                    );
+                    row.insert(
+                        "constraint_type".to_string(),
+                        Value::String("FOREIGN KEY".to_string()),
+                    );
+                    rows.push(row);
+                }
+            }
+        }
         virtual_select_result(select, rows)
     }
 
@@ -2861,6 +2972,11 @@ impl Engine {
         let mut rows = Vec::new();
         for schema in self.schemas.iter() {
             for index in &schema.indexes {
+                let index_name = if index.unique && !index.name.eq_ignore_ascii_case("PRIMARY") {
+                    unique_index_name(&schema, &index.columns)
+                } else {
+                    index.name.clone()
+                };
                 for (idx, col) in index.columns.iter().enumerate() {
                     let mut row = Map::new();
                     row.insert("table_schema".to_string(), Value::String("app".to_string()));
@@ -2868,7 +2984,7 @@ impl Engine {
                         "table_name".to_string(),
                         Value::String(schema.table.clone()),
                     );
-                    row.insert("index_name".to_string(), Value::String(index.name.clone()));
+                    row.insert("index_name".to_string(), Value::String(index_name.clone()));
                     row.insert("column_name".to_string(), Value::String(col.clone()));
                     row.insert(
                         "seq_in_index".to_string(),
@@ -2882,7 +2998,18 @@ impl Engine {
                 }
             }
         }
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "table_schema",
+                "table_name",
+                "index_name",
+                "column_name",
+                "seq_in_index",
+                "non_unique",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_key_column_usage(
@@ -2928,7 +3055,24 @@ impl Engine {
                 }
             }
         }
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "constraint_catalog",
+                "constraint_schema",
+                "constraint_name",
+                "table_catalog",
+                "table_schema",
+                "table_name",
+                "column_name",
+                "ordinal_position",
+                "position_in_unique_constraint",
+                "referenced_table_schema",
+                "referenced_table_name",
+                "referenced_column_name",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_referential_constraints(
@@ -2996,7 +3140,23 @@ impl Engine {
                 rows.push(row);
             }
         }
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "constraint_catalog",
+                "constraint_schema",
+                "constraint_name",
+                "unique_constraint_catalog",
+                "unique_constraint_schema",
+                "unique_constraint_name",
+                "match_option",
+                "update_rule",
+                "delete_rule",
+                "table_name",
+                "referenced_table_name",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_character_sets(
@@ -3087,20 +3247,45 @@ impl Engine {
                     })
                     .unwrap_or_else(|| definition.to_string());
                 Map::from_iter([
-                    ("table_schema".to_string(), Value::String("test".to_string())),
+                    ("table_schema".to_string(), Value::String("app".to_string())),
                     ("table_name".to_string(), Value::String(view.key().clone())),
                     ("view_definition".to_string(), Value::String(view_definition)),
+                    ("check_option".to_string(), Value::String("NONE".to_string())),
+                    (
+                        "security_type".to_string(),
+                        Value::String("DEFINER".to_string()),
+                    ),
                 ])
             })
             .collect();
-        virtual_select_result(select, rows)
+        virtual_select_result_with_empty_schema(
+            select,
+            rows,
+            &[
+                "table_schema",
+                "table_name",
+                "view_definition",
+                "check_option",
+                "security_type",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_routines(
         &self,
         select: &Select,
     ) -> Result<QueryResult> {
-        virtual_select_result(select, Vec::new())
+        virtual_select_result_with_empty_schema(
+            select,
+            Vec::new(),
+            &[
+                "routine_schema",
+                "routine_name",
+                "routine_type",
+                "data_type",
+                "routine_definition",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_engines(&self, select: &Select) -> Result<QueryResult> {
@@ -3216,10 +3401,19 @@ impl Engine {
             .map(|(name, value)| {
                 Map::from_iter([
                     ("variable_name".to_string(), Value::String(name.to_string())),
-                    ("session_value".to_string(), Value::String(value.to_string())),
+                    (
+                        "session_value".to_string(),
+                        Value::String(value.to_string()),
+                    ),
                     ("global_value".to_string(), Value::String(value.to_string())),
-                    ("default_value".to_string(), Value::String(value.to_string())),
-                    ("variable_scope".to_string(), Value::String("GLOBAL".to_string())),
+                    (
+                        "default_value".to_string(),
+                        Value::String(value.to_string()),
+                    ),
+                    (
+                        "variable_scope".to_string(),
+                        Value::String("GLOBAL".to_string()),
+                    ),
                     ("read_only".to_string(), Value::String("NO".to_string())),
                 ])
             })
@@ -3478,7 +3672,19 @@ impl Engine {
         select: &Select,
     ) -> Result<QueryResult> {
         // Triggers not supported yet
-        virtual_select_result(select, Vec::new())
+        virtual_select_result_with_empty_schema(
+            select,
+            Vec::new(),
+            &[
+                "trigger_schema",
+                "trigger_name",
+                "event_manipulation",
+                "event_object_schema",
+                "event_object_table",
+                "action_statement",
+                "action_timing",
+            ],
+        )
     }
 
     pub(super) fn select_information_schema_check_constraints(
@@ -3486,12 +3692,27 @@ impl Engine {
         select: &Select,
     ) -> Result<QueryResult> {
         // CHECK constraints not validated yet
-        virtual_select_result(select, Vec::new())
+        virtual_select_result_with_empty_schema(
+            select,
+            Vec::new(),
+            &["constraint_schema", "constraint_name", "check_clause"],
+        )
     }
 
     pub(super) fn select_information_schema_files(&self, select: &Select) -> Result<QueryResult> {
         // File storage information
-        virtual_select_result(select, Vec::new())
+        virtual_select_result_with_empty_schema(
+            select,
+            Vec::new(),
+            &[
+                "file_id",
+                "file_name",
+                "file_type",
+                "tablespace_name",
+                "table_schema",
+                "table_name",
+            ],
+        )
     }
 
     pub(super) fn show_tables(&self) -> QueryResult {
@@ -3823,11 +4044,7 @@ impl Engine {
         let persistent = table_list
             .to_ascii_uppercase()
             .find(" PERSISTENT")
-            .map(|index| {
-                table_list[..index]
-                    .trim()
-                    .to_string()
-            });
+            .map(|index| table_list[..index].trim().to_string());
         let table_list = persistent.as_deref().unwrap_or(table_list);
         let rows = table_list
             .split(',')

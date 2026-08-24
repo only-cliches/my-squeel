@@ -13,30 +13,30 @@ env:
 
 jobs:
   feature-parity:
-    name: MySQL feature parity
+    name: MariaDB feature parity
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     services:
-      mysql:
-        image: mysql:8.0.43
+      mariadb:
+        image: mariadb:10.11.7
         env:
-          MYSQL_ROOT_PASSWORD: my-sqweel
-          MYSQL_DATABASE: test
+          MARIADB_ROOT_PASSWORD: my-sqweel
+          MARIADB_DATABASE: test
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping --silent -h 127.0.0.1 -pmy-sqweel"
+          --health-cmd="mariadb-admin ping --silent -h 127.0.0.1 -pmy-sqweel"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=30
     env:
       CARGO_BUILD_JOBS: 1
-      MYSQL_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3306/test
-      MYSQL_PARITY_REQUIRED: 1
+      MARIADB_COMPARE_URL: mysql://root:my-sqweel@127.0.0.1:3306/test
+      MARIADB_PARITY_REQUIRED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run pre-push checks against real MySQL
+      - name: Run pre-push checks against MariaDB
         run: tools/prepush.sh
 
   mtr-baseline:

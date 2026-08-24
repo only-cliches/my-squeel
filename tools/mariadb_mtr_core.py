@@ -99,7 +99,7 @@ def parse_manifest(path: Path) -> list[TestCase]:
     return cases
 
 
-def mysql_test_file(suite_root: Path, name: str, layout: str = "mysql") -> Path:
+def mysql_test_file(suite_root: Path, name: str, layout: str = "mariadb") -> Path:
     mysql_test = suite_root / "mysql-test"
     if "/" not in name:
         main_directory = "main" if layout == "mariadb" else "t"
@@ -108,7 +108,7 @@ def mysql_test_file(suite_root: Path, name: str, layout: str = "mysql") -> Path:
     return mysql_test / "suite" / suite / "t" / f"{test}.test"
 
 
-def mysql_result_file(suite_root: Path, name: str, layout: str = "mysql") -> Path:
+def mysql_result_file(suite_root: Path, name: str, layout: str = "mariadb") -> Path:
     mysql_test = suite_root / "mysql-test"
     if "/" not in name:
         main_directory = "main" if layout == "mariadb" else "r"
@@ -179,7 +179,7 @@ def sql_statement_count(text: str) -> int:
     return count
 
 
-def validate_cases(suite_root: Path, cases: list[TestCase], layout: str = "mysql") -> None:
+def validate_cases(suite_root: Path, cases: list[TestCase], layout: str = "mariadb") -> None:
     missing = [
         case.name
         for case in cases
@@ -431,7 +431,7 @@ def mtr_command(
 def mtr_case_timezone(
     suite_root: Path,
     case: TestCase,
-    layout: str = "mysql",
+    layout: str = "mariadb",
 ) -> str:
     """Return the SQL timezone equivalent of an upstream MTR server option.
 
@@ -485,7 +485,7 @@ def configure_case_timezone(
     client_bindir: Path,
     suite_root: Path,
     case: TestCase,
-    layout: str = "mysql",
+    layout: str = "mariadb",
 ) -> str:
     timezone = mtr_case_timezone(suite_root, case, layout)
     connection = parse_server_url(server.url)
@@ -523,7 +523,7 @@ def run_case(
     case: TestCase,
     artifact_dir: Path,
     mysqltest_bin: Path,
-    layout: str = "mysql",
+    layout: str = "mariadb",
     timeout: int = 300,
 ) -> Invocation:
     case_artifact = artifact_dir / server.name / case.name.replace("/", "_")
@@ -651,7 +651,7 @@ def start_mysqweel(binary: Path, report_dir: Path) -> tuple[Server, subprocess.P
 def render_markdown(report: dict) -> str:
     counts = report["counts"]
     baseline_label = report.get("baseline_label", "Baseline")
-    baseline_version = report.get("baseline_version", report.get("mysql_version", "unknown"))
+    baseline_version = report.get("baseline_version", "unknown")
     lines = [
         f"# {baseline_label} {baseline_version} upstream compatibility",
         "",
@@ -678,7 +678,7 @@ def render_markdown(report: dict) -> str:
     for result in report["results"]:
         lines.append(
             f"| `{result['test']}` | `{result['feature']}` | {result.get('statements', 0)} | "
-            f"{result.get('baseline', result.get('mysql', 'not-run'))} | {result['mysqweel']} |"
+            f"{result.get('baseline', 'not-run')} | {result['mysqweel']} |"
         )
 
     failed_by_server: dict[str, dict] = {}
@@ -727,7 +727,7 @@ def run(args: argparse.Namespace) -> int:
     mysqltest_path = Path(mysqltest).resolve()
     client_bindir = args.client_bindir.resolve() if args.client_bindir else mysqltest_path.parent
     if not (client_bindir / "mysql").exists():
-        raise FileNotFoundError(f"MySQL-compatible client not found in {client_bindir}")
+        raise FileNotFoundError(f"MariaDB client not found in {client_bindir}")
     safe_process = (
         args.safe_process_bin.resolve()
         if args.safe_process_bin
@@ -737,10 +737,10 @@ def run(args: argparse.Namespace) -> int:
         safe_process = suite_root / "mysql-test" / "lib" / "My" / "SafeProcess" / "my_safe_process"
     validate_mtr_runtime(client_bindir, mysqltest_path, safe_process)
 
-    run_baseline = args.target in ("baseline", "mysql", "both")
+    run_baseline = args.target in ("baseline", "both")
     run_mysqweel = args.target in ("mysqweel", "both")
     baseline_server: Server | None = None
-    baseline_url = args.baseline_url or os.environ.get("MARIADB_COMPARE_URL") or os.environ.get("MYSQL_COMPARE_URL")
+    baseline_url = args.baseline_url or os.environ.get("MARIADB_COMPARE_URL")
     baseline_name = re.sub(r"[^a-z0-9]+", "-", args.baseline_label.lower()).strip("-") or "baseline"
     if run_baseline:
         if not baseline_url:
@@ -904,7 +904,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--suite-root", type=Path, required=True)
     result.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     result.add_argument("--report-dir", type=Path, default=Path("artifacts/mariadb-mtr"))
-    result.add_argument("--target", choices=("baseline", "mysql", "mysqweel", "both"), default="both")
+    result.add_argument("--target", choices=("baseline", "mysqweel", "both"), default="both")
     result.add_argument("--baseline-url", "--mysql-url", dest="baseline_url")
     result.add_argument("--mysqweel-url")
     result.add_argument("--mysqweel-bin", type=Path)
@@ -912,7 +912,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--mysqltest-bin", type=Path)
     result.add_argument("--client-bindir", type=Path)
     result.add_argument("--safe-process-bin", type=Path)
-    result.add_argument("--mtr-layout", choices=("mysql", "mariadb"), default="mysql")
+    result.add_argument("--mtr-layout", choices=("mariadb",), default="mariadb")
     result.add_argument("--baseline-label", default="MariaDB")
     result.add_argument("--baseline-version", "--mysql-version", dest="baseline_version", default="10.11.7")
     result.add_argument("--source-revision", default="mariadb-10.11.7-2ubuntu2")

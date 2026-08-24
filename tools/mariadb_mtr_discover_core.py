@@ -16,13 +16,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 try:
-    from tools.mysql_mtr_compat import (
+    from tools.mariadb_mtr_core import (
         TEST_NAME,
         sha256_file,
         sql_statement_count,
     )
 except ModuleNotFoundError:  # Direct execution adds tools/, not the repository root, to sys.path.
-    from mysql_mtr_compat import TEST_NAME, sha256_file, sql_statement_count
+    from mariadb_mtr_core import TEST_NAME, sha256_file, sql_statement_count
 
 
 DEPENDENT_DIRECTIVE = re.compile(
@@ -145,7 +145,7 @@ def classify_feature(sql: str) -> str:
     return "-".join(sorted(categories))
 
 
-def test_name(mysql_test_root: Path, test_file: Path, layout: str = "mysql") -> str | None:
+def test_name(mysql_test_root: Path, test_file: Path, layout: str = "mariadb") -> str | None:
     relative = test_file.relative_to(mysql_test_root)
     parts = relative.parts
     if layout == "mariadb" and len(parts) == 2 and parts[0] == "main":
@@ -159,7 +159,7 @@ def test_name(mysql_test_root: Path, test_file: Path, layout: str = "mysql") -> 
     return None
 
 
-def result_file_for_test(mysql_test_root: Path, test_file: Path, layout: str = "mysql") -> Path:
+def result_file_for_test(mysql_test_root: Path, test_file: Path, layout: str = "mariadb") -> Path:
     relative = test_file.relative_to(mysql_test_root)
     parts = list(relative.parts)
     if layout == "mariadb" and parts[0] == "main":
@@ -225,7 +225,7 @@ def discover_cases(
     suite_root: Path,
     scope: str,
     max_statements: int,
-    layout: str = "mysql",
+    layout: str = "mariadb",
     include_safe_harness: bool = False,
 ) -> list[DiscoveryCase]:
     mysql_test_root = suite_root / "mysql-test"
@@ -399,7 +399,7 @@ def write_promotion_manifest(args: argparse.Namespace) -> int:
     promoted = [
         result
         for result in report.get("results", [])
-        if result.get("baseline", result.get("mysql")) == "pass"
+        if result.get("baseline") == "pass"
         and result.get("mysqweel") == "pass"
     ]
     lines = [
@@ -436,7 +436,7 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument("--source-revision", default="mariadb-10.11.7-2ubuntu2")
-    result.add_argument("--mtr-layout", choices=("mysql", "mariadb"), default="mysql")
+    result.add_argument("--mtr-layout", choices=("mariadb",), default="mariadb")
     result.add_argument("--baseline-label", default="MariaDB")
     result.add_argument("--compat-report", type=Path)
     result.add_argument("--promote-manifest", type=Path)

@@ -1,6 +1,6 @@
 [package]
 name = "my-sqweel"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Streamlined, embeddable MySQL for applications, integration testing, and QA."
 license = "MIT"

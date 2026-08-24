@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MariaDB-named entry point for the shared MTR discovery tool."""
+"""Entry point for MariaDB MTR discovery."""
 
-from mysql_mtr_discover import main, parser
+from mariadb_mtr_discover_core import main, parser
 
 
 if __name__ == "__main__":

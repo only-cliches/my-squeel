@@ -30,6 +30,64 @@ fn accepts_mysql2_query_protocol_escaped_json_with_apostrophes() {
 }
 
 #[test]
+fn accepts_plain_select_for_update_as_transaction_compatibility_syntax() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql(
+            "CREATE TABLE inventory_balances (id BIGINT PRIMARY KEY, balance_key VARCHAR(191), on_hand BIGINT);",
+        )
+        .unwrap();
+    engine
+        .execute_sql(
+            "INSERT INTO inventory_balances (id, balance_key, on_hand) VALUES (1, 'item:location', 25);",
+        )
+        .unwrap();
+
+    engine.execute_sql("START TRANSACTION").unwrap();
+    let selected = engine
+        .execute_sql_with_params(
+            "SELECT id, on_hand FROM inventory_balances WHERE balance_key = ? LIMIT ? FOR UPDATE",
+            &[serde_json::json!("item:location"), serde_json::json!(1)],
+        )
+        .unwrap();
+    engine.execute_sql("COMMIT").unwrap();
+
+    assert_eq!(selected[0].rows.len(), 1);
+    assert_eq!(
+        selected[0].rows[0].get("id").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        selected[0].rows[0].get("on_hand").and_then(Value::as_i64),
+        Some(25)
+    );
+}
+
+#[test]
+fn rejects_select_locking_extensions_without_locking_semantics() {
+    let _guard = test_lock();
+    let engine = Engine::default();
+    engine
+        .execute_sql("CREATE TABLE lock_targets (id BIGINT PRIMARY KEY);")
+        .unwrap();
+
+    for query in [
+        "SELECT id FROM lock_targets FOR SHARE",
+        "SELECT id FROM lock_targets FOR UPDATE NOWAIT",
+        "SELECT id FROM lock_targets FOR UPDATE SKIP LOCKED",
+    ] {
+        let error = engine.execute_sql(query).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "unsupported SQL feature: SELECT locking clauses other than plain FOR UPDATE"
+            ),
+            "unexpected error for {query}: {error}"
+        );
+    }
+}
+
+#[test]
 fn supports_naive_join_and_basic_introspection() {
     let _guard = test_lock();
     let engine = Engine::default();
@@ -1198,4 +1256,31 @@ fn supports_common_subquery_shapes() {
         .execute_sql("SELECT email FROM users WHERE EXISTS (SELECT id FROM posts WHERE posts.user_id = users.id)")
         .unwrap();
     assert_eq!(correlated[0].rows.len(), 2);
+
+    let correlated_count = engine
+        .execute_sql(
+            "SELECT users.id, (SELECT COUNT(*) FROM posts WHERE posts.user_id = users.id) AS post_count FROM users ORDER BY users.id",
+        )
+        .unwrap();
+    assert_eq!(
+        correlated_count[0]
+            .rows
+            .iter()
+            .map(|row| row.get("post_count").and_then(|value| value.as_u64()))
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(0), Some(1)]
+    );
+
+    let aggregate_not_exists = engine
+        .execute_sql(
+            "SELECT SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM posts WHERE posts.user_id = users.id) THEN 1 ELSE 0 END) AS missing FROM users",
+        )
+        .unwrap();
+    assert_eq!(
+        aggregate_not_exists[0].rows[0]
+            .get("missing")
+            .unwrap()
+            .as_i64(),
+        Some(1)
+    );
 }

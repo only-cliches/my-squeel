@@ -837,11 +837,7 @@ impl Engine {
         self.remove_row_from_indexes(table, &key, &previous);
         self.add_row_to_indexes(table, &key, &updated.data);
         if self.storage.is_persistent() {
-            self.persist_row_batch(
-                table,
-                &BTreeSet::new(),
-                &BTreeMap::from([(key, updated)]),
-            )?;
+            self.persist_row_batch(table, &BTreeSet::new(), &BTreeMap::from([(key, updated)]))?;
         }
         record_query_writes(usize::from(changed > 0), changed);
         Ok(QueryResult {
@@ -1029,10 +1025,9 @@ impl Engine {
             let mut warnings = Vec::new();
             if update_ignore_mode() {
                 for key in &candidate_keys {
-                    match self.apply_parent_delete_actions(
-                        &table_name,
-                        &BTreeSet::from([key.clone()]),
-                    ) {
+                    match self
+                        .apply_parent_delete_actions(&table_name, &BTreeSet::from([key.clone()]))
+                    {
                         Ok(()) => {
                             deletable_keys.insert(key.clone());
                         }

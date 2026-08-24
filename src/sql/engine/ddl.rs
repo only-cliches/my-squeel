@@ -1453,10 +1453,8 @@ pub(super) fn add_index_metadata(schema: &mut TableSchemaHint, index: IndexHint)
     }
 }
 
-pub(super) fn generated_index_name(_table: &str, cols: &[String]) -> String {
-    cols.first()
-        .cloned()
-        .unwrap_or_else(|| "unique".to_string())
+pub(super) fn generated_index_name(table: &str, cols: &[String]) -> String {
+    format!("{}_{}_unique", table, cols.join("_"))
 }
 
 fn legacy_generated_index_name(table: &str, cols: &[String]) -> String {
@@ -1464,12 +1462,20 @@ fn legacy_generated_index_name(table: &str, cols: &[String]) -> String {
 }
 
 pub(super) fn unique_index_name(schema: &TableSchemaHint, cols: &[String]) -> String {
-    schema
+    let configured = schema
         .indexes
         .iter()
         .find(|index| index.unique && index.columns == cols)
-        .map(|index| index.name.clone())
-        .unwrap_or_else(|| generated_index_name(&schema.table, cols))
+        .map(|index| index.name.as_str());
+    let legacy_column_name = cols.first().map(String::as_str);
+    let parser_generated_constraint = format!("{}_{}_CONSTRAINT", schema.table, cols.join("_"));
+    match configured {
+        Some(name) if Some(name) == legacy_column_name || name == parser_generated_constraint => {
+            generated_index_name(&schema.table, cols)
+        }
+        Some(name) => name.to_string(),
+        None => generated_index_name(&schema.table, cols),
+    }
 }
 
 pub(super) fn add_foreign_key_metadata(schema: &mut TableSchemaHint, foreign_key: ForeignKeyHint) {

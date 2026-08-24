@@ -2,6 +2,37 @@
 
 All notable changes to MySqweel will be documented in this file.
 
+## 0.4.3 future
+
+### Compatibility
+
+- Improved `information_schema` compatibility for ORM introspection: empty virtual tables retain result-set columns, wire metadata uses MySQL's declared column casing while preserving explicit aliases, and constraint/index metadata exposes primary, unique, and foreign-key columns consistently.
+- Added correlated subquery evaluation inside aggregate expressions, including correlated `COUNT` and `NOT EXISTS` queries.
+- Accepted plain `SELECT ... FOR UPDATE` syntax for transaction-oriented clients while explicitly rejecting locking extensions whose locking semantics are not implemented.
+
+### Compatibility and CI
+
+- Consolidated external compatibility verification on pinned MariaDB 10.11.7 across the differential corpus, exact parity and error-code suites, pre-push provisioning, CI, and MTR discovery tooling; removed the Oracle MySQL comparison paths.
+
+### Fixed
+
+- Fixed `JSON_SET` so it replaces existing values correctly, including values addressed by nested array indexes; previously those paths behaved like insert-only updates.
+- Fixed `JSON_SEARCH(..., 'one', ...)` to recursively search scalar values when no explicit JSON path is supplied, returning matching nested paths such as `$.name`.
+- Fixed `JSON_SEARCH` result encoding so matching paths retain their JSON string representation over the MySQL wire protocol.
+- Fixed `SET GLOBAL time_zone` and `SET SESSION time_zone` variable-name normalization, and aligned whole-second `UNIX_TIMESTAMP` wire metadata with MariaDB's integer output.
+- Fixed expression lookup precedence so SQL string literals that match column names remain literals, preserving typed column values and keys in nested `JSON_OBJECT` expressions.
+
+### Compatibility and CI
+
+- Fixed the ARM64 MariaDB MTR preparation flow by extracting the pinned `mariadb-server` package for its required `myisamlog` test utility without installing or starting a second database server.
+- Bumped the MariaDB MTR package cache key so CI refreshes stale package archives and runs the corrected upstream baseline checks.
+- Added external-server timezone handling to the MTR compatibility runner. Hash-pinned tests with fixed POSIX `GMT` offsets now apply the equivalent SQL timezone to both MariaDB and MySqweel before each case.
+- Preserved upstream warning checks in source builds by sending MySqweel query warning counts through the vendored MySQL protocol writer, while retaining compatibility with the published dependency during package verification.
+- Added a fail-closed `tools/prepush.sh` check and opt-in Git pre-push hook, and made CI use that same entry point for its real-MySQL differential suite; local checks refuse to report success when neither MySQL nor Docker is available.
+- Made the pre-push check raise low host file-descriptor limits before running parallel Lux-backed tests, preventing macOS defaults from causing unrelated `Too many open files` failures.
+- Removed a timing-dependent port rebind from the parity harness so parallel local checks connect to the already-bound MySqweel listener reliably.
+- Added regression coverage for JSON array-index mutation and recursive JSON path search.
+
 ## 0.4.2 Aug 15, 2026
 
 ### Performance
@@ -31,30 +62,10 @@ All notable changes to MySqweel will be documented in this file.
 - Fixed persistent single-table deletes so removed rows, primary-key membership, and secondary indexes are updated in Lux storage before the engine is reopened.
 - Fixed `ALTER TABLE ... ADD COLUMN ... AUTO_INCREMENT` metadata so the new column remains visible in `information_schema.columns` and `key_column_usage`; parity helpers now also assert `last_insert_id` for write statements.
 - Fixed MySQL wire prepared-statement metadata probing so INSERT, UPDATE, and DELETE statements execute only once, during `COM_STMT_EXECUTE`, preserving auto-increment and affected-row semantics.
-- Matched MySQL's `ON DUPLICATE KEY UPDATE` insert-ID behavior by returning the existing row's auto-increment value when an update resolves a unique-key conflict.
-- Matched MySQL insert-ID metadata when an `INSERT` explicitly supplies the value of an auto-increment column.
-- Changed real-MySQL parity comparisons to collect value mismatches through the full scenario and report them together, instead of stopping at the first mismatch.
-
-## 0.4.1 future
-
-### Fixed
-
-- Fixed `JSON_SET` so it replaces existing values correctly, including values addressed by nested array indexes; previously those paths behaved like insert-only updates.
-- Fixed `JSON_SEARCH(..., 'one', ...)` to recursively search scalar values when no explicit JSON path is supplied, returning matching nested paths such as `$.name`.
-- Fixed `JSON_SEARCH` result encoding so matching paths retain their JSON string representation over the MySQL wire protocol.
-- Fixed `SET GLOBAL time_zone` and `SET SESSION time_zone` variable-name normalization, and aligned whole-second `UNIX_TIMESTAMP` wire metadata with MariaDB's integer output.
-- Fixed expression lookup precedence so SQL string literals that match column names remain literals, preserving typed column values and keys in nested `JSON_OBJECT` expressions.
-
-### Compatibility and CI
-
-- Fixed the ARM64 MariaDB MTR preparation flow by extracting the pinned `mariadb-server` package for its required `myisamlog` test utility without installing or starting a second database server.
-- Bumped the MariaDB MTR package cache key so CI refreshes stale package archives and runs the corrected upstream baseline checks.
-- Added external-server timezone handling to the MTR compatibility runner. Hash-pinned tests with fixed POSIX `GMT` offsets now apply the equivalent SQL timezone to both MariaDB and MySqweel before each case.
-- Preserved upstream warning checks in source builds by sending MySqweel query warning counts through the vendored MySQL protocol writer, while retaining compatibility with the published dependency during package verification.
-- Added a fail-closed `tools/prepush.sh` check and opt-in Git pre-push hook, and made CI use that same entry point for its real-MySQL differential suite; local checks refuse to report success when neither MySQL nor Docker is available.
-- Made the pre-push check raise low host file-descriptor limits before running parallel Lux-backed tests, preventing macOS defaults from causing unrelated `Too many open files` failures.
-- Removed a timing-dependent port rebind from the parity harness so parallel local checks connect to the already-bound MySqweel listener reliably.
-- Added regression coverage for JSON array-index mutation and recursive JSON path search.
+- Matched MariaDB's `ON DUPLICATE KEY UPDATE` insert-ID behavior by returning the existing row's auto-increment value when an update resolves a unique-key conflict.
+- Matched MariaDB insert-ID metadata when an `INSERT` explicitly supplies the value of an auto-increment column.
+- Changed MariaDB parity comparisons to collect value mismatches through the full scenario and report them together, instead of stopping at the first mismatch.
+- Consolidated external compatibility testing on pinned MariaDB 10.11.7: differential corpus, exact parity, error-code checks, pre-push provisioning, CI, and MTR discovery now use MariaDB-only targets and configuration, with the Oracle MySQL comparison paths removed.
 
 ## 0.4.0 Aug 12, 2026
 

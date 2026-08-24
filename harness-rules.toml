@@ -111,11 +111,11 @@ argv = [
     "cargo",
     "test",
     "--test",
-    "mysql_parity",
+    "mariadb_parity",
     "--test",
-    "mysql_compatibility_corpus",
+    "mariadb_compatibility_corpus",
     "--test",
-    "mysql_error_compatibility",
+    "mariadb_error_compatibility",
     "--",
     "--nocapture",
 ]
@@ -128,7 +128,7 @@ argv = ["tools/prepush.sh"]
 cwd = "$WORKSPACE"
 timeout_secs = 300
 approval_mode = "auto"
-reason = "Run the repository's fail-closed pre-push suite against pinned MySQL 8.0.43 before the next CI push"
+reason = "Run the repository's fail-closed pre-push suite against pinned MariaDB 10.11.7 before the next CI push"
 
 [[hostdo.commands]]
 argv = [

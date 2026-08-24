@@ -292,6 +292,32 @@ pub(super) fn virtual_select_result(
     })
 }
 
+/// Preserve the result-set shape of a virtual table when a wildcard query
+/// matches no rows. MySQL still sends column definitions for an empty SELECT;
+/// without them the wire layer must encode the response as an OK packet.
+pub(super) fn virtual_select_result_with_empty_schema(
+    select: &Select,
+    rows: Vec<Map<String, Value>>,
+    wildcard_columns: &[&str],
+) -> Result<QueryResult> {
+    let mut result = virtual_select_result(select, rows)?;
+    if result.rows.is_empty() {
+        result.columns = select
+            .projection
+            .iter()
+            .flat_map(|item| match item {
+                SelectItem::UnnamedExpr(expr) => vec![projection_output_column_name(expr)],
+                SelectItem::ExprWithAlias { alias, .. } => vec![alias.value.clone()],
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => wildcard_columns
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect(),
+            })
+            .collect();
+    }
+    Ok(result)
+}
+
 pub(super) fn aggregate_select_result(
     select: &Select,
     rows: &mut Vec<Map<String, Value>>,
@@ -301,6 +327,7 @@ pub(super) fn aggregate_select_result(
     limit: Option<&Expr>,
     offset: Option<&Offset>,
     last_insert_id: u64,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Option<QueryResult>> {
     let group_by = group_by_exprs(select);
     if group_by.is_empty() && !projection_has_aggregate(&select.projection) {
@@ -317,12 +344,12 @@ pub(super) fn aggregate_select_result(
         }
         for row in &mut rows {
             if !row.contains_key(&alias.value) {
-                let value = eval_expr(expr, row, last_insert_id)?;
+                let value = eval(expr, row, last_insert_id)?;
                 row.insert(alias.value.clone(), value);
             }
         }
     }
-    let grouped = group_rows(rows, &group_by, last_insert_id)?;
+    let grouped = group_rows(rows, &group_by, last_insert_id, eval)?;
     let mut order_hint_map = column_hints.clone();
     order_hint_map.extend(
         order_by
@@ -342,6 +369,7 @@ pub(super) fn aggregate_select_result(
                 &base,
                 last_insert_id,
                 &order_hint_map,
+                eval,
                 &mut row,
             )?;
         }
@@ -354,9 +382,10 @@ pub(super) fn aggregate_select_result(
                 &base,
                 last_insert_id,
                 &order_hint_map,
+                eval,
                 &mut context,
             )?;
-            let having_value = eval_expr(having, &context, last_insert_id)?;
+            let having_value = eval(having, &context, last_insert_id)?;
             if !matches!(sql_truth(&having_value), SqlTruth::True) {
                 continue;
             }
@@ -368,6 +397,7 @@ pub(super) fn aggregate_select_result(
                 &base,
                 last_insert_id,
                 &order_hint_map,
+                eval,
                 &mut row,
             )?;
         }
@@ -507,6 +537,7 @@ pub(super) fn group_rows(
     rows: Vec<Map<String, Value>>,
     group_by: &[Expr],
     last_insert_id: u64,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Vec<Vec<Map<String, Value>>>> {
     if group_by.is_empty() {
         return Ok(vec![rows]);
@@ -519,7 +550,7 @@ pub(super) fn group_rows(
         let mut key_parts = Vec::new();
         let mut key_values = Vec::new();
         for expr in group_by {
-            let value = eval_expr(expr, &row, last_insert_id)?;
+            let value = eval(expr, &row, last_insert_id)?;
             key_parts.push(encode_json_value(&value));
             key_values.push(value);
         }
@@ -548,6 +579,7 @@ pub(super) fn project_aggregate_item(
     base: &Map<String, Value>,
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
     out: &mut Map<String, Value>,
 ) -> Result<()> {
     match item {
@@ -562,11 +594,13 @@ pub(super) fn project_aggregate_item(
         }
         SelectItem::UnnamedExpr(expr) => {
             let column = projection_output_column_name(expr);
-            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints)?;
+            let value =
+                aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints, eval)?;
             out.insert(column, value);
         }
         SelectItem::ExprWithAlias { expr, alias } => {
-            let value = aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints)?;
+            let value =
+                aggregate_or_eval_expr(expr, group, base, last_insert_id, order_hints, eval)?;
             if aggregate_call(expr).is_some() {
                 out.insert(projection_expr_column_name(expr), value.clone());
             }
@@ -583,8 +617,9 @@ pub(super) fn aggregate_or_eval_expr(
     base: &Map<String, Value>,
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Value> {
-    eval_aggregate_expr(expr, group, base, last_insert_id, order_hints)
+    eval_aggregate_expr(expr, group, base, last_insert_id, order_hints, eval)
 }
 
 fn eval_aggregate_expr(
@@ -593,17 +628,20 @@ fn eval_aggregate_expr(
     base: &Map<String, Value>,
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Value> {
     if let Some(call) = aggregate_call(expr) {
-        return eval_aggregate_call(&call, group, last_insert_id, order_hints);
+        return eval_aggregate_call(&call, group, last_insert_id, order_hints, eval);
     }
     match expr {
         Expr::BinaryOp { left, op, right } => eval_binary_values(
-            eval_aggregate_expr(left, group, base, last_insert_id, order_hints)?,
+            eval_aggregate_expr(left, group, base, last_insert_id, order_hints, eval)?,
             op,
-            eval_aggregate_expr(right, group, base, last_insert_id, order_hints)?,
+            eval_aggregate_expr(right, group, base, last_insert_id, order_hints, eval)?,
         ),
-        Expr::Nested(inner) => eval_aggregate_expr(inner, group, base, last_insert_id, order_hints),
+        Expr::Nested(inner) => {
+            eval_aggregate_expr(inner, group, base, last_insert_id, order_hints, eval)
+        }
         _ => {
             let mut context = base.clone();
             materialize_aggregate_exprs(
@@ -612,9 +650,10 @@ fn eval_aggregate_expr(
                 base,
                 last_insert_id,
                 order_hints,
+                eval,
                 &mut context,
             )?;
-            eval_expr(expr, &context, last_insert_id)
+            eval(expr, &context, last_insert_id)
         }
     }
 }
@@ -625,20 +664,29 @@ pub(super) fn materialize_aggregate_exprs(
     base: &Map<String, Value>,
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
     out: &mut Map<String, Value>,
 ) -> Result<()> {
     if let Some(call) = aggregate_call(expr) {
         out.insert(
             projection_expr_column_name(expr),
-            eval_aggregate_call(&call, group, last_insert_id, order_hints)?,
+            eval_aggregate_call(&call, group, last_insert_id, order_hints, eval)?,
         );
         return Ok(());
     }
 
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            materialize_aggregate_exprs(left, group, base, last_insert_id, order_hints, out)?;
-            materialize_aggregate_exprs(right, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(left, group, base, last_insert_id, order_hints, eval, out)?;
+            materialize_aggregate_exprs(
+                right,
+                group,
+                base,
+                last_insert_id,
+                order_hints,
+                eval,
+                out,
+            )?;
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -654,37 +702,61 @@ pub(super) fn materialize_aggregate_exprs(
         | Expr::Ceil { expr, .. }
         | Expr::Floor { expr, .. }
         | Expr::Cast { expr, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
         }
         Expr::Convert { expr, styles, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
             for style in styles {
-                materialize_aggregate_exprs(style, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    style,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
         }
         Expr::InList { expr, list, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
             for item in list {
-                materialize_aggregate_exprs(item, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    item,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
         }
         Expr::InSubquery { expr, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
         }
         Expr::Like { expr, pattern, .. } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
-            materialize_aggregate_exprs(pattern, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
+            materialize_aggregate_exprs(
+                pattern,
+                group,
+                base,
+                last_insert_id,
+                order_hints,
+                eval,
+                out,
+            )?;
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
-            materialize_aggregate_exprs(low, group, base, last_insert_id, order_hints, out)?;
-            materialize_aggregate_exprs(high, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
+            materialize_aggregate_exprs(low, group, base, last_insert_id, order_hints, eval, out)?;
+            materialize_aggregate_exprs(high, group, base, last_insert_id, order_hints, eval, out)?;
         }
         Expr::Position { expr, r#in } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
-            materialize_aggregate_exprs(r#in, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
+            materialize_aggregate_exprs(r#in, group, base, last_insert_id, order_hints, eval, out)?;
         }
         Expr::Substring {
             expr,
@@ -692,12 +764,28 @@ pub(super) fn materialize_aggregate_exprs(
             substring_for,
             ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
             if let Some(expr) = substring_from {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
             if let Some(expr) = substring_for {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
         }
         Expr::Trim {
@@ -706,9 +794,17 @@ pub(super) fn materialize_aggregate_exprs(
             trim_characters,
             ..
         } => {
-            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+            materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, eval, out)?;
             if let Some(expr) = trim_what {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
             if let Some(items) = trim_characters {
                 for expr in items {
@@ -718,6 +814,7 @@ pub(super) fn materialize_aggregate_exprs(
                         base,
                         last_insert_id,
                         order_hints,
+                        eval,
                         out,
                     )?;
                 }
@@ -730,13 +827,37 @@ pub(super) fn materialize_aggregate_exprs(
             else_result,
         } => {
             if let Some(expr) = operand {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
             for expr in conditions.iter().chain(results) {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
             if let Some(expr) = else_result {
-                materialize_aggregate_exprs(expr, group, base, last_insert_id, order_hints, out)?;
+                materialize_aggregate_exprs(
+                    expr,
+                    group,
+                    base,
+                    last_insert_id,
+                    order_hints,
+                    eval,
+                    out,
+                )?;
             }
         }
         Expr::Function(function) => {
@@ -754,6 +875,7 @@ pub(super) fn materialize_aggregate_exprs(
                             base,
                             last_insert_id,
                             order_hints,
+                            eval,
                             out,
                         )?;
                     }
@@ -924,15 +1046,16 @@ fn eval_aggregate_call(
     group: &[Map<String, Value>],
     last_insert_id: u64,
     order_hints: &BTreeMap<String, ColumnHint>,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Value> {
     if call.kind == AggregateKind::GroupConcat && !call.order_by.is_empty() {
         let mut ordered_group = group.iter().collect::<Vec<_>>();
         ordered_group.sort_by(|left, right| {
             for order in &call.order_by {
-                let left_value =
-                    eval_compiled_scalar(&order.expr, left, last_insert_id).unwrap_or(Value::Null);
-                let right_value =
-                    eval_compiled_scalar(&order.expr, right, last_insert_id).unwrap_or(Value::Null);
+                let left_value = eval_compiled_scalar(&order.expr, left, last_insert_id, eval)
+                    .unwrap_or(Value::Null);
+                let right_value = eval_compiled_scalar(&order.expr, right, last_insert_id, eval)
+                    .unwrap_or(Value::Null);
                 let ordering = compare_order_values(
                     &left_value,
                     &right_value,
@@ -953,16 +1076,17 @@ fn eval_aggregate_call(
             }
             Ordering::Equal
         });
-        return eval_aggregate_call_rows(call, ordered_group.into_iter(), last_insert_id);
+        return eval_aggregate_call_rows(call, ordered_group.into_iter(), last_insert_id, eval);
     }
 
-    eval_aggregate_call_rows(call, group.iter(), last_insert_id)
+    eval_aggregate_call_rows(call, group.iter(), last_insert_id, eval)
 }
 
 fn eval_aggregate_call_rows<'a>(
     call: &AggregateCall,
     rows: impl IntoIterator<Item = &'a Map<String, Value>>,
     last_insert_id: u64,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Value> {
     let rows = rows.into_iter();
     let mut values = Vec::with_capacity(rows.size_hint().0);
@@ -976,7 +1100,7 @@ fn eval_aggregate_call_rows<'a>(
                     let value = call
                         .args
                         .first()
-                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id, eval))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     values.push(if value == Value::Null {
@@ -989,13 +1113,13 @@ fn eval_aggregate_call_rows<'a>(
                     let key = call
                         .args
                         .first()
-                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id, eval))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     let value = call
                         .args
                         .get(1)
-                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
+                        .map(|arg| eval_compiled_scalar(arg, row, last_insert_id, eval))
                         .transpose()?
                         .unwrap_or(Value::Null);
                     if key != Value::Null {
@@ -1016,7 +1140,7 @@ fn eval_aggregate_call_rows<'a>(
         if call.kind == AggregateKind::GroupConcat {
             let mut parts = Vec::new();
             for arg in &call.args {
-                let value = eval_compiled_scalar(arg, row, last_insert_id)?;
+                let value = eval_compiled_scalar(arg, row, last_insert_id, eval)?;
                 if value == Value::Null {
                     parts.clear();
                     break;
@@ -1032,11 +1156,11 @@ fn eval_aggregate_call_rows<'a>(
         let value = match call.args.as_slice() {
             [] => Value::Number(Number::from(1_u64)),
             [arg] if arg.text == "*" => Value::Number(Number::from(1_u64)),
-            [arg] => eval_compiled_scalar(arg, row, last_insert_id)?,
+            [arg] => eval_compiled_scalar(arg, row, last_insert_id, eval)?,
             args => {
                 let tuple = args
                     .iter()
-                    .map(|arg| eval_compiled_scalar(arg, row, last_insert_id))
+                    .map(|arg| eval_compiled_scalar(arg, row, last_insert_id, eval))
                     .collect::<Result<Vec<_>>>()?;
                 if tuple.iter().any(|value| value == &Value::Null) {
                     Value::Null
@@ -3069,9 +3193,11 @@ pub(super) fn eval_function_text(
                 Ok(Value::Null)
             } else {
                 let micros = (json_to_f64_lossy(&value)? * 1_000_000.0).round();
-                Ok(Value::String(format_mysql_duration(chrono::Duration::microseconds(
-                    micros.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
-                ))))
+                Ok(Value::String(format_mysql_duration(
+                    chrono::Duration::microseconds(
+                        micros.clamp(i64::MIN as f64, i64::MAX as f64) as i64
+                    ),
+                )))
             }
         }
         "TIME_TO_SEC" => {
@@ -3675,12 +3801,13 @@ fn eval_compiled_scalar(
     expression: &CompiledScalarExpr,
     data: &Map<String, Value>,
     last_insert_id: u64,
+    eval: &dyn Fn(&Expr, &Map<String, Value>, u64) -> Result<Value>,
 ) -> Result<Value> {
     if expression.text == "*" {
         return Ok(Value::Number(Number::from(1_u64)));
     }
     if let Some(expr) = &expression.parsed {
-        return eval_expr(expr, data, last_insert_id);
+        return eval(expr, data, last_insert_id);
     }
     Ok(data.get(&expression.text).cloned().unwrap_or(Value::Null))
 }

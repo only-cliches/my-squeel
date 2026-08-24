@@ -2,9 +2,9 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, anyhow};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, Query,
-    Select, SelectItem, SetExpr, SetQuantifier, Statement, TableFactor, UnaryOperator, Visit,
-    Visitor,
+    BinaryOperator, CastKind, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LockType,
+    Query, Select, SelectItem, SetExpr, SetQuantifier, Statement, TableFactor, UnaryOperator,
+    Visit, Visitor,
 };
 
 pub(super) fn validate_statement_support(statement: &Statement) -> Result<()> {
@@ -31,8 +31,12 @@ impl Visitor for SupportValidator {
         if query.fetch.is_some() {
             return unsupported("FETCH");
         }
-        if !query.locks.is_empty() {
-            return unsupported("SELECT locking clauses");
+        if query.locks.iter().any(|lock| {
+            !matches!(lock.lock_type, LockType::Update)
+                || lock.of.is_some()
+                || lock.nonblock.is_some()
+        }) {
+            return unsupported("SELECT locking clauses other than plain FOR UPDATE");
         }
         if query.for_clause.is_some()
             || query.settings.is_some()
