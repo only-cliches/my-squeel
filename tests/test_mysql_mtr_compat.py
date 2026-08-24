@@ -8,7 +8,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from tools.mysql_mtr_compat import (
+from tools.mariadb_mtr_core import (
     Server,
     TestCase,
     mtr_case_timezone,
@@ -20,7 +20,7 @@ from tools.mysql_mtr_compat import (
     validate_distinct_servers,
     validate_mtr_runtime,
 )
-from tools.mysql_mtr_discover import (
+from tools.mariadb_mtr_discover_core import (
     discover_cases,
     rotating_selection,
     write_promotion_manifest,
@@ -73,10 +73,9 @@ class ManifestTests(unittest.TestCase):
     def test_upstream_hash_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "mysql-test" / "t").mkdir(parents=True)
-            (root / "mysql-test" / "r").mkdir(parents=True)
-            (root / "mysql-test" / "t" / "select_all.test").write_text("SELECT 1;\n")
-            (root / "mysql-test" / "r" / "select_all.result").write_text("SELECT 1;\n1\n1\n")
+            (root / "mysql-test" / "main").mkdir(parents=True)
+            (root / "mysql-test" / "main" / "select_all.test").write_text("SELECT 1;\n")
+            (root / "mysql-test" / "main" / "select_all.result").write_text("SELECT 1;\n1\n1\n")
             manifest = root / "allowlist.txt"
             manifest.write_text(f"select_all query {DIGEST_A} {DIGEST_B}\n")
             with self.assertRaisesRegex(ValueError, "test hash mismatch"):
@@ -117,10 +116,9 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
     def test_discovery_separates_static_candidates_from_harness_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            test_dir = root / "mysql-test" / "t"
-            result_dir = root / "mysql-test" / "r"
+            test_dir = root / "mysql-test" / "main"
+            result_dir = root / "mysql-test" / "main"
             test_dir.mkdir(parents=True)
-            result_dir.mkdir(parents=True)
             (test_dir / "plain.test").write_text("SELECT 1;\n")
             (result_dir / "plain.result").write_text("SELECT 1;\n1\n1\n")
             (test_dir / "sourced.test").write_text("-- source include/have_innodb.inc\nSELECT 1;\n")
@@ -133,11 +131,10 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
     def test_aggressive_discovery_follows_safe_sources_and_rejects_hidden_routines(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            test_dir = root / "mysql-test" / "t"
-            result_dir = root / "mysql-test" / "r"
+            test_dir = root / "mysql-test" / "main"
+            result_dir = root / "mysql-test" / "main"
             include_dir = root / "mysql-test" / "include"
             test_dir.mkdir(parents=True)
-            result_dir.mkdir(parents=True)
             include_dir.mkdir(parents=True)
             (include_dir / "query.inc").write_text("SELECT 2;\n")
             (include_dir / "routine.inc").write_text(
@@ -165,10 +162,9 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
     def test_aggressive_discovery_rejects_harness_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            test_dir = root / "mysql-test" / "t"
-            result_dir = root / "mysql-test" / "r"
+            test_dir = root / "mysql-test" / "main"
+            result_dir = root / "mysql-test" / "main"
             test_dir.mkdir(parents=True)
-            result_dir.mkdir(parents=True)
             (test_dir / "writes_file.test").write_text(
                 "-- write_file $MYSQL_TMP_DIR/data.txt\nvalue\nEOF\nSELECT 1;\n"
             )
@@ -237,10 +233,9 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
     def test_rotating_discovery_selection_wraps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            test_dir = root / "mysql-test" / "t"
-            result_dir = root / "mysql-test" / "r"
+            test_dir = root / "mysql-test" / "main"
+            result_dir = root / "mysql-test" / "main"
             test_dir.mkdir(parents=True)
-            result_dir.mkdir(parents=True)
             for name in ("alpha", "bravo", "charlie"):
                 (test_dir / f"{name}.test").write_text("SELECT 1;\n")
                 (result_dir / f"{name}.result").write_text("SELECT 1;\n1\n1\n")
@@ -263,7 +258,7 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
                                 "feature": "query",
                                 "test_sha256": DIGEST_A,
                                 "result_sha256": DIGEST_B,
-                                "mysql": "pass",
+                                "baseline": "pass",
                                 "mysqweel": "pass",
                             },
                             {
@@ -271,7 +266,7 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
                                 "feature": "query",
                                 "test_sha256": DIGEST_B,
                                 "result_sha256": DIGEST_A,
-                                "mysql": "pass",
+                                "baseline": "pass",
                                 "mysqweel": "fail",
                             },
                         ],
@@ -289,14 +284,15 @@ INSERT INTO t1 VALUES ('a;b'), ("c;d"), (`value`);
 class ReportTests(unittest.TestCase):
     def test_report_contains_score_and_test_statuses(self):
         report = {
-            "mysql_version": "8.0.43",
+            "baseline_label": "MariaDB",
+            "baseline_version": "10.11.7",
             "source_revision": "abc123",
             "status": "fail",
             "score_percent": 50.0,
             "counts": {"included": 2, "passed": 1, "failed": 1, "infrastructure": 0},
             "results": [
-                {"test": "select_all", "feature": "select", "mysql": "pass", "mysqweel": "pass"},
-                {"test": "join", "feature": "join", "mysql": "pass", "mysqweel": "fail"},
+                {"test": "select_all", "feature": "select", "baseline": "pass", "mysqweel": "pass"},
+                {"test": "join", "feature": "join", "baseline": "pass", "mysqweel": "fail"},
             ],
         }
         markdown = render_markdown(report)
@@ -305,7 +301,8 @@ class ReportTests(unittest.TestCase):
 
     def test_report_includes_threshold(self):
         report = {
-            "mysql_version": "8.0.43",
+            "baseline_label": "MariaDB",
+            "baseline_version": "10.11.7",
             "source_revision": "abc123",
             "status": "pass",
             "score_percent": 90.0,
@@ -317,22 +314,23 @@ class ReportTests(unittest.TestCase):
 
     def test_report_includes_one_representative_failure_per_server(self):
         report = {
-            "mysql_version": "8.0.43",
+            "baseline_label": "MariaDB",
+            "baseline_version": "10.11.7",
             "source_revision": "abc123",
             "status": "invalid",
             "score_percent": 0.0,
             "counts": {"included": 1, "passed": 0, "failed": 1, "infrastructure": 0},
             "results": [
-                {"test": "select_all", "feature": "select", "mysql": "fail", "mysqweel": "fail"}
+                {"test": "select_all", "feature": "select", "baseline": "fail", "mysqweel": "fail"}
             ],
             "invocations": [
                 {
                     "test": "select_all",
-                    "server": "mysql",
+                    "server": "mariadb",
                     "status": "fail",
                     "returncode": 1,
                     "stdout": "",
-                    "stderr": "missing mysqlimport",
+                    "stderr": "missing mariadb-import",
                 },
                 {
                     "test": "select_all",
@@ -346,8 +344,8 @@ class ReportTests(unittest.TestCase):
         }
         markdown = render_markdown(report)
         self.assertIn("Representative failure diagnostics", markdown)
-        self.assertIn("### mysql: `select_all`", markdown)
-        self.assertIn("missing mysqlimport", markdown)
+        self.assertIn("### mariadb: `select_all`", markdown)
+        self.assertIn("missing mariadb-import", markdown)
         self.assertIn("### mysqweel: `select_all`", markdown)
         self.assertIn("result mismatch", markdown)
 
